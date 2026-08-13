@@ -1,6 +1,6 @@
 # Liuer Panel
 
-[![Version](https://img.shields.io/badge/version-2.6.44-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
+[![Version](https://img.shields.io/badge/version-2.6.45-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
 [![Shell](https://img.shields.io/badge/shell-Bash-4EAA25.svg)](https://www.gnu.org/software/bash/)
 
 Liuer Panel is a lightweight command-line control panel for provisioning and managing Linux web servers. It manages Nginx, isolated PHP-FPM pools, databases, SSL certificates, website users, backups, security services, and common framework tasks from the `liuer` command.
@@ -170,8 +170,68 @@ Backups are stored under:
 - Create a Redis Unix-socket instance isolated to one website user
 - Create a Memcached Unix-socket instance isolated to one website user
 - Display and flush per-site cache endpoints
-- Keep global Redis/Memcached controls available for legacy sites with an explicit shared-cache warning
+- Choose the Redis/Memcached data-memory limit during setup and change it later
+- Warn that each isolated instance is a separate process and process overhead is additional
+- Show framework-aware connection instructions after setup and before returning to a shared cache
+- Disable and remove an isolated cache after the application has been reconfigured
+- Show status and enable, start, stop, disable, or flush global Redis/Memcached services
+- Protect global cache operations with explicit shared-cache impact warnings
 - Clear PHP Opcache by restarting PHP-FPM
+
+#### Isolated cache configuration
+
+Global Redis and Memcached use TCP endpoints shared by every configured website:
+
+```text
+Redis:     127.0.0.1:6379
+Memcached: 127.0.0.1:11211
+```
+
+An isolated cache is a separate process owned by one website's Linux user. It uses a private Unix socket and does not depend on the global Redis or Memcached service being active. Creating the service does not automatically modify the website application or plugin configuration.
+
+Each instance adds process overhead. The selected limit controls Redis dataset memory or Memcached item storage; total process RAM can be higher. Suggested starting points are:
+
+| Workload | Suggested limit |
+| --- | ---: |
+| Small WordPress site | 64 MB |
+| Typical WordPress site | 128 MB |
+| WooCommerce or a larger application | 256 MB |
+| Many sites on a low-memory VPS | 32–64 MB per site |
+
+Monitor total usage when running several instances:
+
+```bash
+ps -eo pid,user,rss,cmd | grep '[r]edis-server'
+free -h
+```
+
+For the WordPress Redis Object Cache plugin, add the following above `/* That's all, stop editing! Happy publishing. */` in `wp-config.php`, replacing the example domain and socket:
+
+```php
+define('WP_REDIS_CLIENT', 'predis');
+define('WP_REDIS_SCHEME', 'unix');
+define('WP_REDIS_PATH', '/run/liuer-redis-example.com/redis.sock');
+define('WP_REDIS_DATABASE', 0);
+define('WP_REDIS_PREFIX', 'example.com:');
+define('WP_REDIS_TIMEOUT', 1);
+define('WP_REDIS_READ_TIMEOUT', 1);
+```
+
+Remove conflicting `WP_REDIS_HOST` and `WP_REDIS_PORT` definitions. Confirm WordPress → Settings → Redis reports a Unix-socket connection, then flush only that website's cache.
+
+To return WordPress to shared Redis, replace the connection definitions before removing the isolated service:
+
+```php
+define('WP_REDIS_SCHEME', 'tcp');
+define('WP_REDIS_HOST', '127.0.0.1');
+define('WP_REDIS_PORT', 6379);
+define('WP_REDIS_DATABASE', 0);
+define('WP_REDIS_PREFIX', 'example.com:');
+```
+
+Remove `WP_REDIS_PATH`, verify the plugin reports `Connected`, and then remove the isolated cache from Liuer Panel. Cache data does not need migration because the application rebuilds it. Other frameworks and plugins must be configured using their own Unix-socket settings.
+
+Stopping or flushing a global cache affects every website still connected to its TCP endpoint. Do not uninstall the Redis or Memcached package while isolated instances exist because they still require the installed server binary.
 
 ### Security
 

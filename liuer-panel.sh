@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.44"
+readonly VERSION="2.6.45"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -3693,11 +3693,87 @@ _site_meta_set() {
     chmod 600 "$meta"
 }
 
+_show_cache_connection_guide() {
+    local domain="$1" cache_type="$2" mode="${3:-isolated}"
+    local meta="${SITES_META_DIR}/${domain}.conf"
+    local site_type web_root socket=""
+    site_type=$(grep '^TYPE=' "$meta" 2>/dev/null | cut -d= -f2)
+    web_root=$(grep '^WEB_ROOT=' "$meta" 2>/dev/null | cut -d= -f2-)
+    [[ "$cache_type" == "redis" ]] \
+        && socket=$(grep '^CACHE_REDIS_SOCKET=' "$meta" 2>/dev/null | cut -d= -f2-)
+    [[ "$cache_type" == "memcached" ]] \
+        && socket=$(grep '^CACHE_MEMCACHED_SOCKET=' "$meta" 2>/dev/null | cut -d= -f2-)
+
+    echo ""
+    if [[ "$mode" == "isolated" ]]; then
+        echo -e "${YELLOW}Application configuration is not changed automatically.${NC}"
+        echo "  Unix socket: ${socket:-not configured}"
+        if [[ "$site_type" == "wordpress" && "$cache_type" == "redis" ]]; then
+            echo -e "  Edit: ${BOLD}${web_root}/wp-config.php${NC}"
+            echo "  Set WP_REDIS_SCHEME=unix and WP_REDIS_PATH to the socket above."
+        else
+            echo "  Configure the application's ${cache_type} client to use this Unix socket."
+        fi
+    else
+        echo -e "${RED}Switch the application first, or it will lose cache connectivity.${NC}"
+        [[ "$cache_type" == "redis" ]] \
+            && echo "  Shared endpoint: 127.0.0.1:6379" \
+            || echo "  Shared endpoint: 127.0.0.1:11211"
+        [[ "$site_type" == "wordpress" && "$cache_type" == "redis" ]] \
+            && echo -e "  In ${BOLD}${web_root}/wp-config.php${NC}: remove WP_REDIS_PATH and restore TCP host/port."
+    fi
+    echo "  Full guide: ${REPO_URL}#isolated-cache-configuration"
+}
+
+_shared_cache_available() {
+    local cache_type="$1"
+    case "$cache_type" in
+        redis)
+            command -v redis-cli &>/dev/null \
+                && [[ "$(redis-cli -h 127.0.0.1 -p 6379 --raw PING 2>/dev/null)" == "PONG" ]]
+            ;;
+        memcached)
+            command -v nc &>/dev/null \
+                && printf 'version\r\n' | nc -w 2 127.0.0.1 11211 2>/dev/null | grep -q '^VERSION '
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+show_cache_connection_guide() {
+    SELECTED_DOMAIN=""
+    _select_domain "Select website" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN" meta="${SITES_META_DIR}/${SELECTED_DOMAIN}.conf"
+    local redis_socket memcached_socket
+    redis_socket=$(grep '^CACHE_REDIS_SOCKET=' "$meta" 2>/dev/null | cut -d= -f2-)
+    memcached_socket=$(grep '^CACHE_MEMCACHED_SOCKET=' "$meta" 2>/dev/null | cut -d= -f2-)
+    [[ -z "$redis_socket" && -z "$memcached_socket" ]] \
+        && { log_warn "No isolated cache configured for ${domain}."; press_enter; return; }
+    [[ -n "$redis_socket" ]] && _show_cache_connection_guide "$domain" redis isolated
+    [[ -n "$memcached_socket" ]] && _show_cache_connection_guide "$domain" memcached isolated
+    echo ""
+    press_enter
+}
+
+_read_cache_memory_limit() {
+    local cache_type="$1" default_mb="$2" value=""
+    echo "" >&2
+    echo -e "${YELLOW}Separate process: the data limit below excludes process overhead.${NC}" >&2
+    echo -ne "Memory limit [${default_mb} MB]: " >&2
+    read -r value
+    [[ -z "$value" ]] && value="$default_mb"
+    if [[ ! "$value" =~ ^[0-9]+$ ]] || [[ "$value" -lt 16 ]] || [[ "$value" -gt 8192 ]]; then
+        log_error "Memory limit must be an integer from 16 to 8192 MB."
+        return 1
+    fi
+    echo "$value"
+}
+
 setup_isolated_cache() {
     local cache_type="$1"
     SELECTED_DOMAIN=""
     _select_domain "Select website" || { press_enter; return; }
-    local domain="$SELECTED_DOMAIN" site_user assigned_user
+    local domain="$SELECTED_DOMAIN" site_user assigned_user cache_memory_mb
     assigned_user=$(grep '^WEB_USER=' "${SITES_META_DIR}/${domain}.conf" 2>/dev/null | cut -d= -f2)
     [[ -z "$assigned_user" ]] && {
         log_warn "Isolated cache requires a dynamic website with an assigned web user."
@@ -3705,6 +3781,15 @@ setup_isolated_cache() {
     }
     site_user=$(_site_exec_user "$domain") \
         || { log_error "Website user not found."; press_enter; return 1; }
+
+    local current_memory=""
+    if [[ "$cache_type" == "redis" ]]; then
+        current_memory=$(grep '^CACHE_REDIS_MAXMEM_MB=' "${SITES_META_DIR}/${domain}.conf" 2>/dev/null | cut -d= -f2-)
+        cache_memory_mb=$(_read_cache_memory_limit redis "${current_memory:-128}") || { press_enter; return 1; }
+    else
+        current_memory=$(grep '^CACHE_MEMCACHED_MAXMEM_MB=' "${SITES_META_DIR}/${domain}.conf" 2>/dev/null | cut -d= -f2-)
+        cache_memory_mb=$(_read_cache_memory_limit memcached "${current_memory:-64}") || { press_enter; return 1; }
+    fi
 
     mkdir -p "$ISOLATED_CACHE_DIR" /var/lib/liuer-panel/cache
     chown root:root "$ISOLATED_CACHE_DIR" /var/lib/liuer-panel/cache
@@ -3737,7 +3822,7 @@ dir ${data_dir}
 dbfilename dump.rdb
 appendonly yes
 appendfilename appendonly.aof
-maxmemory 128mb
+maxmemory ${cache_memory_mb}mb
 maxmemory-policy allkeys-lru
 save 900 1
 save 300 10
@@ -3773,6 +3858,7 @@ RestrictAddressFamilies=AF_UNIX
 WantedBy=multi-user.target
 EOF
             _site_meta_set "$domain" CACHE_REDIS_SOCKET "$socket"
+            _site_meta_set "$domain" CACHE_REDIS_MAXMEM_MB "$cache_memory_mb"
             ;;
         memcached)
             if ! command -v memcached &>/dev/null; then
@@ -3792,7 +3878,7 @@ Group=${site_user}
 UMask=0077
 RuntimeDirectory=${runtime_name}
 RuntimeDirectoryMode=0700
-ExecStart=${memcached_bin} -p 0 -U 0 -s ${socket} -a 0700 -m 64 -c 256
+ExecStart=${memcached_bin} -p 0 -U 0 -s ${socket} -a 0700 -m ${cache_memory_mb} -c 256
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true
@@ -3809,6 +3895,7 @@ RestrictAddressFamilies=AF_UNIX
 WantedBy=multi-user.target
 EOF
             _site_meta_set "$domain" CACHE_MEMCACHED_SOCKET "$socket"
+            _site_meta_set "$domain" CACHE_MEMCACHED_MAXMEM_MB "$cache_memory_mb"
             ;;
         *) log_error "Unsupported cache type: $cache_type"; press_enter; return 1 ;;
     esac
@@ -3818,7 +3905,9 @@ EOF
     if systemctl enable "$service" >/dev/null 2>&1 && systemctl restart "$service"; then
         log_success "Isolated ${cache_type} enabled for ${domain}."
         echo -e "  Socket: ${BOLD}${socket}${NC}"
+        echo -e "  Data memory limit: ${BOLD}${cache_memory_mb} MB${NC} (process overhead is additional)"
         echo -e "  Only user ${BOLD}${site_user}${NC} (and root) can access this socket."
+        _show_cache_connection_guide "$domain" "$cache_type" isolated
     else
         log_error "Failed to start ${service}."
         systemctl status "$service" --no-pager 2>/dev/null | tail -20 || true
@@ -3831,16 +3920,18 @@ show_isolated_caches() {
     local found=0 _mf
     for _mf in "${SITES_META_DIR}"/*.conf; do
         [[ -f "$_mf" ]] || continue
-        local domain redis_socket memcached_socket
+        local domain redis_socket memcached_socket redis_mem memcached_mem
         domain=$(basename "$_mf" .conf)
         redis_socket=$(grep '^CACHE_REDIS_SOCKET=' "$_mf" 2>/dev/null | cut -d= -f2-)
         memcached_socket=$(grep '^CACHE_MEMCACHED_SOCKET=' "$_mf" 2>/dev/null | cut -d= -f2-)
+        redis_mem=$(grep '^CACHE_REDIS_MAXMEM_MB=' "$_mf" 2>/dev/null | cut -d= -f2-)
+        memcached_mem=$(grep '^CACHE_MEMCACHED_MAXMEM_MB=' "$_mf" 2>/dev/null | cut -d= -f2-)
         [[ -z "$redis_socket" && -z "$memcached_socket" ]] && continue
         echo -e "\n  ${BOLD}${domain}${NC}"
-        [[ -n "$redis_socket" ]] && printf "    %-12s %s (%s)\n" "Redis" "$redis_socket" \
-            "$([[ -S "$redis_socket" ]] && echo active || echo unavailable)"
-        [[ -n "$memcached_socket" ]] && printf "    %-12s %s (%s)\n" "Memcached" "$memcached_socket" \
-            "$([[ -S "$memcached_socket" ]] && echo active || echo unavailable)"
+        [[ -n "$redis_socket" ]] && printf "    %-12s %s (%s, limit: %s MB + overhead)\n" \
+            "Redis" "$redis_socket" "$([[ -S "$redis_socket" ]] && echo active || echo unavailable)" "${redis_mem:-128}"
+        [[ -n "$memcached_socket" ]] && printf "    %-12s %s (%s, limit: %s MB + overhead)\n" \
+            "Memcached" "$memcached_socket" "$([[ -S "$memcached_socket" ]] && echo active || echo unavailable)" "${memcached_mem:-64}"
         found=$((found+1))
     done
     [[ "$found" -eq 0 ]] && log_warn "No isolated cache has been configured."
@@ -3859,7 +3950,8 @@ _remove_isolated_cache_for_site() {
     rm -rf "/var/lib/liuer-panel/cache/${domain}"
     systemctl daemon-reload 2>/dev/null || true
     if [[ -f "${SITES_META_DIR}/${domain}.conf" ]]; then
-        sed -i '/^CACHE_REDIS_SOCKET=/d; /^CACHE_MEMCACHED_SOCKET=/d' "${SITES_META_DIR}/${domain}.conf"
+        sed -i '/^CACHE_REDIS_SOCKET=/d; /^CACHE_MEMCACHED_SOCKET=/d; /^CACHE_REDIS_MAXMEM_MB=/d; /^CACHE_MEMCACHED_MAXMEM_MB=/d' \
+            "${SITES_META_DIR}/${domain}.conf"
     fi
     [[ "$quiet" == "1" ]] || log_success "Isolated cache removed for ${domain}."
 }
@@ -3886,9 +3978,87 @@ remove_isolated_cache() {
     if ! grep -qE '^CACHE_(REDIS|MEMCACHED)_SOCKET=' "$meta" 2>/dev/null; then
         log_warn "No isolated cache configured for ${domain}."; press_enter; return
     fi
+    local redis_socket memcached_socket
+    redis_socket=$(grep '^CACHE_REDIS_SOCKET=' "$meta" 2>/dev/null | cut -d= -f2-)
+    memcached_socket=$(grep '^CACHE_MEMCACHED_SOCKET=' "$meta" 2>/dev/null | cut -d= -f2-)
+    [[ -n "$redis_socket" ]] && _show_cache_connection_guide "$domain" redis shared
+    [[ -n "$memcached_socket" ]] && _show_cache_connection_guide "$domain" memcached shared
+    if [[ -n "$redis_socket" ]]; then
+        _shared_cache_available redis \
+            && log_success "Shared Redis is responding at 127.0.0.1:6379." \
+            || log_warn "Shared Redis is not responding; disable the WordPress Redis plugin instead of switching yet."
+    fi
+    if [[ -n "$memcached_socket" ]]; then
+        _shared_cache_available memcached \
+            && log_success "Shared Memcached is responding at 127.0.0.1:11211." \
+            || log_warn "Shared Memcached is not responding; disable application caching instead of switching yet."
+    fi
+    echo ""
+    log_warn "Removing now stops the private service and permanently deletes its cached data."
     confirm_danger "Remove isolated cache and cached data for ${domain}" \
         || { log_info "Cancelled."; return; }
     _remove_isolated_cache_for_site "$domain"
+    press_enter
+}
+
+change_isolated_cache_memory() {
+    SELECTED_DOMAIN=""
+    _select_domain "Select website" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN" meta="${SITES_META_DIR}/${SELECTED_DOMAIN}.conf"
+    local redis_socket memcached_socket cache_type current_mb new_mb service_file conf
+    redis_socket=$(grep '^CACHE_REDIS_SOCKET=' "$meta" 2>/dev/null | cut -d= -f2-)
+    memcached_socket=$(grep '^CACHE_MEMCACHED_SOCKET=' "$meta" 2>/dev/null | cut -d= -f2-)
+    [[ -z "$redis_socket" && -z "$memcached_socket" ]] \
+        && { log_warn "No isolated cache configured for ${domain}."; press_enter; return; }
+
+    if [[ -n "$redis_socket" && -n "$memcached_socket" ]]; then
+        echo "  1) Redis"
+        echo "  2) Memcached"
+        echo "  0) Cancel"
+        echo -ne "${YELLOW}Select cache:${NC} "; read -r _cache_choice
+        [[ "$_cache_choice" == "1" ]] && cache_type="redis"
+        [[ "$_cache_choice" == "2" ]] && cache_type="memcached"
+        [[ -z "$cache_type" ]] && return
+    elif [[ -n "$redis_socket" ]]; then
+        cache_type="redis"
+    else
+        cache_type="memcached"
+    fi
+
+    if [[ "$cache_type" == "redis" ]]; then
+        current_mb=$(grep '^CACHE_REDIS_MAXMEM_MB=' "$meta" 2>/dev/null | cut -d= -f2-)
+        [[ -z "$current_mb" ]] && current_mb=$(grep '^maxmemory ' "${ISOLATED_CACHE_DIR}/${domain}.redis.conf" 2>/dev/null \
+            | sed -E 's/^maxmemory ([0-9]+)mb$/\1/' | head -1)
+        current_mb="${current_mb:-128}"
+    else
+        current_mb=$(grep '^CACHE_MEMCACHED_MAXMEM_MB=' "$meta" 2>/dev/null | cut -d= -f2-)
+        [[ -z "$current_mb" ]] && current_mb="64"
+    fi
+
+    echo -e "  Current ${cache_type} data limit: ${BOLD}${current_mb} MB${NC} + process overhead"
+    new_mb=$(_read_cache_memory_limit "$cache_type" "$current_mb") || { press_enter; return 1; }
+    [[ "$new_mb" == "$current_mb" ]] && { log_info "Memory limit unchanged."; press_enter; return; }
+    log_warn "The isolated ${cache_type} service will restart briefly. Memcached data is not persistent."
+    confirm_action "Change the limit to ${new_mb} MB?" || { log_info "Cancelled."; return; }
+
+    if [[ "$cache_type" == "redis" ]]; then
+        conf="${ISOLATED_CACHE_DIR}/${domain}.redis.conf"
+        [[ -f "$conf" ]] || { log_error "Redis configuration not found: $conf"; press_enter; return 1; }
+        sed -i "s/^maxmemory .*/maxmemory ${new_mb}mb/" "$conf"
+        _site_meta_set "$domain" CACHE_REDIS_MAXMEM_MB "$new_mb"
+    else
+        service_file="/etc/systemd/system/liuer-memcached-${domain}.service"
+        [[ -f "$service_file" ]] || { log_error "Memcached service not found: $service_file"; press_enter; return 1; }
+        sed -Ei "s|(ExecStart=.*[[:space:]]-m[[:space:]])[0-9]+|\1${new_mb}|" "$service_file"
+        _site_meta_set "$domain" CACHE_MEMCACHED_MAXMEM_MB "$new_mb"
+        systemctl daemon-reload
+    fi
+
+    if systemctl restart "liuer-${cache_type}-${domain}.service"; then
+        log_success "Isolated ${cache_type} limit changed to ${new_mb} MB for ${domain}."
+    else
+        log_error "Failed to restart isolated ${cache_type}; check systemctl status liuer-${cache_type}-${domain}.service"
+    fi
     press_enter
 }
 
@@ -3935,6 +4105,100 @@ flush_memcached() {
     fi
 }
 
+_global_cache_service() {
+    local cache_type="$1"
+    case "$cache_type" in
+        redis)
+            if systemctl cat redis-server.service &>/dev/null; then
+                echo redis-server
+            elif systemctl cat redis.service &>/dev/null; then
+                echo redis
+            else
+                return 1
+            fi
+            ;;
+        memcached)
+            systemctl cat memcached.service &>/dev/null || return 1
+            echo memcached
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+show_global_cache_status() {
+    print_section "GLOBAL / SHARED CACHE STATUS"
+    echo -e "${YELLOW}These services are shared by every website configured to use localhost TCP ports.${NC}\n"
+    local cache_type label port service active enabled
+    for cache_type in redis memcached; do
+        [[ "$cache_type" == "redis" ]] \
+            && { label="Redis"; port="127.0.0.1:6379"; } \
+            || { label="Memcached"; port="127.0.0.1:11211"; }
+        if service=$(_global_cache_service "$cache_type"); then
+            active=$(systemctl is-active "$service" 2>/dev/null || true)
+            enabled=$(systemctl is-enabled "$service" 2>/dev/null || true)
+            printf "  %-12s service=%-14s status=%-10s boot=%-10s endpoint=%s\n" \
+                "$label" "$service" "${active:-unknown}" "${enabled:-unknown}" "$port"
+        else
+            printf "  %-12s %s\n" "$label" "not installed"
+        fi
+    done
+    echo ""
+}
+
+_control_global_cache() {
+    local cache_type="$1" action="$2" service label
+    [[ "$cache_type" == "redis" ]] && label="Redis" || label="Memcached"
+    service=$(_global_cache_service "$cache_type") || {
+        log_warn "Global ${label} service is not installed."
+        return 1
+    }
+    case "$action" in
+        enable)
+            systemctl enable --now "$service" \
+                && log_success "Global ${label} enabled and running (${service})." \
+                || log_error "Could not enable/start ${service}."
+            ;;
+        disable)
+            print_warning_box
+            echo -e "${RED}Every website still using the shared ${label} service may lose cache connectivity.${NC}"
+            echo "Isolated Unix-socket instances are separate and will keep running."
+            confirm_danger "Stop and disable global ${label}" || { log_info "Cancelled."; return; }
+            systemctl disable --now "$service" \
+                && log_success "Global ${label} stopped and disabled (${service})." \
+                || log_error "Could not stop/disable ${service}."
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+manage_global_cache() {
+    while true; do
+        show_global_cache_status
+        echo "  1) Enable and start global Redis"
+        echo "  2) Stop and disable global Redis"
+        echo "  3) Enable and start global Memcached"
+        echo "  4) Stop and disable global Memcached"
+        echo "  5) Flush global Redis"
+        echo "  6) Flush global Memcached"
+        echo "  0) Back"
+        echo -ne "${YELLOW}Select:${NC} "; read -r _ch
+        case "$_ch" in
+            1) _control_global_cache redis enable; press_enter ;;
+            2) _control_global_cache redis disable; press_enter ;;
+            3) _control_global_cache memcached enable; press_enter ;;
+            4) _control_global_cache memcached disable; press_enter ;;
+            5) log_warn "FLUSHALL clears Redis data for every website using the global service."
+               confirm_danger "Flush global Redis" && flush_redis
+               press_enter ;;
+            6) log_warn "flush_all clears data for every website using global Memcached."
+               confirm_danger "Flush global Memcached" && flush_memcached
+               press_enter ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
 flush_opcache() {
     local vers_str
     vers_str=$(get_php_versions)
@@ -3956,9 +4220,11 @@ manage_cache() {
         echo "  2) Set up isolated Memcached for a website"
         echo "  3) Show isolated cache endpoints"
         echo "  4) Flush isolated cache for a website"
-        echo "  5) Flush PHP Opcache (restart PHP-FPM)"
-        echo "  6) Remove isolated cache for a website"
-        echo "  7) Flush legacy GLOBAL Redis/Memcached"
+        echo "  5) Change isolated cache memory limit"
+        echo "  6) Show application connection guide"
+        echo "  7) Manage GLOBAL/shared Redis and Memcached"
+        echo "  8) Flush PHP Opcache (restart PHP-FPM)"
+        echo "  9) Disable/remove isolated cache (return to shared cache)"
         echo "  0) Back"
         echo -e "${YELLOW}Select:${NC} \c"
         read -r _ch
@@ -3967,13 +4233,11 @@ manage_cache() {
             2) setup_isolated_cache memcached ;;
             3) show_isolated_caches ;;
             4) flush_isolated_cache ;;
-            5) flush_opcache; press_enter ;;
-            6) remove_isolated_cache ;;
-            7) log_warn "Global cache is shared by every website on this VPS."
-               confirm_action "Flush the shared global cache?" || continue
-               flush_redis || true
-               flush_memcached || true
-               press_enter ;;
+            5) change_isolated_cache_memory ;;
+            6) show_cache_connection_guide ;;
+            7) manage_global_cache ;;
+            8) flush_opcache; press_enter ;;
+            9) remove_isolated_cache ;;
             0) return ;;
             *) log_warn "Invalid selection." ;;
         esac
