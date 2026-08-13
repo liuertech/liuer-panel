@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.43"
+readonly VERSION="2.6.44"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -22,6 +22,9 @@ readonly DB_LIST_FILE="${CONFIG_DIR}/db_list.txt"
 readonly SECRET_KEY_FILE="${CONFIG_DIR}/secret.key"
 readonly SITES_META_DIR="${CONFIG_DIR}/sites"
 readonly BACKUP_BASE="/home/backup"
+readonly PHP_RUNTIME_BASE="/var/lib/liuer-panel/php-runtime"
+readonly ISOLATED_CACHE_DIR="/etc/liuer-cache"
+readonly SELINUX_PREF_FILE="${CONFIG_DIR}/selinux_mode"
 readonly NGINX_CONF_DIR="/etc/nginx/conf.d"
 readonly WWW_DIR="/home/web"
 readonly LOG_FILE="/var/log/liuer-panel.log"
@@ -66,6 +69,38 @@ get_backup_dir() {
     local _usr
     _usr=$(grep "^WEB_USER=" "${SITES_META_DIR}/${_dom}.conf" 2>/dev/null | cut -d= -f2)
     [[ -n "$_usr" ]] && echo "/home/backup/${_usr}/${_dom}" || echo "/backup/${_dom}"
+}
+
+# Create a root-only backup directory. Backup archives may contain source code,
+# environment files and database credentials, so they must never be world-readable.
+_secure_backup_dir() {
+    local _bdir="$1"
+    mkdir -p "$_bdir"
+    chown root:root "$_bdir" 2>/dev/null || true
+    chmod 700 "$_bdir"
+    local _parent; _parent=$(dirname "$_bdir")
+    if [[ "$_parent" == "$BACKUP_BASE" || "$_parent" == "${BACKUP_BASE}/"* \
+       || "$_parent" == "/backup" || "$_parent" == "/backup/"* ]]; then
+        chown root:root "$_parent" 2>/dev/null || true
+        chmod 700 "$_parent"
+    fi
+}
+
+_secure_backup_files() {
+    local _bdir="$1"
+    [[ -d "$_bdir" ]] || return 0
+    find "$_bdir" -maxdepth 1 -type f -exec chmod 600 {} \; 2>/dev/null || true
+}
+
+_repair_all_backup_permissions() {
+    local _base
+    for _base in "$BACKUP_BASE" /backup; do
+        [[ -d "$_base" ]] || continue
+        chown root:root "$_base" 2>/dev/null || true
+        chmod 700 "$_base"
+        find "$_base" -type d -exec chmod 700 {} \; 2>/dev/null || true
+        find "$_base" -type f -exec chmod 600 {} \; 2>/dev/null || true
+    done
 }
 
 # Resolve the actual backup dir for a domain — handles cases where WEB_USER changed.
@@ -419,6 +454,15 @@ get_php_pool_conf() {
     esac
 }
 
+_prepare_php_runtime_dirs() {
+    local domain="$1" site_user="$2"
+    local runtime_dir="${PHP_RUNTIME_BASE}/${domain}"
+    install -d -o root -g root -m 711 "$PHP_RUNTIME_BASE"
+    install -d -o "$site_user" -g "$site_user" -m 700 \
+        "$runtime_dir" "$runtime_dir/tmp" "$runtime_dir/sessions" "$runtime_dir/uploads"
+    echo "$runtime_dir"
+}
+
 create_php_pool() {
     local ver="$1" domain="$2" site_user="$3" disable_funcs="${4:-1}" site_path="${5:-}"
     [[ -z "$site_path" ]] && site_path="/home/web/${site_user}/${domain}"
@@ -426,6 +470,7 @@ create_php_pool() {
     local socket; socket=$(get_php_pool_socket "$ver" "$domain")
     local nginx_user="nginx"
     id nginx &>/dev/null || nginx_user="www-data"
+    local runtime_dir; runtime_dir=$(_prepare_php_runtime_dirs "$domain" "$site_user")
     cat > "$pool_conf" <<EOF
 [${domain}]
 user = ${site_user}
@@ -448,13 +493,55 @@ EOF
     cat >> "$pool_conf" <<EOF
 php_admin_value[error_log] = /var/log/nginx/${domain}_php_error.log
 php_admin_flag[log_errors] = on
-php_admin_value[open_basedir] = ${site_path}:/tmp:/var/tmp
+php_admin_value[open_basedir] = ${site_path}:${runtime_dir}
+php_admin_value[sys_temp_dir] = ${runtime_dir}/tmp
+php_admin_value[upload_tmp_dir] = ${runtime_dir}/uploads
+php_admin_value[session.save_path] = ${runtime_dir}/sessions
 EOF
     if [[ "$disable_funcs" == "1" ]]; then
         echo "php_admin_value[disable_functions] = ${DANGEROUS_FUNCTIONS}" >> "$pool_conf"
     fi
     local svc; svc=$(get_php_service "$ver")
     systemctl reload "$svc" 2>/dev/null || systemctl restart "$svc" 2>/dev/null || true
+}
+
+_repair_php_runtime_isolation() {
+    local _mf
+    for _mf in "${SITES_META_DIR}"/*.conf; do
+        [[ -f "$_mf" ]] || continue
+        local _dom _usr _ver _site _pool _runtime _svc
+        _dom=$(grep '^DOMAIN=' "$_mf" 2>/dev/null | cut -d= -f2)
+        [[ -z "$_dom" ]] && _dom=$(basename "$_mf" .conf)
+        _usr=$(grep '^WEB_USER=' "$_mf" 2>/dev/null | cut -d= -f2)
+        _ver=$(grep '^PHP_VERSION=' "$_mf" 2>/dev/null | cut -d= -f2)
+        [[ -z "$_usr" || -z "$_ver" ]] && continue
+        id "$_usr" &>/dev/null || { log_warn "Skipping PHP runtime repair for ${_dom}: user ${_usr} does not exist."; continue; }
+        _site=$(get_site_dir "$_dom")
+        _pool=$(get_php_pool_conf "$_ver" "$_dom")
+        [[ -f "$_pool" ]] || continue
+        _runtime=$(_prepare_php_runtime_dirs "$_dom" "$_usr")
+        _php_pool_set "$_pool" 'php_admin_value[open_basedir]' "${_site}:${_runtime}"
+        _php_pool_set "$_pool" 'php_admin_value[sys_temp_dir]' "${_runtime}/tmp"
+        _php_pool_set "$_pool" 'php_admin_value[upload_tmp_dir]' "${_runtime}/uploads"
+        _php_pool_set "$_pool" 'php_admin_value[session.save_path]' "${_runtime}/sessions"
+        _svc=$(get_php_service "$_ver")
+        systemctl reload "$_svc" 2>/dev/null || true
+    done
+
+    # phpMyAdmin is not stored as a normal site metadata file.
+    if [[ -f "${CONFIG_DIR}/pma_user" && -d /var/www/phpmyadmin ]]; then
+        local _pma_user _pma_pool _pma_runtime
+        _pma_user=$(cat "${CONFIG_DIR}/pma_user" 2>/dev/null || true)
+        _pma_pool=$(get_php_pool_conf "8.2" "phpmyadmin")
+        if [[ -n "$_pma_user" && -f "$_pma_pool" ]] && id "$_pma_user" &>/dev/null; then
+            _pma_runtime=$(_prepare_php_runtime_dirs "phpmyadmin" "$_pma_user")
+            _php_pool_set "$_pma_pool" 'php_admin_value[open_basedir]' "/var/www/phpmyadmin:${_pma_runtime}"
+            _php_pool_set "$_pma_pool" 'php_admin_value[sys_temp_dir]' "${_pma_runtime}/tmp"
+            _php_pool_set "$_pma_pool" 'php_admin_value[upload_tmp_dir]' "${_pma_runtime}/uploads"
+            _php_pool_set "$_pma_pool" 'php_admin_value[session.save_path]' "${_pma_runtime}/sessions"
+            systemctl reload "$(get_php_service "8.2")" 2>/dev/null || true
+        fi
+    fi
 }
 
 # Set or update a single key in a PHP-FPM pool conf file
@@ -675,6 +762,7 @@ _repair_sftp_perms() {
             _in_match=0; _sfuser=""
         fi
     done < "$_sshd"
+    _reapply_framework_hardening
 }
 
 remove_php_pool() {
@@ -1456,7 +1544,13 @@ change_web_user() {
         # Update PHP pool open_basedir
         if [[ -n "$_php_ver" ]]; then
             local _pool; _pool=$(get_php_pool_conf "$_php_ver" "$domain")
-            [[ -f "$_pool" ]] && sed -i "s|open_basedir = .*|open_basedir = ${_new_site_dir}:/tmp:/var/tmp|" "$_pool"
+            if [[ -f "$_pool" ]]; then
+                local _runtime; _runtime=$(_prepare_php_runtime_dirs "$domain" "$_new_user")
+                _php_pool_set "$_pool" 'php_admin_value[open_basedir]' "${_new_site_dir}:${_runtime}"
+                _php_pool_set "$_pool" 'php_admin_value[sys_temp_dir]' "${_runtime}/tmp"
+                _php_pool_set "$_pool" 'php_admin_value[upload_tmp_dir]' "${_runtime}/uploads"
+                _php_pool_set "$_pool" 'php_admin_value[session.save_path]' "${_runtime}/sessions"
+            fi
         fi
         # Update SFTP chroot in sshd_config
         sed -i "s|ChrootDirectory ${_site_dir}|ChrootDirectory ${_new_site_dir}|g" /etc/ssh/sshd_config 2>/dev/null || true
@@ -1470,6 +1564,9 @@ change_web_user() {
     else
         echo "WEB_USER=${_new_user}" >> "$_meta"
     fi
+    _update_isolated_cache_user "$domain" "$_new_user"
+    grep -q '^PERMISSION_PROFILE=framework_hardened$' "$_meta" 2>/dev/null \
+        && _apply_framework_permissions "$domain" 1 || true
 
     log_success "Web user for ${domain} changed: ${_cur_user:-default} → ${_new_user}"
     press_enter
@@ -1966,6 +2063,17 @@ CREATED=$(date '+%Y-%m-%d %H:%M:%S')
 EOF
     chmod 600 "${SITES_META_DIR}/${domain}.conf"
 
+    # Framework-aware write protection is offered only where Liuer knows the
+    # required writable directories. Plain PHP remains fully user-managed.
+    if [[ "$site_type" == "2" || "$site_type" == "3" ]]; then
+        echo ""
+        log_info "Optional security: make application code read-only to PHP/SFTP."
+        [[ "$site_type" == "3" ]] \
+            && log_warn "WordPress dashboard core/plugin/theme updates may stop working while enabled."
+        confirm_action "Enable framework write protection for ${domain}?" \
+            && _apply_framework_permissions "$domain" || true
+    fi
+
     # --- SSL ---
     echo ""
     local ssl_status="None"
@@ -2342,6 +2450,8 @@ delete_website() {
         _site_user=$(grep "^WEB_USER=" "$_meta" | cut -d= -f2)
     fi
     [[ -n "$_php_ver" && -n "$_site_user" ]] && remove_php_pool "$_php_ver" "$domain" || true
+    rm -rf "${PHP_RUNTIME_BASE:?}/${domain}"
+    _remove_isolated_cache_for_site "$domain" 1
 
     # Delete site files automatically (user already confirmed with CONFIRM)
     local site_dir; site_dir="$(get_site_dir "$domain")"
@@ -3571,6 +3681,245 @@ delete_database() {
 # =============================================================================
 # CACHE MODULE
 # =============================================================================
+_site_meta_set() {
+    local domain="$1" key="$2" value="$3"
+    local meta="${SITES_META_DIR}/${domain}.conf"
+    [[ -f "$meta" ]] || return 1
+    if grep -q "^${key}=" "$meta" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$meta"
+    else
+        echo "${key}=${value}" >> "$meta"
+    fi
+    chmod 600 "$meta"
+}
+
+setup_isolated_cache() {
+    local cache_type="$1"
+    SELECTED_DOMAIN=""
+    _select_domain "Select website" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN" site_user assigned_user
+    assigned_user=$(grep '^WEB_USER=' "${SITES_META_DIR}/${domain}.conf" 2>/dev/null | cut -d= -f2)
+    [[ -z "$assigned_user" ]] && {
+        log_warn "Isolated cache requires a dynamic website with an assigned web user."
+        press_enter; return 1
+    }
+    site_user=$(_site_exec_user "$domain") \
+        || { log_error "Website user not found."; press_enter; return 1; }
+
+    mkdir -p "$ISOLATED_CACHE_DIR" /var/lib/liuer-panel/cache
+    chown root:root "$ISOLATED_CACHE_DIR" /var/lib/liuer-panel/cache
+    chmod 711 "$ISOLATED_CACHE_DIR"
+    chmod 711 /var/lib/liuer-panel/cache
+
+    local runtime_name="liuer-${cache_type}-${domain}"
+    local socket="/run/${runtime_name}/${cache_type}.sock"
+    local service="${runtime_name}.service"
+    local service_file="/etc/systemd/system/${service}"
+
+    case "$cache_type" in
+        redis)
+            if ! command -v redis-server &>/dev/null; then
+                confirm_action "Redis is not installed. Install it now?" || { press_enter; return 1; }
+                [[ "$OS_FAMILY" == "rhel" ]] && pkg_install redis || pkg_install redis-server
+            fi
+            local redis_bin; redis_bin=$(command -v redis-server)
+            local data_dir="/var/lib/liuer-panel/cache/${domain}/redis"
+            local conf="${ISOLATED_CACHE_DIR}/${domain}.redis.conf"
+            install -d -o "$site_user" -g "$site_user" -m 700 "$data_dir"
+            cat > "$conf" <<EOF
+port 0
+protected-mode yes
+daemonize no
+supervised no
+unixsocket ${socket}
+unixsocketperm 0700
+dir ${data_dir}
+dbfilename dump.rdb
+appendonly yes
+appendfilename appendonly.aof
+maxmemory 128mb
+maxmemory-policy allkeys-lru
+save 900 1
+save 300 10
+EOF
+            chown root:"$site_user" "$conf" && chmod 640 "$conf"
+            cat > "$service_file" <<EOF
+[Unit]
+Description=Liuer isolated Redis for ${domain}
+After=network.target
+
+[Service]
+Type=simple
+User=${site_user}
+Group=${site_user}
+UMask=0077
+RuntimeDirectory=${runtime_name}
+RuntimeDirectoryMode=0700
+ExecStart=${redis_bin} ${conf}
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=${data_dir}
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            _site_meta_set "$domain" CACHE_REDIS_SOCKET "$socket"
+            ;;
+        memcached)
+            if ! command -v memcached &>/dev/null; then
+                confirm_action "Memcached is not installed. Install it now?" || { press_enter; return 1; }
+                pkg_install memcached libmemcached-tools
+            fi
+            local memcached_bin; memcached_bin=$(command -v memcached)
+            cat > "$service_file" <<EOF
+[Unit]
+Description=Liuer isolated Memcached for ${domain}
+After=network.target
+
+[Service]
+Type=simple
+User=${site_user}
+Group=${site_user}
+UMask=0077
+RuntimeDirectory=${runtime_name}
+RuntimeDirectoryMode=0700
+ExecStart=${memcached_bin} -p 0 -U 0 -s ${socket} -a 0700 -m 64 -c 256
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            _site_meta_set "$domain" CACHE_MEMCACHED_SOCKET "$socket"
+            ;;
+        *) log_error "Unsupported cache type: $cache_type"; press_enter; return 1 ;;
+    esac
+
+    chmod 644 "$service_file"
+    systemctl daemon-reload
+    if systemctl enable "$service" >/dev/null 2>&1 && systemctl restart "$service"; then
+        log_success "Isolated ${cache_type} enabled for ${domain}."
+        echo -e "  Socket: ${BOLD}${socket}${NC}"
+        echo -e "  Only user ${BOLD}${site_user}${NC} (and root) can access this socket."
+    else
+        log_error "Failed to start ${service}."
+        systemctl status "$service" --no-pager 2>/dev/null | tail -20 || true
+    fi
+    press_enter
+}
+
+show_isolated_caches() {
+    print_section "ISOLATED CACHE ENDPOINTS"
+    local found=0 _mf
+    for _mf in "${SITES_META_DIR}"/*.conf; do
+        [[ -f "$_mf" ]] || continue
+        local domain redis_socket memcached_socket
+        domain=$(basename "$_mf" .conf)
+        redis_socket=$(grep '^CACHE_REDIS_SOCKET=' "$_mf" 2>/dev/null | cut -d= -f2-)
+        memcached_socket=$(grep '^CACHE_MEMCACHED_SOCKET=' "$_mf" 2>/dev/null | cut -d= -f2-)
+        [[ -z "$redis_socket" && -z "$memcached_socket" ]] && continue
+        echo -e "\n  ${BOLD}${domain}${NC}"
+        [[ -n "$redis_socket" ]] && printf "    %-12s %s (%s)\n" "Redis" "$redis_socket" \
+            "$([[ -S "$redis_socket" ]] && echo active || echo unavailable)"
+        [[ -n "$memcached_socket" ]] && printf "    %-12s %s (%s)\n" "Memcached" "$memcached_socket" \
+            "$([[ -S "$memcached_socket" ]] && echo active || echo unavailable)"
+        found=$((found+1))
+    done
+    [[ "$found" -eq 0 ]] && log_warn "No isolated cache has been configured."
+    echo ""
+    press_enter
+}
+
+_remove_isolated_cache_for_site() {
+    local domain="$1" quiet="${2:-0}" cache_type service
+    validate_domain "$domain" || { log_error "Invalid cache domain: $domain"; return 1; }
+    for cache_type in redis memcached; do
+        service="liuer-${cache_type}-${domain}.service"
+        systemctl disable --now "$service" &>/dev/null || true
+        rm -f "/etc/systemd/system/${service}" "${ISOLATED_CACHE_DIR}/${domain}.${cache_type}.conf"
+    done
+    rm -rf "/var/lib/liuer-panel/cache/${domain}"
+    systemctl daemon-reload 2>/dev/null || true
+    if [[ -f "${SITES_META_DIR}/${domain}.conf" ]]; then
+        sed -i '/^CACHE_REDIS_SOCKET=/d; /^CACHE_MEMCACHED_SOCKET=/d' "${SITES_META_DIR}/${domain}.conf"
+    fi
+    [[ "$quiet" == "1" ]] || log_success "Isolated cache removed for ${domain}."
+}
+
+_update_isolated_cache_user() {
+    local domain="$1" site_user="$2" cache_type service_file
+    for cache_type in redis memcached; do
+        service_file="/etc/systemd/system/liuer-${cache_type}-${domain}.service"
+        [[ -f "$service_file" ]] || continue
+        sed -i "s/^User=.*/User=${site_user}/; s/^Group=.*/Group=${site_user}/" "$service_file"
+        if [[ "$cache_type" == "redis" && -f "${ISOLATED_CACHE_DIR}/${domain}.redis.conf" ]]; then
+            chown root:"$site_user" "${ISOLATED_CACHE_DIR}/${domain}.redis.conf"
+            chown -R "$site_user":"$site_user" "/var/lib/liuer-panel/cache/${domain}/redis" 2>/dev/null || true
+        fi
+    done
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl try-restart "liuer-redis-${domain}.service" "liuer-memcached-${domain}.service" 2>/dev/null || true
+}
+
+remove_isolated_cache() {
+    SELECTED_DOMAIN=""
+    _select_domain "Select website" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN" meta="${SITES_META_DIR}/${SELECTED_DOMAIN}.conf"
+    if ! grep -qE '^CACHE_(REDIS|MEMCACHED)_SOCKET=' "$meta" 2>/dev/null; then
+        log_warn "No isolated cache configured for ${domain}."; press_enter; return
+    fi
+    confirm_danger "Remove isolated cache and cached data for ${domain}" \
+        || { log_info "Cancelled."; return; }
+    _remove_isolated_cache_for_site "$domain"
+    press_enter
+}
+
+flush_isolated_cache() {
+    SELECTED_DOMAIN=""
+    _select_domain "Select website" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN" meta="${SITES_META_DIR}/${SELECTED_DOMAIN}.conf"
+    local redis_socket memcached_socket
+    redis_socket=$(grep '^CACHE_REDIS_SOCKET=' "$meta" 2>/dev/null | cut -d= -f2-)
+    memcached_socket=$(grep '^CACHE_MEMCACHED_SOCKET=' "$meta" 2>/dev/null | cut -d= -f2-)
+    [[ -z "$redis_socket" && -z "$memcached_socket" ]] \
+        && { log_warn "No isolated cache configured for ${domain}."; press_enter; return; }
+    if [[ -n "$redis_socket" && -S "$redis_socket" ]]; then
+        redis-cli -s "$redis_socket" FLUSHDB >/dev/null \
+            && log_success "Redis cache flushed for ${domain}." \
+            || log_warn "Could not flush Redis for ${domain}."
+    fi
+    if [[ -n "$memcached_socket" && -S "$memcached_socket" ]]; then
+        python3 - "$memcached_socket" <<'PY' && log_success "Memcached flushed." || log_warn "Could not flush Memcached."
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(3)
+s.connect(sys.argv[1])
+s.sendall(b'flush_all\r\n')
+if not s.recv(64).startswith(b'OK'):
+    raise SystemExit(1)
+PY
+    fi
+    press_enter
+}
+
 flush_redis() {
     command -v redis-cli &>/dev/null || { log_warn "Redis is not installed."; return 1; }
     redis-cli FLUSHALL && log_success "Redis cache flushed." \
@@ -3603,21 +3952,28 @@ flush_opcache() {
 manage_cache() {
     while true; do
         print_section "CACHE MANAGEMENT"
-        echo "  1) Flush Redis cache"
-        echo "  2) Flush Memcached cache"
-        echo "  3) Flush PHP Opcache (restart PHP-FPM)"
-        echo "  4) Flush ALL caches"
+        echo "  1) Set up isolated Redis for a website"
+        echo "  2) Set up isolated Memcached for a website"
+        echo "  3) Show isolated cache endpoints"
+        echo "  4) Flush isolated cache for a website"
+        echo "  5) Flush PHP Opcache (restart PHP-FPM)"
+        echo "  6) Remove isolated cache for a website"
+        echo "  7) Flush legacy GLOBAL Redis/Memcached"
         echo "  0) Back"
         echo -e "${YELLOW}Select:${NC} \c"
         read -r _ch
         case "$_ch" in
-            1) flush_redis;    press_enter ;;
-            2) flush_memcached; press_enter ;;
-            3) flush_opcache;  press_enter ;;
-            4) log_info "Flushing Redis...";     flush_redis     || true
-               log_info "Flushing Memcached..."; flush_memcached || true
-               log_info "Flushing Opcache...";   flush_opcache   || true
-               log_success "All caches flushed."; press_enter ;;
+            1) setup_isolated_cache redis ;;
+            2) setup_isolated_cache memcached ;;
+            3) show_isolated_caches ;;
+            4) flush_isolated_cache ;;
+            5) flush_opcache; press_enter ;;
+            6) remove_isolated_cache ;;
+            7) log_warn "Global cache is shared by every website on this VPS."
+               confirm_action "Flush the shared global cache?" || continue
+               flush_redis || true
+               flush_memcached || true
+               press_enter ;;
             0) return ;;
             *) log_warn "Invalid selection." ;;
         esac
@@ -3739,19 +4095,23 @@ malware_scan() {
 
     echo -e "${BOLD}Scan scope:${NC}"
     echo "  1) Scan a specific domain"
-    echo "  2) Scan all of /home/web/"
+    echo "  2) Scan all managed website paths"
     echo "  0) Cancel"
     echo -e "${YELLOW}Select:${NC} \c"
     read -r _ch
 
     local scan_path=""
+    local -a scan_paths=()
     case "$_ch" in
         1) _select_domain "Select site" || return
            scan_path="$(get_site_dir "$SELECTED_DOMAIN")"
            if [[ ! -d "$scan_path" ]]; then
                log_error "Directory not found: $scan_path"; return 1
-           fi ;;
-        2) scan_path="/home/web" ;;
+           fi
+           scan_paths+=("$scan_path") ;;
+        2) [[ -d /home/web ]] && scan_paths+=(/home/web)
+           [[ -d /var/www ]] && scan_paths+=(/var/www)
+           scan_path="${scan_paths[*]}" ;;
         0) return ;;
         *) log_warn "Invalid selection."; return 1 ;;
     esac
@@ -3761,13 +4121,14 @@ malware_scan() {
     freshclam --quiet 2>/dev/null || true
 
     local log_path="/var/log/clamav/scan_$(date +%Y%m%d_%H%M%S).log"
-    mkdir -p "$(dirname "$log_path")"
+    install -d -o root -g root -m 750 "$(dirname "$log_path")"
 
     echo -e "${BOLD}Scanning: ${BOLD}${scan_path}${NC}"
     echo -e "${DIM}(Full log: $log_path)${NC}\n"
 
     # clamscan returns 1 if infected (not an error)
-    clamscan -r --infected --log="$log_path" "$scan_path" 2>&1 | tail -30 || true
+    clamscan -r --infected --log="$log_path" "${scan_paths[@]}" 2>&1 | tail -30 || true
+    chmod 640 "$log_path" 2>/dev/null || true
 
     local infected
     infected=$(grep -oP '(?<=Infected files: )\d+' "$log_path" 2>/dev/null || echo "?")
@@ -3775,6 +4136,107 @@ malware_scan() {
     echo -e "  ${BOLD}Infected files found: ${infected}${NC}"
     echo -e "  Full log: $log_path"
     press_enter
+}
+
+_run_scheduled_malware_scan() {
+    local scope="${1:---all}" scan_path=""
+    local -a scan_paths=()
+    if [[ "$scope" != "--all" ]]; then
+        validate_domain "$scope" || { log_error "Invalid malware scan domain: $scope"; return 1; }
+        scan_path=$(get_site_dir "$scope")
+        scan_paths+=("$scan_path")
+    else
+        [[ -d /home/web ]] && scan_paths+=(/home/web)
+        [[ -d /var/www ]] && scan_paths+=(/var/www)
+    fi
+    [[ ${#scan_paths[@]} -gt 0 ]] || { log_error "No website paths found for malware scan."; return 1; }
+    [[ "$scope" == "--all" || -d "$scan_path" ]] \
+        || { log_error "Malware scan path not found: $scan_path"; return 1; }
+    command -v clamscan &>/dev/null || { log_error "ClamAV is not installed."; return 1; }
+
+    freshclam --quiet 2>/dev/null || true
+    install -d -o root -g root -m 750 /var/log/clamav
+    local safe_scope="${scope//[^a-zA-Z0-9._-]/all}"
+    local log_path="/var/log/clamav/scheduled_${safe_scope}_$(date +%Y%m%d_%H%M%S).log"
+    clamscan -r --infected --log="$log_path" "${scan_paths[@]}" >/dev/null 2>&1
+    local scan_rc=$?
+    chmod 640 "$log_path" 2>/dev/null || true
+    if [[ "$scan_rc" -eq 1 ]]; then
+        local infected; infected=$(grep -oP '(?<=Infected files: )\d+' "$log_path" 2>/dev/null || echo "unknown")
+        log_warn "Malware scan found ${infected} infected file(s) in ${scope}. Log: ${log_path}"
+        lcp_notify "malware_detected" "\"scope\":\"${scope}\",\"infected\":\"${infected}\""
+        return 1
+    elif [[ "$scan_rc" -gt 1 ]]; then
+        log_error "Malware scan failed for ${scope}. Log: ${log_path}"
+        return "$scan_rc"
+    fi
+    log_success "Scheduled malware scan clean: ${scope}"
+}
+
+schedule_malware_scan() {
+    command -v clamscan &>/dev/null || {
+        log_warn "ClamAV is not installed. Install it from System → Install extra service first."
+        press_enter; return 1
+    }
+    echo -e "${BOLD}Scan scope:${NC}"
+    echo "  1) All websites"
+    echo "  2) One website"
+    echo "  0) Cancel"
+    echo -ne "${YELLOW}Select:${NC} "; read -r _scope_choice
+    local scope="--all"
+    case "$_scope_choice" in
+        1) ;;
+        2) SELECTED_DOMAIN=""; _select_domain "Select website" || return; scope="$SELECTED_DOMAIN" ;;
+        *) return ;;
+    esac
+
+    echo -e "\n${BOLD}Schedule:${NC}"
+    echo "  1) Daily at 02:30"
+    echo "  2) Every Sunday at 02:30"
+    echo "  0) Cancel"
+    echo -ne "${YELLOW}Select:${NC} "; read -r _freq
+    local cron_time
+    case "$_freq" in
+        1) cron_time="30 2 * * *" ;;
+        2) cron_time="30 2 * * 0" ;;
+        *) return ;;
+    esac
+
+    ensure_cron_service || { press_enter; return 1; }
+    local tmp; tmp=$(mktemp) || return 1
+    crontab -l -u root 2>/dev/null | grep -Fv "_cron_malware_scan ${scope} " > "$tmp" || true
+    crontab -u root "$tmp" || { rm -f "$tmp"; log_error "Could not update root crontab."; press_enter; return 1; }
+    rm -f "$tmp"
+    local entry="${cron_time} /usr/local/bin/liuer _cron_malware_scan ${scope} >> /var/log/liuer-panel.log 2>&1"
+    _install_user_crontab_entry root "$entry" \
+        && log_success "Optional malware scan scheduled and verified." \
+        || log_error "Failed to schedule malware scan."
+    press_enter
+}
+
+manage_malware_scans() {
+    while true; do
+        print_section "MALWARE SCAN — OPTIONAL"
+        echo "  1) Scan now"
+        echo "  2) Schedule scan"
+        echo "  3) View scheduled scans"
+        echo "  4) Remove all scheduled scans"
+        echo "  0) Back"
+        echo -ne "${YELLOW}Select:${NC} "; read -r _ch
+        case "$_ch" in
+            1) malware_scan ;;
+            2) schedule_malware_scan ;;
+            3) echo ""; crontab -l -u root 2>/dev/null | grep '_cron_malware_scan' \
+                   || log_warn "No scheduled malware scans."; echo ""; press_enter ;;
+            4) confirm_action "Remove every scheduled malware scan?" || continue
+               local tmp; tmp=$(mktemp) || continue
+               crontab -l -u root 2>/dev/null | grep -v '_cron_malware_scan' > "$tmp" || true
+               crontab -u root "$tmp" && log_success "Scheduled malware scans removed."
+               rm -f "$tmp"; press_enter ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
 }
 
 # =============================================================================
@@ -3901,21 +4363,160 @@ fix_permissions() {
     press_enter
 }
 
+_apply_framework_permissions() {
+    local domain="$1" quiet="${2:-0}"
+    local meta="${SITES_META_DIR}/${domain}.conf"
+    [[ -f "$meta" ]] || return 1
+    local site_type site_user site_dir web_root
+    site_type=$(grep '^TYPE=' "$meta" 2>/dev/null | cut -d= -f2)
+    site_user=$(grep '^WEB_USER=' "$meta" 2>/dev/null | cut -d= -f2)
+    site_dir=$(get_site_dir "$domain")
+    web_root=$(grep '^WEB_ROOT=' "$meta" 2>/dev/null | cut -d= -f2-)
+    [[ -z "$web_root" ]] && {
+        [[ "$site_type" == "laravel" ]] && web_root="${site_dir}/public" || web_root="${site_dir}/public_html"
+    }
+    [[ "$site_type" =~ ^(wordpress|laravel)$ && -n "$site_user" && -d "$site_dir" ]] || return 1
+
+    chown -R root:"$site_user" "$site_dir"
+    chown root:root "$site_dir" && chmod 755 "$site_dir"
+    find "$site_dir" -mindepth 1 -type d -exec chmod 750 {} \;
+    find "$site_dir" -type f -exec chmod 640 {} \;
+
+    local -a writable=()
+    if [[ "$site_type" == "laravel" ]]; then
+        writable+=("${site_dir}/storage" "${site_dir}/bootstrap/cache")
+    else
+        writable+=("${web_root}/wp-content/uploads" "${web_root}/wp-content/cache" "${web_root}/wp-content/upgrade")
+    fi
+    local dir
+    for dir in "${writable[@]}"; do
+        mkdir -p "$dir"
+        chown -R "$site_user":"$site_user" "$dir"
+        find "$dir" -type d -exec chmod 770 {} \;
+        find "$dir" -type f -exec chmod 660 {} \;
+    done
+    _site_meta_set "$domain" PERMISSION_PROFILE framework_hardened
+    [[ "$quiet" == "1" ]] || log_success "Framework write protection enabled for ${domain}."
+}
+
+_reapply_framework_hardening() {
+    local _mf
+    for _mf in "${SITES_META_DIR}"/*.conf; do
+        [[ -f "$_mf" ]] || continue
+        grep -q '^PERMISSION_PROFILE=framework_hardened$' "$_mf" 2>/dev/null || continue
+        _apply_framework_permissions "$(basename "$_mf" .conf)" 1 || true
+    done
+}
+
+manage_framework_permissions() {
+    print_section "FRAMEWORK WRITE PROTECTION"
+    SELECTED_DOMAIN=""
+    _select_domain "Select WordPress/Laravel website" || { press_enter; return; }
+    local domain="$SELECTED_DOMAIN" meta="${SITES_META_DIR}/${SELECTED_DOMAIN}.conf"
+    local site_type site_user site_dir profile
+    site_type=$(grep '^TYPE=' "$meta" 2>/dev/null | cut -d= -f2)
+    site_user=$(grep '^WEB_USER=' "$meta" 2>/dev/null | cut -d= -f2)
+    site_dir=$(get_site_dir "$domain")
+    profile=$(grep '^PERMISSION_PROFILE=' "$meta" 2>/dev/null | cut -d= -f2)
+    if [[ ! "$site_type" =~ ^(wordpress|laravel)$ ]]; then
+        log_warn "This optional profile only supports WordPress and Laravel."
+        press_enter; return
+    fi
+    echo -e "  Site    : ${BOLD}${domain}${NC} (${site_type})"
+    echo -e "  Profile : ${BOLD}${profile:-editable}${NC}"
+    echo ""
+    echo "  1) Enable framework write protection"
+    echo "  2) Restore editable permissions"
+    echo "  0) Back"
+    echo -ne "${YELLOW}Select:${NC} "; read -r _ch
+    case "$_ch" in
+        1)
+            log_warn "Application code becomes read-only to PHP/SFTP. WordPress in-dashboard updates may fail."
+            confirm_action "Enable this optional protection?" || return
+            _apply_framework_permissions "$domain"
+            ;;
+        2)
+            confirm_action "Allow the website user to edit all site files again?" || return
+            _set_site_perms "$site_dir" "$site_user"
+            _site_meta_set "$domain" PERMISSION_PROFILE editable
+            _repair_sftp_perms
+            log_success "Editable permissions restored for ${domain}."
+            ;;
+        *) return ;;
+    esac
+    press_enter
+}
+
+manage_selinux() {
+    print_section "SELINUX"
+    if ! command -v getenforce &>/dev/null || [[ ! -f /etc/selinux/config ]]; then
+        log_info "SELinux is not available on this operating system."
+        press_enter; return
+    fi
+    local runtime persistent
+    runtime=$(getenforce 2>/dev/null || echo unknown)
+    persistent=$(grep '^SELINUX=' /etc/selinux/config 2>/dev/null | cut -d= -f2 || echo unknown)
+    echo -e "  Runtime    : ${BOLD}${runtime}${NC}"
+    echo -e "  After boot : ${BOLD}${persistent}${NC}"
+    echo ""
+    echo "  1) Disable SELinux (recommended by Liuer Panel for compatibility)"
+    echo "  2) Enable SELinux enforcing"
+    echo "  0) Back"
+    echo -ne "${YELLOW}Select:${NC} "; read -r _ch
+    case "$_ch" in
+        1)
+            confirm_action "Set SELinux to disabled?" || return
+            setenforce 0 2>/dev/null || true
+            if grep -q '^SELINUX=' /etc/selinux/config; then
+                sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
+            else
+                echo 'SELINUX=disabled' >> /etc/selinux/config
+            fi
+            echo disabled > "$SELINUX_PREF_FILE" && chmod 600 "$SELINUX_PREF_FILE"
+            log_success "SELinux disabled. Reboot to fully apply the persistent mode."
+            ;;
+        2)
+            print_warning_box
+            echo -e "${YELLOW}Custom SELinux policy may be required for Nginx, PHP, certificates and site paths.${NC}"
+            confirm_action "Set SELinux to enforcing?" || return
+            if grep -q '^SELINUX=' /etc/selinux/config; then
+                sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
+            else
+                echo 'SELINUX=enforcing' >> /etc/selinux/config
+            fi
+            echo enforcing > "$SELINUX_PREF_FILE" && chmod 600 "$SELINUX_PREF_FILE"
+            if [[ "$runtime" != "Disabled" ]]; then
+                setenforce 1 2>/dev/null \
+                    && log_success "SELinux enforcing enabled." \
+                    || log_warn "Persistent mode updated; reboot is required."
+            else
+                log_warn "SELinux is disabled in the running kernel. Reboot is required to enable it."
+            fi
+            ;;
+        *) return ;;
+    esac
+    press_enter
+}
+
 manage_security() {
     while true; do
         print_section "SECURITY"
         echo "  1) Firewall management"
-        echo "  2) Malware scan (ClamAV)"
+        echo "  2) Malware scan & optional schedule (ClamAV)"
         echo "  3) Fail2ban management"
         echo "  4) Fix permissions"
+        echo "  5) SELinux status / enable / disable"
+        echo "  6) Optional WordPress/Laravel write protection"
         echo "  0) Back"
         echo -e "${YELLOW}Select:${NC} \c"
         read -r _ch
         case "$_ch" in
             1) manage_firewall ;;
-            2) malware_scan ;;
+            2) manage_malware_scans ;;
             3) manage_fail2ban ;;
             4) fix_permissions ;;
+            5) manage_selinux ;;
+            6) manage_framework_permissions ;;
             0) return ;;
             *) log_warn "Invalid selection." ;;
         esac
@@ -3943,7 +4544,7 @@ backup_website() {
 
     local ts; ts=$(date +%Y%m%d_%H%M%S)
     local bdir; bdir="$(get_backup_dir "$domain")"
-    mkdir -p "$bdir"
+    _secure_backup_dir "$bdir"
 
     # Backup site files
     if [[ "$_btype" == "1" || "$_btype" == "2" ]]; then
@@ -3990,6 +4591,8 @@ backup_website() {
             fi
         fi
     fi
+
+    _secure_backup_files "$bdir"
 
     echo ""
     log_success "Backup complete → ${bdir}"
@@ -4369,8 +4972,8 @@ show_status() {
 
 install_extra_service() {
     print_section "INSTALL EXTRA SERVICE"
-    echo "  1) Redis"
-    echo "  2) Memcached"
+    echo "  1) Redis (global/shared)"
+    echo "  2) Memcached (global/shared)"
     echo "  3) PostgreSQL"
     echo "  4) Fail2ban"
     echo "  5) ClamAV"
@@ -4567,14 +5170,25 @@ do_repair() {
     # 0a. Ensure all PHP-FPM services with active pool configs are running
     _ensure_php_fpm_running
 
+    # 0a.1 Give every PHP-FPM pool private temp, upload and session directories
+    _repair_php_runtime_isolation
+
+    # 0a.2 Restrict existing backup directories and archives to root
+    _repair_all_backup_permissions
+
     # 0b. Upgrade nginx to mainline if < 1.25
     upgrade_nginx_mainline
 
     # 0c. Ensure fastcgi buffer sizes are set globally (fixes "too big header" 502)
     _ensure_nginx_fastcgi_buffers
 
-    # 1. Disable SELinux if enforcing (RHEL-family)
-    if command -v getenforce &>/dev/null && getenforce 2>/dev/null | grep -qi enforcing; then
+    # 1. Disable SELinux by default, unless the administrator explicitly opted
+    # back into enforcing mode from the Security menu.
+    local _selinux_pref="disabled"
+    [[ -f "$SELINUX_PREF_FILE" ]] && _selinux_pref=$(cat "$SELINUX_PREF_FILE" 2>/dev/null || echo disabled)
+    if [[ "$_selinux_pref" == "enforcing" ]]; then
+        log_info "SELinux enforcing preference retained; repair will not disable it."
+    elif command -v getenforce &>/dev/null && getenforce 2>/dev/null | grep -qi enforcing; then
         setenforce 0
         sed -i 's/^SELINUX=enforcing/SELINUX=disabled/' /etc/selinux/config
         log_success "SELinux disabled."
@@ -4925,11 +5539,11 @@ do_install() {
     case "$OS_FAMILY" in
         rhel)
             dnf update -y
-            dnf install -y epel-release curl wget tar gzip openssl git cronie ;;
+            dnf install -y epel-release curl wget tar gzip zip unzip python3 openssl git cronie ;;
         debian)
             apt-get update -y
             DEBIAN_FRONTEND=noninteractive apt-get install -y \
-                curl wget tar gzip openssl git cron software-properties-common ;;
+                curl wget tar gzip zip unzip python3 openssl git cron software-properties-common ;;
     esac
 
     # ── Nginx (mainline 1.25+ from nginx.org for HTTP/2 & HTTP/3 support) ────
@@ -5052,9 +5666,10 @@ do_install() {
 
     # ── Optional: Cache ───────────────────────────────────────────────────────
     echo -e "\n${BOLD}─── Cache ───${NC}"
-    echo -e "${DIM}Redis and Memcached serve a similar purpose. Select one or skip.${NC}\n"
-    echo "  1) Redis      (recommended — widely used, supports persistence)"
-    echo "  2) Memcached  (lightweight, pure in-memory)"
+    echo -e "${DIM}These options install one GLOBAL cache shared by the VPS.${NC}"
+    echo -e "${DIM}For website isolation, configure a Unix-socket instance later from the Cache menu.${NC}\n"
+    echo "  1) Redis      (global/shared)"
+    echo "  2) Memcached  (global/shared)"
     echo "  3) Skip"
     echo ""
     echo -e "${YELLOW}Select [1-3]:${NC} \c"
@@ -5111,7 +5726,9 @@ do_install() {
     # ── Directory structure ───────────────────────────────────────────────────
     log_info "Creating directory structure..."
     mkdir -p "$CONFIG_DIR" "$SITES_META_DIR" "$INSTALL_DIR" /home/web /home/backup /var/www
+    chmod 700 /home/backup
     chmod 700 "$CONFIG_DIR"
+    echo disabled > "$SELINUX_PREF_FILE" && chmod 600 "$SELINUX_PREF_FILE"
     touch "$DB_LIST_FILE" && chmod 600 "$DB_LIST_FILE"
     ensure_secret_key
 
@@ -5331,7 +5948,7 @@ _run_scheduled_backup() {
         local _bdir; _bdir="$(get_backup_dir "$_dom")"
         local _sdir; _sdir="$(get_site_dir "$_dom")"
         local _ts; _ts=$(date +%Y%m%d_%H%M%S)
-        mkdir -p "$_bdir"
+        _secure_backup_dir "$_bdir"
 
         # Files backup
         if [[ "$_btype" == "1" || "$_btype" == "2" ]]; then
@@ -5361,6 +5978,7 @@ _run_scheduled_backup() {
         # Retention policy
         ls -t "${_bdir}"/code_*.tar.gz 2>/dev/null | tail -n +"$((_keep+1))" | xargs rm -f 2>/dev/null || true
         ls -t "${_bdir}"/db_*.sql.gz   2>/dev/null | tail -n +"$((_keep+1))" | xargs rm -f 2>/dev/null || true
+        _secure_backup_files "$_bdir"
         log_info "Auto-backup done: ${_dom}"
     }
 
@@ -6252,6 +6870,7 @@ _api_create_site() {
 _api_delete_site() {
     local domain="$1"
     [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
+    validate_domain "$domain" || { log_error "Invalid domain: $domain"; exit 1; }
 
     local meta="${SITES_META_DIR}/${domain}.conf"
     local php_ver="" site_user=""
@@ -6264,6 +6883,8 @@ _api_delete_site() {
     nginx -t &>/dev/null && nginx -s reload
 
     [[ -n "$php_ver" ]] && remove_php_pool "$php_ver" "$domain" || true
+    rm -rf "${PHP_RUNTIME_BASE:?}/${domain}"
+    _remove_isolated_cache_for_site "$domain" 1
 
     local site_dir; site_dir=$(get_site_dir "$domain")
     [[ -d "$site_dir" ]] && rm -rf "$site_dir"
@@ -6847,31 +7468,112 @@ _api_delete_backup_file() {
     log_success "Deleted: $filename"
 }
 
+_site_exec_user() {
+    local domain="$1" _usr
+    _usr=$(grep '^WEB_USER=' "${SITES_META_DIR}/${domain}.conf" 2>/dev/null | cut -d= -f2)
+    if [[ -z "$_usr" ]]; then
+        id www-data &>/dev/null && _usr="www-data" || _usr="nginx"
+    fi
+    id "$_usr" &>/dev/null || return 1
+    echo "$_usr"
+}
+
+_realpath_within_site() {
+    local site_dir="$1" candidate="$2" require_existing="${3:-1}"
+    local site_real candidate_real
+    site_real=$(realpath -e -- "$site_dir" 2>/dev/null) || return 1
+    if [[ "$require_existing" == "1" ]]; then
+        candidate_real=$(realpath -e -- "$candidate" 2>/dev/null) || return 1
+    else
+        candidate_real=$(realpath -m -- "$candidate" 2>/dev/null) || return 1
+    fi
+    [[ "$candidate_real" == "$site_real" || "$candidate_real" == "${site_real}/"* ]] || return 1
+    echo "$candidate_real"
+}
+
+_run_as_site_user() {
+    local _usr="$1"; shift
+    if command -v runuser &>/dev/null; then
+        runuser -u "$_usr" -- "$@"
+    else
+        sudo -u "$_usr" -- "$@"
+    fi
+}
 
 _api_zip_path() {
     local domain="$1" abs_path="$2"
     [[ -z "$domain" || -z "$abs_path" ]] && { log_error "Domain and path required"; exit 1; }
+    validate_domain "$domain" || { log_error "Invalid domain: $domain"; exit 1; }
+    command -v zip &>/dev/null || { log_error "zip is not installed"; exit 1; }
     local site_dir; site_dir=$(get_site_dir "$domain")
-    [[ "$abs_path" != "${site_dir}"* ]] && { log_error "Path not allowed"; exit 1; }
-    [[ ! -e "$abs_path" ]] && { log_error "Path not found: $abs_path"; exit 1; }
-    local base_name="${abs_path##*/}"
+    local site_real; site_real=$(realpath -e -- "$site_dir" 2>/dev/null) \
+        || { log_error "Site directory not found"; exit 1; }
+    local path_real; path_real=$(_realpath_within_site "$site_real" "$abs_path" 1) \
+        || { log_error "Path is outside the website or does not exist"; exit 1; }
+    [[ "$path_real" == "$site_real" ]] \
+        && { log_error "Zipping the website root from this API is not allowed"; exit 1; }
+    local site_user; site_user=$(_site_exec_user "$domain") \
+        || { log_error "Website user not found"; exit 1; }
+    local base_name="${path_real##*/}"
     local zip_name="${base_name}.zip"
-    local parent_dir; parent_dir="$(dirname "$abs_path")"
+    local parent_dir; parent_dir="$(dirname "$path_real")"
     local zip_full="${parent_dir}/${zip_name}"
-    cd "$parent_dir" && zip -r "$zip_full" "$base_name" >/dev/null 2>&1
-    printf '{"zip_name":"%s"}\n' "$zip_name"
+    [[ -L "$zip_full" ]] && { log_error "Refusing to overwrite a symbolic link"; exit 1; }
+    (cd "$parent_dir" && _run_as_site_user "$site_user" zip -r -y -- "$zip_full" "$base_name" >/dev/null 2>&1) \
+        || { log_error "Failed to create archive (check website write permissions)"; exit 1; }
+    local safe_name; safe_name=$(printf '%s' "$zip_name" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    printf '{"zip_name":"%s"}\n' "$safe_name"
 }
 
 _api_unzip_path() {
     local domain="$1" abs_zip="$2" abs_dest="${3:-}"
     [[ -z "$domain" || -z "$abs_zip" ]] && { log_error "Domain and zip path required"; exit 1; }
+    validate_domain "$domain" || { log_error "Invalid domain: $domain"; exit 1; }
     local site_dir; site_dir=$(get_site_dir "$domain")
-    [[ "$abs_zip" != "${site_dir}"* ]] && { log_error "Zip path not allowed"; exit 1; }
-    [[ ! -f "$abs_zip" ]] && { log_error "File not found: $abs_zip"; exit 1; }
+    local zip_real; zip_real=$(_realpath_within_site "$site_dir" "$abs_zip" 1) \
+        || { log_error "Zip path is outside the website or does not exist"; exit 1; }
+    [[ ! -f "$zip_real" ]] && { log_error "File not found: $abs_zip"; exit 1; }
     [[ -z "$abs_dest" ]] && abs_dest="$(dirname "$abs_zip")"
-    [[ "$abs_dest" != "${site_dir}"* ]] && { log_error "Dest path not allowed"; exit 1; }
-    mkdir -p "$abs_dest"
-    unzip -o "$abs_zip" -d "$abs_dest" >/dev/null 2>&1
+    local dest_real; dest_real=$(_realpath_within_site "$site_dir" "$abs_dest" 0) \
+        || { log_error "Destination is outside the website"; exit 1; }
+    local site_user; site_user=$(_site_exec_user "$domain") \
+        || { log_error "Website user not found"; exit 1; }
+    _run_as_site_user "$site_user" mkdir -p -- "$dest_real" \
+        || { log_error "Cannot create destination with website user permissions"; exit 1; }
+    command -v python3 &>/dev/null || { log_error "python3 is required for safe archive extraction"; exit 1; }
+    if ! _run_as_site_user "$site_user" python3 - "$zip_real" "$dest_real" <<'PY'
+import os
+import shutil
+import stat
+import sys
+import zipfile
+
+archive, destination = sys.argv[1], os.path.realpath(sys.argv[2])
+with zipfile.ZipFile(archive) as zf:
+    total_size = sum(info.file_size for info in zf.infolist())
+    if total_size > int(shutil.disk_usage(destination).free * 0.8):
+        raise SystemExit('archive would consume too much free disk space')
+    for info in zf.infolist():
+        name = info.filename.replace('\\', '/')
+        parts = [part for part in name.split('/') if part not in ('', '.')]
+        if name.startswith('/') or any(part == '..' for part in parts):
+            raise SystemExit('path traversal entry')
+        if stat.S_ISLNK(info.external_attr >> 16):
+            raise SystemExit('symbolic link entry')
+        target = os.path.realpath(os.path.join(destination, *parts))
+        if os.path.commonpath((destination, target)) != destination:
+            raise SystemExit('entry outside destination')
+        current = destination
+        for part in parts:
+            current = os.path.join(current, part)
+            if os.path.lexists(current) and os.path.islink(current):
+                raise SystemExit('existing symbolic link in destination')
+    zf.extractall(destination)
+PY
+    then
+        log_error "Unsafe archive or extraction failed"
+        exit 1
+    fi
     echo '{"ok":true}'
 }
 
@@ -6881,7 +7583,7 @@ _api_run_site_backup() {
     local _sdir; _sdir=$(get_site_dir "$domain")
     [[ ! -d "$_sdir" ]] && { log_error "Site directory not found: $domain"; exit 1; }
     local _ts; _ts=$(date +%Y%m%d_%H%M%S)
-    mkdir -p "$_bdir"
+    _secure_backup_dir "$_bdir"
 
     if [[ "$btype" == "1" || "$btype" == "2" ]]; then
         local _cbk="${_bdir}/code_${_ts}.tar.gz"
@@ -6906,6 +7608,7 @@ _api_run_site_backup() {
             fi
         fi
     fi
+    _secure_backup_files "$_bdir"
     log_success "Backup complete → ${_bdir}"
 }
 
@@ -7232,6 +7935,12 @@ main() {
             _run_scheduled_backup "${2:-}" "${3:-7}" "${4:-1}"
             ;;
 
+        _cron_malware_scan)
+            check_root
+            detect_os
+            _run_scheduled_malware_scan "${2:---all}"
+            ;;
+
         # ── Internal API (called non-interactively by liuercp) ────────────────
         create_site)       check_root; detect_os; _api_create_site    "${2:-}" "${3:-php}"  "${4:-8.3}" ;;
         delete_site)       check_root; detect_os; _api_delete_site    "${2:-}" ;;
@@ -7275,7 +7984,7 @@ main() {
         run_site_backup)         check_root; detect_os; _api_run_site_backup        "${2:-}" "${3:-1}" ;;
         restore_backup_file)     check_root; detect_os; _api_restore_backup_file    "${2:-}" "${3:-}" ;;
         zip_path)              check_root;            _api_zip_path   "${2:-}" "${3:-}"        ;;
-        unzip_path)            check_root;            _api_unzip_path "${2:-}" "${3:-}" "${4:-.}" ;;
+        unzip_path)            check_root;            _api_unzip_path "${2:-}" "${3:-}" "${4:-}" ;;
 
         # ── Unknown command ───────────────────────────────────────────────────
         *)

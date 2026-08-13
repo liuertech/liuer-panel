@@ -1,6 +1,6 @@
 # Liuer Panel
 
-[![Version](https://img.shields.io/badge/version-2.6.43-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
+[![Version](https://img.shields.io/badge/version-2.6.44-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
 [![Shell](https://img.shields.io/badge/shell-Bash-4EAA25.svg)](https://www.gnu.org/software/bash/)
 
 Liuer Panel is a lightweight command-line control panel for provisioning and managing Linux web servers. It manages Nginx, isolated PHP-FPM pools, databases, SSL certificates, website users, backups, security services, and common framework tasks from the `liuer` command.
@@ -47,7 +47,7 @@ During installation, you can optionally add:
 
 - PHP 5.6, 7.4, 8.0, or 8.3 alongside PHP 8.2
 - PostgreSQL
-- Redis or Memcached
+- Redis or Memcached as a legacy global/shared service
 - Fail2ban
 - phpMyAdmin
 
@@ -163,20 +163,25 @@ Backups are stored under:
 - Install extensions for a selected PHP version
 - List loaded PHP extensions
 - Maintain a separate PHP-FPM socket and pool per website
+- Use private per-site PHP temporary, upload, and session directories outside the document root
 
 ### Cache management
 
-- Flush Redis
-- Flush Memcached
+- Create a Redis Unix-socket instance isolated to one website user
+- Create a Memcached Unix-socket instance isolated to one website user
+- Display and flush per-site cache endpoints
+- Keep global Redis/Memcached controls available for legacy sites with an explicit shared-cache warning
 - Clear PHP Opcache by restarting PHP-FPM
-- Flush all supported caches in one operation
 
 ### Security
 
 - Manage UFW or firewalld and inspect listening ports
 - Scan one website or all website files with ClamAV
+- Optionally schedule daily or weekly ClamAV scans without automatically deleting or quarantining files
 - Install and manage Fail2ban, inspect bans, and unban IP addresses
 - Repair website and SFTP ownership and permissions
+- Enable optional write protection for WordPress and Laravel application code
+- Inspect, disable, or re-enable SELinux on supported systems
 - Require explicit confirmation for destructive operations
 
 ### System management
@@ -200,6 +205,8 @@ Backups are stored under:
 - Updating or repairing Nginx configuration
 - Opening HTTP and HTTPS firewall rules
 - Repairing SFTP chroot permissions
+- Creating private PHP runtime directories and repairing existing PHP-FPM pools
+- Restricting backup directories to root (`700`) and backup files to `600`
 - Starting the system cron service
 - Recreating and enabling the Liuer Certbot renewal timer
 
@@ -225,6 +232,7 @@ Display the saved URL from `liuer` → **System** → **Show phpMyAdmin URL**. T
 | CLI command | `/usr/local/bin/liuer` |
 | Panel configuration | `/etc/liuer-panel` |
 | Site metadata | `/etc/liuer-panel/sites` |
+| Isolated cache configuration | `/etc/liuer-cache` |
 | Nginx site configuration | `/etc/nginx/conf.d` |
 | Dynamic website files | `/home/web/<web-user>/<domain>` |
 | Dynamic website backups | `/home/backup/<web-user>/<domain>` |
@@ -234,6 +242,10 @@ Display the saved URL from `liuer` → **System** → **Show phpMyAdmin URL**. T
 
 - The panel performs privileged package, service, firewall, user, and filesystem operations; review the script before running it on a production server.
 - `/etc/liuer-panel` contains sensitive metadata and encrypted credentials and should remain root-only.
+- Backups are root-only because they can contain source code, environment files, and database data.
+- Reusing one web user for multiple websites remains supported, but those websites intentionally share the same Linux permission boundary.
+- Global Redis or Memcached instances are shared. Use the per-site Unix-socket cache option when websites require cache isolation.
+- SELinux is disabled by default on RHEL-family installations for compatibility, but it can be re-enabled from the Security menu; custom policies may be required.
 - Stored password encryption depends on `/etc/liuer-panel/secret.key`; protect this key and include it in secure disaster-recovery planning.
 - PHP 5.6 and 7.4 are end-of-life and should only be used temporarily for legacy applications.
 - Verify DNS and inbound ports 80/443 before requesting a Let's Encrypt certificate.
