@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.41"
+readonly VERSION="2.6.42"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -2008,6 +2008,49 @@ EOF
     press_enter
 }
 
+cleanup_legacy_certbot_schedules() {
+    # Older Liuer Panel releases installed `certbot renew` in root's crontab.
+    # Once our verified timer is active, remove those entries to prevent two
+    # independent renewal schedules from running on upgraded servers.
+    if command -v crontab &>/dev/null; then
+        local _old_crontab _new_crontab
+        _old_crontab=$(mktemp) || return 1
+        _new_crontab=$(mktemp) || { rm -f "$_old_crontab"; return 1; }
+
+        crontab -l > "$_old_crontab" 2>/dev/null || true
+        awk '
+            /^[[:space:]]*#/ { print; next }
+            /(^|[[:space:]])([^[:space:]]*\/)?certbot[[:space:]]+renew([[:space:]]|$)/ { next }
+            { print }
+        ' "$_old_crontab" > "$_new_crontab"
+
+        if ! cmp -s "$_old_crontab" "$_new_crontab"; then
+            if crontab "$_new_crontab"; then
+                log_success "Removed legacy Certbot renewal job from root crontab."
+            else
+                log_warn "Could not remove the legacy Certbot cron job."
+                rm -f "$_old_crontab" "$_new_crontab"
+                return 1
+            fi
+        fi
+        rm -f "$_old_crontab" "$_new_crontab"
+    fi
+
+    # Disable package/snap timers so the Liuer timer is the only scheduler.
+    local _legacy_timer
+    for _legacy_timer in certbot.timer snap.certbot.renew.timer; do
+        systemctl cat "$_legacy_timer" &>/dev/null || continue
+        if systemctl is-enabled --quiet "$_legacy_timer" 2>/dev/null \
+           || systemctl is-active --quiet "$_legacy_timer" 2>/dev/null; then
+            if systemctl disable --now "$_legacy_timer" &>/dev/null; then
+                log_success "Disabled legacy SSL timer: ${_legacy_timer}"
+            else
+                log_warn "Could not disable legacy SSL timer: ${_legacy_timer}"
+            fi
+        fi
+    done
+}
+
 setup_certbot_auto_renewal() {
     command -v certbot &>/dev/null || {
         log_error "Cannot configure SSL auto-renewal: certbot is not installed."
@@ -2053,6 +2096,8 @@ EOF
     if systemctl enable --now liuer-certbot-renew.timer &>/dev/null \
        && systemctl is-enabled --quiet liuer-certbot-renew.timer \
        && systemctl is-active --quiet liuer-certbot-renew.timer; then
+        cleanup_legacy_certbot_schedules || \
+            log_warn "SSL timer is active, but a legacy renewal schedule may remain."
         log_success "SSL auto-renewal enabled (checked every 10 days)."
         return 0
     fi
