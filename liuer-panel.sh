@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.45"
+readonly VERSION="2.6.46"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -4128,7 +4128,7 @@ _global_cache_service() {
 show_global_cache_status() {
     print_section "GLOBAL / SHARED CACHE STATUS"
     echo -e "${YELLOW}These services are shared by every website configured to use localhost TCP ports.${NC}\n"
-    local cache_type label port service active enabled
+    local cache_type label port service active enabled state
     for cache_type in redis memcached; do
         [[ "$cache_type" == "redis" ]] \
             && { label="Redis"; port="127.0.0.1:6379"; } \
@@ -4136,8 +4136,18 @@ show_global_cache_status() {
         if service=$(_global_cache_service "$cache_type"); then
             active=$(systemctl is-active "$service" 2>/dev/null || true)
             enabled=$(systemctl is-enabled "$service" 2>/dev/null || true)
-            printf "  %-12s service=%-14s status=%-10s boot=%-10s endpoint=%s\n" \
-                "$label" "$service" "${active:-unknown}" "${enabled:-unknown}" "$port"
+            if [[ "$active" == "active" && "$enabled" == "enabled" ]]; then
+                state="ON (now + after reboot)"
+            elif [[ "$active" != "active" && "$enabled" == "disabled" ]]; then
+                state="OFF (now + after reboot)"
+            elif [[ "$active" != "active" && "$enabled" == "enabled" ]]; then
+                state="MISMATCH: off now, WILL START after reboot"
+            elif [[ "$active" == "active" && "$enabled" != "enabled" ]]; then
+                state="MISMATCH: on now, WILL STOP after reboot"
+            else
+                state="UNKNOWN (${active:-unknown}/${enabled:-unknown})"
+            fi
+            printf "  %-12s %-48s service=%s endpoint=%s\n" "$label" "$state" "$service" "$port"
         else
             printf "  %-12s %s\n" "$label" "not installed"
         fi
@@ -4155,7 +4165,7 @@ _control_global_cache() {
     case "$action" in
         enable)
             systemctl enable --now "$service" \
-                && log_success "Global ${label} enabled and running (${service})." \
+                && log_success "Global ${label} is ON now and after reboot (${service})." \
                 || log_error "Could not enable/start ${service}."
             ;;
         disable)
@@ -4164,7 +4174,7 @@ _control_global_cache() {
             echo "Isolated Unix-socket instances are separate and will keep running."
             confirm_danger "Stop and disable global ${label}" || { log_info "Cancelled."; return; }
             systemctl disable --now "$service" \
-                && log_success "Global ${label} stopped and disabled (${service})." \
+                && log_success "Global ${label} is OFF now and after reboot (${service})." \
                 || log_error "Could not stop/disable ${service}."
             ;;
         *) return 1 ;;
@@ -4174,10 +4184,10 @@ _control_global_cache() {
 manage_global_cache() {
     while true; do
         show_global_cache_status
-        echo "  1) Enable and start global Redis"
-        echo "  2) Stop and disable global Redis"
-        echo "  3) Enable and start global Memcached"
-        echo "  4) Stop and disable global Memcached"
+        echo "  1) Turn ON global Redis (now + after reboot)"
+        echo "  2) Turn OFF global Redis (now + after reboot)"
+        echo "  3) Turn ON global Memcached (now + after reboot)"
+        echo "  4) Turn OFF global Memcached (now + after reboot)"
         echo "  5) Flush global Redis"
         echo "  6) Flush global Memcached"
         echo "  0) Back"

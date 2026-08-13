@@ -1,6 +1,6 @@
 # Liuer Panel
 
-[![Version](https://img.shields.io/badge/version-2.6.45-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
+[![Version](https://img.shields.io/badge/version-2.6.46-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
 [![Shell](https://img.shields.io/badge/shell-Bash-4EAA25.svg)](https://www.gnu.org/software/bash/)
 
 Liuer Panel is a lightweight command-line control panel for provisioning and managing Linux web servers. It manages Nginx, isolated PHP-FPM pools, databases, SSL certificates, website users, backups, security services, and common framework tasks from the `liuer` command.
@@ -175,6 +175,8 @@ Backups are stored under:
 - Show framework-aware connection instructions after setup and before returning to a shared cache
 - Disable and remove an isolated cache after the application has been reconfigured
 - Show status and enable, start, stop, disable, or flush global Redis/Memcached services
+- Treat global cache ON/OFF as persistent states: ON starts now and after reboot; OFF stops now and after reboot
+- Flag mismatched service states that would unexpectedly change after reboot
 - Protect global cache operations with explicit shared-cache impact warnings
 - Clear PHP Opcache by restarting PHP-FPM
 
