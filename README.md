@@ -1,6 +1,6 @@
 # Liuer Panel
 
-[![Version](https://img.shields.io/badge/version-2.6.42-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
+[![Version](https://img.shields.io/badge/version-2.6.43-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
 [![Shell](https://img.shields.io/badge/shell-Bash-4EAA25.svg)](https://www.gnu.org/software/bash/)
 
 Liuer Panel is a lightweight command-line control panel for provisioning and managing Linux web servers. It manages Nginx, isolated PHP-FPM pools, databases, SSL certificates, website users, backups, security services, and common framework tasks from the `liuer` command.
@@ -102,7 +102,7 @@ Dynamic website files use the following layout:
 - Reissue or renew a Let's Encrypt certificate from the site menu
 - Automatically install and enable `liuer-certbot-renew.timer`
 
-The Liuer timer checks Certbot every 10 days and reloads Nginx afterward. Certbot only renews certificates that have entered their renewal window; it does not request a new certificate every 10 days. Custom/paid certificates are not automatically renewed.
+The first check runs approximately 15 minutes after the timer is installed. After a successful check, Liuer runs Certbot every 10 days. If renewal fails, systemd retries every 12 hours until it succeeds and then returns to the normal 10-day cycle. Certbot only renews certificates that have entered their renewal window, and Nginx is reloaded through a deploy hook only after a certificate is renewed successfully. Custom/paid certificates are not automatically renewed.
 
 When installing or repairing the timer, Liuer Panel automatically removes the legacy `certbot renew` entry from root's crontab and disables the distribution or Snap Certbot timer. This keeps one verified renewal schedule after upgrading an older VPS.
 

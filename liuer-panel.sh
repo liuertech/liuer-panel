@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.42"
+readonly VERSION="2.6.43"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -2061,9 +2061,9 @@ setup_certbot_auto_renewal() {
     _certbot_bin=$(command -v certbot)
     _systemctl_bin=$(command -v systemctl)
 
-    # A dedicated timer avoids relying on distro-specific certbot timers. It
-    # checks every 10 days; certbot itself only replaces certificates that are
-    # inside their renewal window.
+    # A dedicated timer avoids relying on distro-specific Certbot timers. It
+    # checks every 10 days. A failed renewal is retried every 12 hours by the
+    # service until it succeeds; a successful run returns to the 10-day cycle.
     cat > "$CERTBOT_RENEW_SERVICE" <<EOF
 [Unit]
 Description=Liuer Panel Certbot renewal
@@ -2072,8 +2072,9 @@ After=network-online.target nginx.service
 
 [Service]
 Type=oneshot
-ExecStart=${_certbot_bin} renew --quiet
-ExecStartPost=${_systemctl_bin} reload nginx
+ExecStart=${_certbot_bin} renew --quiet --deploy-hook "${_systemctl_bin} reload nginx"
+Restart=on-failure
+RestartSec=12h
 EOF
 
     cat > "$CERTBOT_RENEW_TIMER" <<'EOF'
@@ -2081,10 +2082,9 @@ EOF
 Description=Check Let's Encrypt certificates every 10 days
 
 [Timer]
-OnBootSec=15min
+OnActiveSec=15min
 OnUnitActiveSec=10d
 AccuracySec=1h
-Persistent=true
 Unit=liuer-certbot-renew.service
 
 [Install]
@@ -2093,12 +2093,14 @@ EOF
 
     chmod 644 "$CERTBOT_RENEW_SERVICE" "$CERTBOT_RENEW_TIMER"
     systemctl daemon-reload
-    if systemctl enable --now liuer-certbot-renew.timer &>/dev/null \
+    systemctl reset-failed liuer-certbot-renew.service &>/dev/null || true
+    if systemctl enable liuer-certbot-renew.timer &>/dev/null \
+       && systemctl restart liuer-certbot-renew.timer &>/dev/null \
        && systemctl is-enabled --quiet liuer-certbot-renew.timer \
        && systemctl is-active --quiet liuer-certbot-renew.timer; then
         cleanup_legacy_certbot_schedules || \
             log_warn "SSL timer is active, but a legacy renewal schedule may remain."
-        log_success "SSL auto-renewal enabled (checked every 10 days)."
+        log_success "SSL auto-renewal enabled (10-day cycle, 12-hour retry on failure)."
         return 0
     fi
 
