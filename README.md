@@ -1,6 +1,6 @@
 # Liuer Panel
 
-[![Version](https://img.shields.io/badge/version-2.6.46-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
+[![Version](https://img.shields.io/badge/version-2.6.47-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
 [![Shell](https://img.shields.io/badge/shell-Bash-4EAA25.svg)](https://www.gnu.org/software/bash/)
 
 Liuer Panel is a lightweight command-line control panel for provisioning and managing Linux web servers. It manages Nginx, isolated PHP-FPM pools, databases, SSL certificates, website users, backups, security services, and common framework tasks from the `liuer` command.
@@ -242,9 +242,25 @@ Stopping or flushing a global cache affects every website still connected to its
 - Optionally schedule daily or weekly ClamAV scans without automatically deleting or quarantining files
 - Install and manage Fail2ban, inspect bans, and unban IP addresses
 - Repair website and SFTP ownership and permissions
-- Enable optional write protection for WordPress and Laravel application code
+- Choose balanced or strict WordPress permissions, or protect Laravel application code
 - Inspect, disable, or re-enable SELinux on supported systems
 - Require explicit confirmation for destructive operations
+
+#### WordPress and Laravel permission profiles
+
+WordPress offers three permission profiles:
+
+| Profile | WordPress core | `wp-content` | Dashboard plugin/theme management |
+| --- | --- | --- | --- |
+| Balanced | Read-only to PHP | Writable by the site's web user | Supported |
+| Strict | Read-only to PHP | Only uploads, cache, and upgrade directories writable | Blocked |
+| Editable | Writable by the site's web user | Writable by the site's web user | Supported |
+
+Balanced protects `wp-admin`, `wp-includes`, root PHP files, and `wp-config.php`, while allowing WordPress to install, delete, and update plugins and themes. This is a usability/security tradeoff: code executing through a compromised WordPress site runs as the same web user and can also modify files under `wp-content`. Use Strict when plugin and theme changes are performed manually by an administrator and maximum write restriction is preferred.
+
+Upgrading to version 2.6.47 reapplies existing `framework_hardened` WordPress profiles as Balanced during automatic repair. Sites explicitly changed to Strict remain Strict.
+
+Laravel protection keeps application code read-only to PHP while leaving `storage` and `bootstrap/cache` writable. Plain PHP websites remain user-managed because their required writable paths cannot be inferred safely.
 
 ### System management
 

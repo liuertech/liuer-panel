@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.46"
+readonly VERSION="2.6.47"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -725,7 +725,12 @@ _set_site_perms() {
 # Re-apply group-writable perms for all SFTP chroot dirs (run AFTER _set_site_perms)
 _repair_sftp_perms() {
     local _sshd="/etc/ssh/sshd_config"
-    [[ -f "$_sshd" ]] || return 0
+    if [[ ! -f "$_sshd" ]]; then
+        # Framework profiles are part of website permissions, not SFTP. Always
+        # restore them even on systems without an sshd configuration file.
+        _reapply_framework_hardening
+        return 0
+    fi
     local _sfuser="" _in_match=0
     while IFS= read -r _line; do
         if [[ "$_line" =~ ^[[:space:]]*Match[[:space:]]+User[[:space:]]+([^[:space:]]+) ]]; then
@@ -1565,7 +1570,7 @@ change_web_user() {
         echo "WEB_USER=${_new_user}" >> "$_meta"
     fi
     _update_isolated_cache_user "$domain" "$_new_user"
-    grep -q '^PERMISSION_PROFILE=framework_hardened$' "$_meta" 2>/dev/null \
+    grep -qE '^PERMISSION_PROFILE=framework_(hardened|strict)$' "$_meta" 2>/dev/null \
         && _apply_framework_permissions "$domain" 1 || true
 
     log_success "Web user for ${domain} changed: ${_cur_user:-default} → ${_new_user}"
@@ -2067,10 +2072,13 @@ EOF
     # required writable directories. Plain PHP remains fully user-managed.
     if [[ "$site_type" == "2" || "$site_type" == "3" ]]; then
         echo ""
-        log_info "Optional security: make application code read-only to PHP/SFTP."
-        [[ "$site_type" == "3" ]] \
-            && log_warn "WordPress dashboard core/plugin/theme updates may stop working while enabled."
-        confirm_action "Enable framework write protection for ${domain}?" \
+        if [[ "$site_type" == "3" ]]; then
+            log_info "Optional security: protect WordPress core while keeping wp-content manageable."
+            log_warn "PHP will still be able to modify plugins, themes, uploads and other wp-content files."
+        else
+            log_info "Optional security: make Laravel code read-only except required runtime directories."
+        fi
+        confirm_action "Enable the balanced framework permission profile for ${domain}?" \
             && _apply_framework_permissions "$domain" || true
     fi
 
@@ -4638,10 +4646,10 @@ fix_permissions() {
 }
 
 _apply_framework_permissions() {
-    local domain="$1" quiet="${2:-0}"
+    local domain="$1" quiet="${2:-0}" requested_profile="${3:-}"
     local meta="${SITES_META_DIR}/${domain}.conf"
     [[ -f "$meta" ]] || return 1
-    local site_type site_user site_dir web_root
+    local site_type site_user site_dir web_root profile
     site_type=$(grep '^TYPE=' "$meta" 2>/dev/null | cut -d= -f2)
     site_user=$(grep '^WEB_USER=' "$meta" 2>/dev/null | cut -d= -f2)
     site_dir=$(get_site_dir "$domain")
@@ -4651,6 +4659,10 @@ _apply_framework_permissions() {
     }
     [[ "$site_type" =~ ^(wordpress|laravel)$ && -n "$site_user" && -d "$site_dir" ]] || return 1
 
+    profile="$requested_profile"
+    [[ -z "$profile" ]] && profile=$(grep '^PERMISSION_PROFILE=' "$meta" 2>/dev/null | cut -d= -f2)
+    [[ ! "$profile" =~ ^framework_(hardened|strict)$ ]] && profile="framework_hardened"
+
     chown -R root:"$site_user" "$site_dir"
     chown root:root "$site_dir" && chmod 755 "$site_dir"
     find "$site_dir" -mindepth 1 -type d -exec chmod 750 {} \;
@@ -4659,31 +4671,49 @@ _apply_framework_permissions() {
     local -a writable=()
     if [[ "$site_type" == "laravel" ]]; then
         writable+=("${site_dir}/storage" "${site_dir}/bootstrap/cache")
-    else
+    elif [[ "$profile" == "framework_strict" ]]; then
+        # Strict WordPress mode blocks dashboard plugin/theme installation,
+        # deletion and updates. Only runtime content remains writable.
         writable+=("${web_root}/wp-content/uploads" "${web_root}/wp-content/cache" "${web_root}/wp-content/upgrade")
+    else
+        # Balanced WordPress mode protects core and wp-config.php while keeping
+        # wp-content manageable from the dashboard (plugins, themes, languages,
+        # cache, uploads and object-cache drop-ins).
+        writable+=("${web_root}/wp-content")
     fi
     local dir
     for dir in "${writable[@]}"; do
         mkdir -p "$dir"
         chown -R "$site_user":"$site_user" "$dir"
-        find "$dir" -type d -exec chmod 770 {} \;
-        find "$dir" -type f -exec chmod 660 {} \;
+        if [[ "$site_type" == "wordpress" && "$profile" == "framework_hardened" ]]; then
+            # PHP-FPM is the owner and can write with 750/640. Do not grant
+            # group write here because nginx is also a member of the site group.
+            find "$dir" -type d -exec chmod 750 {} \;
+            find "$dir" -type f -exec chmod 640 {} \;
+        else
+            find "$dir" -type d -exec chmod 770 {} \;
+            find "$dir" -type f -exec chmod 660 {} \;
+        fi
     done
-    _site_meta_set "$domain" PERMISSION_PROFILE framework_hardened
-    [[ "$quiet" == "1" ]] || log_success "Framework write protection enabled for ${domain}."
+    _site_meta_set "$domain" PERMISSION_PROFILE "$profile"
+    if [[ "$quiet" != "1" ]]; then
+        [[ "$site_type" == "wordpress" && "$profile" == "framework_hardened" ]] \
+            && log_success "Balanced WordPress protection enabled: core read-only, wp-content editable." \
+            || log_success "Strict framework write protection enabled for ${domain}."
+    fi
 }
 
 _reapply_framework_hardening() {
     local _mf
     for _mf in "${SITES_META_DIR}"/*.conf; do
         [[ -f "$_mf" ]] || continue
-        grep -q '^PERMISSION_PROFILE=framework_hardened$' "$_mf" 2>/dev/null || continue
+        grep -qE '^PERMISSION_PROFILE=framework_(hardened|strict)$' "$_mf" 2>/dev/null || continue
         _apply_framework_permissions "$(basename "$_mf" .conf)" 1 || true
     done
 }
 
 manage_framework_permissions() {
-    print_section "FRAMEWORK WRITE PROTECTION"
+    print_section "FRAMEWORK PERMISSIONS"
     SELECTED_DOMAIN=""
     _select_domain "Select WordPress/Laravel website" || { press_enter; return; }
     local domain="$SELECTED_DOMAIN" meta="${SITES_META_DIR}/${SELECTED_DOMAIN}.conf"
@@ -4696,20 +4726,39 @@ manage_framework_permissions() {
         log_warn "This optional profile only supports WordPress and Laravel."
         press_enter; return
     fi
+    local profile_label="Editable"
+    [[ "$profile" == "framework_hardened" ]] && profile_label="Balanced"
+    [[ "$profile" == "framework_strict" ]] && profile_label="Strict"
     echo -e "  Site    : ${BOLD}${domain}${NC} (${site_type})"
-    echo -e "  Profile : ${BOLD}${profile:-editable}${NC}"
+    echo -e "  Profile : ${BOLD}${profile_label}${NC}"
     echo ""
-    echo "  1) Enable framework write protection"
-    echo "  2) Restore editable permissions"
+    if [[ "$site_type" == "wordpress" ]]; then
+        echo "  1) Balanced: protect WordPress core, allow wp-content management"
+        echo "  2) Strict: block plugin/theme installation, deletion and updates"
+        echo "  3) Editable: allow the web user to edit all site files"
+    else
+        echo "  1) Protect Laravel code; allow storage and bootstrap/cache"
+        echo "  3) Editable: allow the web user to edit all site files"
+    fi
     echo "  0) Back"
     echo -ne "${YELLOW}Select:${NC} "; read -r _ch
     case "$_ch" in
         1)
-            log_warn "Application code becomes read-only to PHP/SFTP. WordPress in-dashboard updates may fail."
-            confirm_action "Enable this optional protection?" || return
-            _apply_framework_permissions "$domain"
+            if [[ "$site_type" == "wordpress" ]]; then
+                log_warn "WordPress core stays read-only, but PHP can modify all wp-content files."
+            else
+                log_warn "Laravel application code becomes read-only to PHP/SFTP."
+            fi
+            confirm_action "Apply this permission profile?" || return
+            _apply_framework_permissions "$domain" 0 framework_hardened
             ;;
         2)
+            [[ "$site_type" != "wordpress" ]] && { log_warn "Invalid selection."; press_enter; return; }
+            log_warn "Strict mode prevents WordPress from deleting, installing or updating plugins/themes."
+            confirm_action "Enable strict WordPress protection?" || return
+            _apply_framework_permissions "$domain" 0 framework_strict
+            ;;
+        3)
             confirm_action "Allow the website user to edit all site files again?" || return
             _set_site_perms "$site_dir" "$site_user"
             _site_meta_set "$domain" PERMISSION_PROFILE editable
@@ -4780,7 +4829,7 @@ manage_security() {
         echo "  3) Fail2ban management"
         echo "  4) Fix permissions"
         echo "  5) SELinux status / enable / disable"
-        echo "  6) Optional WordPress/Laravel write protection"
+        echo "  6) WordPress/Laravel permission profiles"
         echo "  0) Back"
         echo -e "${YELLOW}Select:${NC} \c"
         read -r _ch
@@ -5449,6 +5498,11 @@ do_repair() {
 
     # 0a.2 Restrict existing backup directories and archives to root
     _repair_all_backup_permissions
+
+    # 0a.3 Re-apply saved framework profiles. In 2.6.47, existing WordPress
+    # framework_hardened profiles become balanced (core protected, wp-content
+    # manageable) so dashboard plugin/theme operations work again.
+    _reapply_framework_hardening
 
     # 0b. Upgrade nginx to mainline if < 1.25
     upgrade_nginx_mainline
