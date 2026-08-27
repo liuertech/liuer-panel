@@ -1,6 +1,6 @@
 # Liuer Panel
 
-[![Version](https://img.shields.io/badge/version-2.6.47-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
+[![Version](https://img.shields.io/badge/version-2.6.48-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
 [![Shell](https://img.shields.io/badge/shell-Bash-4EAA25.svg)](https://www.gnu.org/software/bash/)
 
 Liuer Panel is a lightweight command-line control panel for provisioning and managing Linux web servers. It manages Nginx, isolated PHP-FPM pools, databases, SSL certificates, website users, backups, security services, and common framework tasks from the `liuer` command.
@@ -72,6 +72,7 @@ Most management commands require root privileges. Use `sudo liuer ...` when you 
 ### Website management
 
 - Create plain PHP, Laravel, WordPress, and static HTML websites
+- Create WordPress with the latest core, a selected core version, or an empty web root with a database for manual upload/restore
 - Generate and validate an Nginx virtual host automatically
 - Use a dedicated Linux web user and PHP-FPM pool for each dynamic site
 - Change a site's PHP version without recreating the website
@@ -93,6 +94,8 @@ Dynamic website files use the following layout:
 ├── public/        # Laravel document root
 └── public_html/   # PHP or WordPress document root
 ```
+
+The empty WordPress option creates the site and MySQL/MariaDB credentials but does not download core or generate `wp-config.php`. Its files remain Editable for manual upload or restore; apply the Balanced or Strict permission profile after the source has been uploaded.
 
 ### SSL certificates
 
@@ -132,6 +135,7 @@ Website cron jobs never fall back to the root crontab. A website must have an as
 - Generate database names, usernames, and strong passwords
 - Automatically configure Laravel `.env` database settings
 - Automatically configure WordPress database credentials
+- Create WordPress database credentials without downloading WordPress core
 - Use SQLite when creating a Laravel project
 - Encrypt stored database and user passwords with a server-local secret key
 

@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.47"
+readonly VERSION="2.6.48"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -1776,7 +1776,7 @@ create_website() {
     local web_user="${site_user:-www-data}"
 
     # --- Site-type specific setup ---
-    local type_name="" wp_ver_used="" laravel_ver_used=""
+    local type_name="" wp_ver_used="" wp_source_mode="" wp_core_ready=0 laravel_ver_used=""
     local db_name_created="" db_user_created="" db_pass_created=""
 
     case "$site_type" in
@@ -1949,28 +1949,67 @@ PHP
 
         3) # WordPress
             type_name="wordpress"
-            echo -e "\n${BOLD}WordPress version [Enter for latest]:${NC} \c"
-            read -r _wpver
+            echo -e "\n${BOLD}WordPress source:${NC}"
+            echo "  1) Download latest WordPress (default)"
+            echo "  2) Download a specific WordPress version"
+            echo "  3) Empty directory + database (do not download WordPress)"
+            echo -e "${YELLOW}Select [1-3, Enter=1]:${NC} \c"
+            local _wp_source_choice
+            read -r _wp_source_choice
+            [[ -z "$_wp_source_choice" ]] && _wp_source_choice="1"
 
-            local wp_url
-            if [[ -z "$_wpver" ]]; then
-                wp_url="https://wordpress.org/latest.tar.gz"
-                wp_ver_used="latest"
-            else
-                wp_url="https://wordpress.org/wordpress-${_wpver}.tar.gz"
-                wp_ver_used="$_wpver"
-            fi
+            local wp_url="" _wpver="" _wp_create_db=0
+            case "$_wp_source_choice" in
+                1)
+                    wp_source_mode="latest"
+                    wp_url="https://wordpress.org/latest.tar.gz"
+                    wp_ver_used="latest"
+                    ;;
+                2)
+                    while true; do
+                        echo -e "${BOLD}WordPress version (e.g. 6.8.2):${NC} \c"
+                        read -r _wpver
+                        [[ "$_wpver" =~ ^[0-9]+\.[0-9]+([.][0-9]+)?$ ]] && break
+                        log_warn "Invalid WordPress version. Try again."
+                    done
+                    wp_source_mode="version"
+                    wp_url="https://wordpress.org/wordpress-${_wpver}.tar.gz"
+                    wp_ver_used="$_wpver"
+                    ;;
+                3)
+                    wp_source_mode="empty"
+                    wp_ver_used="not downloaded"
+                    _wp_create_db=1
+                    log_info "The web root will remain empty for manual upload or restore."
+                    ;;
+                *)
+                    log_warn "Invalid selection. Using the latest WordPress version."
+                    wp_source_mode="latest"
+                    wp_url="https://wordpress.org/latest.tar.gz"
+                    wp_ver_used="latest"
+                    ;;
+            esac
 
-            log_info "Downloading WordPress ${wp_ver_used}..."
-            if curl -fsSL "$wp_url" | tar -xz -C "$web_root" --strip-components=1 2>/dev/null; then
-                log_success "WordPress downloaded."
-            else
-                log_warn "WordPress download failed. Please upload files manually."
+            if [[ "$wp_source_mode" != "empty" ]]; then
+                log_info "Downloading WordPress ${wp_ver_used}..."
+                if curl -fsSL "$wp_url" | tar -xz -C "$web_root" --strip-components=1 2>/dev/null; then
+                    wp_core_ready=1
+                    log_success "WordPress downloaded."
+                else
+                    wp_source_mode="download_failed"
+                    wp_ver_used="${wp_ver_used} (download failed)"
+                    log_warn "WordPress download failed. Please upload files manually."
+                fi
             fi
 
             # Auto-create database for WordPress
             echo ""
-            if confirm_action "Auto-create database and configure wp-config.php?"; then
+            if [[ "$wp_source_mode" == "empty" ]]; then
+                log_info "Creating a database for the empty WordPress site..."
+            elif confirm_action "Auto-create database and configure wp-config.php?"; then
+                _wp_create_db=1
+            fi
+            if [[ "$_wp_create_db" == "1" ]]; then
                 local _db_name _db_user _db_pass
                 _db_name="db_$(echo "$domain" | tr '.-' '_' | cut -c1-12)_$(rand_str 4)"
                 _db_user="u_$(rand_str 10)"
@@ -2014,6 +2053,8 @@ PHP
                         fi
                         chmod 640 "${web_root}/wp-config.php"
                         log_success "wp-config.php configured."
+                    elif [[ "$wp_source_mode" == "empty" ]]; then
+                        log_info "No wp-config.php was created because WordPress core was not downloaded."
                     fi
                 else
                     log_warn "Database creation failed. Configure wp-config.php manually."
@@ -2065,12 +2106,13 @@ SITE_DIR=${site_dir}
 WEB_USER=${site_user}
 DISABLE_FUNCTIONS=1
 CREATED=$(date '+%Y-%m-%d %H:%M:%S')
+${wp_source_mode:+WP_SOURCE_MODE=${wp_source_mode}}
 EOF
     chmod 600 "${SITES_META_DIR}/${domain}.conf"
 
     # Framework-aware write protection is offered only where Liuer knows the
     # required writable directories. Plain PHP remains fully user-managed.
-    if [[ "$site_type" == "2" || "$site_type" == "3" ]]; then
+    if [[ "$site_type" == "2" || ( "$site_type" == "3" && "$wp_core_ready" == "1" ) ]]; then
         echo ""
         if [[ "$site_type" == "3" ]]; then
             log_info "Optional security: protect WordPress core while keeping wp-content manageable."
@@ -2080,6 +2122,10 @@ EOF
         fi
         confirm_action "Enable the balanced framework permission profile for ${domain}?" \
             && _apply_framework_permissions "$domain" || true
+    elif [[ "$site_type" == "3" && "$wp_core_ready" != "1" ]]; then
+        echo ""
+        log_info "Permissions remain editable so the WordPress files can be uploaded or restored."
+        log_warn "After uploading the source, enable Balanced or Strict permissions from Security settings."
     fi
 
     # --- SSL ---
@@ -2107,6 +2153,8 @@ EOF
     printf "  %-12s: %s\n"  "Web root" "$web_root"
     printf "  %-12s: %s\n"  "PHP"      "${php_ver:-N/A}"
     printf "  %-12s: %s\n"  "SSL"      "$ssl_status"
+    [[ "$site_type" == "3" ]] \
+        && printf "  %-12s: %s\n" "WP source" "$wp_ver_used"
     if [[ -n "$db_name_created" ]]; then
         printf "  %-12s: %s\n"  "DB name"  "$db_name_created"
         printf "  %-12s: %s\n"  "DB user"  "$db_user_created"
