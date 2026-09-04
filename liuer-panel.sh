@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.48"
+readonly VERSION="2.6.49"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -2556,6 +2556,7 @@ _list_websites_inline() {
 SELECTED_DOMAIN=""
 _select_domain() {
     local prompt="${1:-Select site}"
+    local cancel_label="${2:-Cancel}"
     local -a _domains=()
     for conf in "${NGINX_CONF_DIR}"/*.conf "${NGINX_CONF_DIR}"/*.conf.disabled; do
         [[ -f "$conf" ]] || continue
@@ -2570,7 +2571,7 @@ _select_domain() {
     done
 
     if [[ ${#_domains[@]} -eq 0 ]]; then
-        log_warn "No websites found."; return 1
+        log_warn "No websites found."; return 2
     fi
 
     echo ""
@@ -2582,13 +2583,13 @@ _select_domain() {
         printf "  %2d) %s%b\n" "$i" "$d" "$_lock_str"
         ((i++)) || true
     done
-    echo -e "   0) Cancel"
+    echo -e "   0) ${cancel_label}"
     echo -ne "\n  ${prompt} [1-$((i-1))]: "
     read -r _sel
 
     if [[ "$_sel" == "0" || -z "$_sel" ]]; then return 1; fi
     if [[ ! "$_sel" =~ ^[0-9]+$ ]] || [[ "$_sel" -lt 1 ]] || [[ "$_sel" -gt ${#_domains[@]} ]]; then
-        log_warn "Invalid selection."; return 1
+        log_warn "Invalid selection."; return 2
     fi
     SELECTED_DOMAIN="${_domains[$((${_sel}-1))]}"
 }
@@ -6318,6 +6319,8 @@ disk_benchmark() {
 _run_scheduled_backup() {
     # Called by cron: _run_scheduled_backup <domain|--all> <keep> <type:1|2|3>
     local _target="${1:---all}" _keep="${2:-7}" _btype="${3:-1}"
+    [[ "$_keep" =~ ^[1-9][0-9]*$ ]] || _keep=7
+    [[ "$_btype" =~ ^[1-3]$ ]] || _btype=1
 
     _do_one_backup() {
         local _dom="$1"
@@ -6370,10 +6373,56 @@ _run_scheduled_backup() {
     fi
 }
 
+# Extract arguments from a scheduled-backup crontab line without relying on
+# variable-length PCRE lookbehind (unsupported by GNU grep). Output format:
+# domain|retention|type
+_parse_backup_schedule_args() {
+    local _line="$1"
+    awk '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "_cron_backup") {
+                    domain = (i + 1 <= NF ? $(i + 1) : "--all")
+                    keep = (i + 2 <= NF ? $(i + 2) : "7")
+                    type = (i + 3 <= NF ? $(i + 3) : "1")
+                    print domain "|" keep "|" type
+                    exit
+                }
+            }
+        }
+    ' <<< "$_line"
+}
+
+_backup_type_label() {
+    case "$1" in
+        1) echo "Files + Database" ;;
+        2) echo "Files only" ;;
+        3) echo "Database only" ;;
+        *) echo "Files + Database" ;;
+    esac
+}
+
+_format_backup_cron_time() {
+    local _hour="$1" _minute="$2"
+    if [[ "$_hour" =~ ^[0-9]{1,2}$ && "$_minute" =~ ^[0-9]{1,2}$ ]] \
+       && (( 10#$_hour <= 23 && 10#$_minute <= 59 )); then
+        printf '%02d:%02d' "$((10#$_hour))" "$((10#$_minute))"
+    else
+        printf '%s:%s' "${_hour:-0}" "${_minute:-0}"
+    fi
+}
+
+_active_backup_schedule_lines() {
+    crontab -l 2>/dev/null \
+        | awk '!/^[[:space:]]*#/ && /(^|[[:space:]])_cron_backup([[:space:]]|$)/'
+}
+
 schedule_backup() {
     print_section "SCHEDULE AUTO BACKUP"
-    echo -e "\n  0) All sites"
-    _select_domain "Select site (or 0 for all)" || true
+    SELECTED_DOMAIN=""
+    local _scope_status=0
+    _select_domain "Select site (or 0 for all)" "All sites" || _scope_status=$?
+    [[ "$_scope_status" == "2" ]] && { press_enter; return 1; }
     local _sdom="${SELECTED_DOMAIN:-all}"
 
     echo -e "\n${BOLD}Backup type:${NC}"
@@ -6391,11 +6440,20 @@ schedule_backup() {
 
     echo -ne "\n  Time (HH:MM, e.g. 02:30): "; read -r _stime
     local _sh="${_stime%%:*}" _sm="${_stime##*:}"
-    [[ "$_sh" =~ ^[0-9]{1,2}$ && "$_sm" =~ ^[0-9]{2}$ ]] \
-        || { log_error "Invalid time format."; press_enter; return 1; }
+    if [[ ! "$_sh" =~ ^[0-9]{1,2}$ || ! "$_sm" =~ ^[0-9]{2}$ ]] \
+       || (( 10#$_sh > 23 || 10#$_sm > 59 )); then
+        log_error "Invalid time. Use HH:MM from 00:00 to 23:59."
+        press_enter; return 1
+    fi
+    _sh=$((10#$_sh))
+    _sm=$((10#$_sm))
 
-    echo -ne "  Keep last N backups [7]: "; read -r _skeep
+    echo -ne "  Retention — keep last N backup runs [7]: "; read -r _skeep
     [[ -z "$_skeep" ]] && _skeep=7
+    if [[ ! "$_skeep" =~ ^[1-9][0-9]*$ ]] || (( _skeep > 10000 )); then
+        log_error "Retention must be a whole number from 1 to 10000."
+        press_enter; return 1
+    fi
 
     local _scron_time
     case "$_sfreq" in
@@ -6422,11 +6480,7 @@ schedule_backup() {
         press_enter; return 1
     fi
 
-    local _type_label; case "$_sbtype" in
-        1) _type_label="Files + Database" ;;
-        2) _type_label="Files only" ;;
-        3) _type_label="Database only" ;;
-    esac
+    local _type_label; _type_label=$(_backup_type_label "$_sbtype")
 
     log_success "Scheduled backup set!"
     printf "  %-12s: %s\n" "Domain"    "$_sdom"
@@ -6533,7 +6587,7 @@ view_backup_schedules() {
     print_section "BACKUP SCHEDULES"
 
     local _raw
-    _raw=$(crontab -l 2>/dev/null | grep "_cron_backup" || true)
+    _raw=$(_active_backup_schedule_lines || true)
 
     if [[ -z "$_raw" ]]; then
         log_warn "No backup schedules found."
@@ -6546,28 +6600,24 @@ view_backup_schedules() {
 
     local _idx=1
     while IFS= read -r _line; do
-        local _cron_expr _domain _keep _btype _label _freq_label
+        local _cron_expr _domain _keep _btype _label _freq_label _parsed
         _cron_expr=$(echo "$_line" | awk '{print $1,$2,$3,$4,$5}')
-        _domain=$(echo "$_line" | grep -oP '(?<=_cron_backup )\S+')
-        _keep=$(echo "$_line" | grep -oP '(?<=_cron_backup \S{1,64} )\d+')
-        _btype=$(echo "$_line" | grep -oP '(?<=_cron_backup \S{1,64} \d+ )\d')
-
-        case "$_btype" in
-            1) _label="Files + Database" ;;
-            2) _label="Files only" ;;
-            3) _label="Database only" ;;
-            *) _label="Files + Database" ;;
-        esac
+        _parsed=$(_parse_backup_schedule_args "$_line")
+        IFS='|' read -r _domain _keep _btype <<< "$_parsed"
+        [[ "$_keep" =~ ^[1-9][0-9]*$ ]] || _keep=7
+        [[ "$_btype" =~ ^[1-3]$ ]] || _btype=1
+        _label=$(_backup_type_label "$_btype")
 
         local _dow; _dow=$(echo "$_cron_expr" | awk '{print $5}')
         [[ "$_dow" == "0" ]] && _freq_label="Weekly (Sunday)" || _freq_label="Daily"
-        local _hh _mm
+        local _hh _mm _display_time
         _hh=$(echo "$_cron_expr" | awk '{print $2}')
         _mm=$(echo "$_cron_expr" | awk '{print $1}')
+        _display_time=$(_format_backup_cron_time "$_hh" "$_mm")
 
-        printf "  %2d) %-25s Type: %-20s  %s at %02d:%02d  Keep: %s\n" \
+        printf "  %2d) %-25s Type: %-20s  %s at %s  Keep: %s backup(s)\n" \
             "$_idx" "${_domain:-all}" "$_label" "$_freq_label" \
-            "${_hh:-0}" "${_mm:-0}" "${_keep:-7}"
+            "$_display_time" "${_keep:-7}"
         ((_idx++)) || true
     done <<< "$_raw"
 
@@ -6579,7 +6629,7 @@ remove_backup_schedule() {
     print_section "REMOVE BACKUP SCHEDULE"
 
     local _raw
-    _raw=$(crontab -l 2>/dev/null | grep "_cron_backup" || true)
+    _raw=$(_active_backup_schedule_lines || true)
 
     if [[ -z "$_raw" ]]; then
         log_warn "No backup schedules found."; press_enter; return
@@ -6593,21 +6643,21 @@ remove_backup_schedule() {
     local _idx=1
     while IFS= read -r _line; do
         _lines+=("$_line")
-        local _domain _keep _btype _label _freq_label _hh _mm _dow _cron_expr
+        local _domain _keep _btype _label _freq_label _hh _mm _dow _cron_expr _parsed _display_time
         _cron_expr=$(echo "$_line" | awk '{print $1,$2,$3,$4,$5}')
-        _domain=$(echo "$_line" | grep -oP '(?<=_cron_backup )\S+')
-        _keep=$(echo "$_line" | grep -oP '(?<=_cron_backup \S{1,64} )\d+')
-        _btype=$(echo "$_line" | grep -oP '(?<=_cron_backup \S{1,64} \d+ )\d')
-        case "$_btype" in
-            1) _label="Files + Database" ;; 2) _label="Files only" ;; 3) _label="Database only" ;; *) _label="Files + Database" ;;
-        esac
+        _parsed=$(_parse_backup_schedule_args "$_line")
+        IFS='|' read -r _domain _keep _btype <<< "$_parsed"
+        [[ "$_keep" =~ ^[1-9][0-9]*$ ]] || _keep=7
+        [[ "$_btype" =~ ^[1-3]$ ]] || _btype=1
+        _label=$(_backup_type_label "$_btype")
         _dow=$(echo "$_cron_expr" | awk '{print $5}')
         [[ "$_dow" == "0" ]] && _freq_label="Weekly (Sunday)" || _freq_label="Daily"
         _hh=$(echo "$_cron_expr" | awk '{print $2}')
         _mm=$(echo "$_cron_expr" | awk '{print $1}')
-        printf "  %2d) %-25s Type: %-20s  %s at %02d:%02d  Keep: %s\n" \
+        _display_time=$(_format_backup_cron_time "$_hh" "$_mm")
+        printf "  %2d) %-25s Type: %-20s  %s at %s  Keep: %s backup(s)\n" \
             "$_idx" "${_domain:-all}" "$_label" "$_freq_label" \
-            "${_hh:-0}" "${_mm:-0}" "${_keep:-7}"
+            "$_display_time" "${_keep:-7}"
         ((_idx++)) || true
     done <<< "$_raw"
 

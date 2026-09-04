@@ -1,6 +1,6 @@
 # Liuer Panel
 
-[![Version](https://img.shields.io/badge/version-2.6.48-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
+[![Version](https://img.shields.io/badge/version-2.6.49-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
 [![Shell](https://img.shields.io/badge/shell-Bash-4EAA25.svg)](https://www.gnu.org/software/bash/)
 
 Liuer Panel is a lightweight command-line control panel for provisioning and managing Linux web servers. It manages Nginx, isolated PHP-FPM pools, databases, SSL certificates, website users, backups, security services, and common framework tasks from the `liuer` command.
@@ -151,6 +151,7 @@ WordPress tools use WP-CLI for cache flushing, core/plugin/theme updates, due cr
 - Restore the latest available website and MySQL/MariaDB database backup
 - Schedule daily or weekly backups through the root crontab
 - Configure the number of backups to retain
+- Preserve and display the selected backup type and retention count accurately in scheduled-backup views
 - View schedules and list or delete individual backup files
 
 Backups are stored under:
