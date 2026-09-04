@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.50"
+readonly VERSION="2.6.51"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -6422,6 +6422,73 @@ _active_backup_schedule_lines() {
         | awk '!/^[[:space:]]*#/ && /(^|[[:space:]])_cron_backup([[:space:]]|$)/'
 }
 
+# Replace the backup schedule for one scope in a single crontab install. An
+# empty root crontab is normal, so reads and filters must not fail under
+# pipefail. Keep the previous crontab available for rollback until the exact
+# new entry has been verified.
+_replace_backup_schedule_entry() {
+    local _scope="$1" _entry="$2"
+    _validate_cron_entry "$_entry" || {
+        log_error "Invalid backup cron entry."
+        return 1
+    }
+
+    local _old _new
+    _old=$(mktemp) || { log_error "Cannot create temporary crontab file."; return 1; }
+    _new=$(mktemp) || { rm -f "$_old"; log_error "Cannot create temporary crontab file."; return 1; }
+    crontab -l -u root > "$_old" 2>/dev/null || true
+
+    awk -v scope="$_scope" '
+        {
+            remove = 0
+            for (i = 1; i <= NF; i++) {
+                if ($i == "_cron_backup" && $(i + 1) == scope) {
+                    remove = 1
+                    break
+                }
+            }
+            if (!remove) print
+        }
+    ' "$_old" > "$_new"
+    printf '%s\n' "$_entry" >> "$_new"
+
+    if ! crontab -u root "$_new"; then
+        rm -f "$_old" "$_new"
+        log_error "Failed to install the root crontab."
+        return 1
+    fi
+    if ! crontab -l -u root 2>/dev/null | grep -Fqx -- "$_entry"; then
+        crontab -u root "$_old" 2>/dev/null || true
+        rm -f "$_old" "$_new"
+        log_error "Cron reported success, but the backup schedule could not be verified; the previous crontab was restored."
+        return 1
+    fi
+
+    rm -f "$_old" "$_new"
+}
+
+_remove_backup_schedule_entry() {
+    local _entry="$1" _old _new
+    _old=$(mktemp) || { log_error "Cannot create temporary crontab file."; return 1; }
+    _new=$(mktemp) || { rm -f "$_old"; log_error "Cannot create temporary crontab file."; return 1; }
+    crontab -l -u root > "$_old" 2>/dev/null || true
+    grep -Fvx -- "$_entry" "$_old" > "$_new" || true
+
+    if ! crontab -u root "$_new"; then
+        rm -f "$_old" "$_new"
+        log_error "Failed to update the root crontab."
+        return 1
+    fi
+    if crontab -l -u root 2>/dev/null | grep -Fqx -- "$_entry"; then
+        crontab -u root "$_old" 2>/dev/null || true
+        rm -f "$_old" "$_new"
+        log_error "The schedule could not be removed; the previous crontab was restored."
+        return 1
+    fi
+
+    rm -f "$_old" "$_new"
+}
+
 schedule_backup() {
     print_section "SCHEDULE AUTO BACKUP"
     echo -e "\n${BOLD}Backup scope:${NC}"
@@ -6494,16 +6561,10 @@ schedule_backup() {
 
     ensure_cron_service || { log_error "Cannot schedule backup because cron is not running."; press_enter; return 1; }
 
-    # Remove old entry for same domain
-    if ! (crontab -l 2>/dev/null | grep -Fv "_cron_backup ${_cron_arg} ") | crontab - 2>/dev/null; then
-        log_error "Failed to update the root crontab."
-        press_enter; return 1
-    fi
-
-    # Add new cron entry (pass backup type as 4th arg)
+    # Atomically replace the schedule for this scope (type is the 4th arg).
     local _backup_cron_entry
     _backup_cron_entry="${_scron_time} /usr/local/bin/liuer _cron_backup ${_cron_arg} ${_skeep} ${_sbtype} >> /var/log/liuer-panel.log 2>&1"
-    if ! _install_user_crontab_entry "root" "$_backup_cron_entry"; then
+    if ! _replace_backup_schedule_entry "$_cron_arg" "$_backup_cron_entry"; then
         log_error "Backup schedule was not installed."
         press_enter; return 1
     fi
@@ -6699,9 +6760,11 @@ remove_backup_schedule() {
     fi
 
     local _entry="${_lines[$((_choice-1))]}"
-    local _escaped_entry; _escaped_entry=$(printf '%s\n' "$_entry" | sed 's/[[\.*^$()+?{|]/\\&/g')
-    (crontab -l 2>/dev/null | grep -v -F "$_entry") | crontab -
-    log_success "Schedule removed."
+    if _remove_backup_schedule_entry "$_entry"; then
+        log_success "Schedule removed and verified."
+    else
+        log_error "Backup schedule was not removed."
+    fi
     press_enter
 }
 
