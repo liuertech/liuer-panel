@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.49"
+readonly VERSION="2.6.50"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -4910,9 +4910,14 @@ backup_website() {
     echo "  1) Files + Database"
     echo "  2) Files only"
     echo "  3) Database only"
+    echo "  0) Cancel"
     local _btype
-    echo -e "${YELLOW}Select [1-3]:${NC} \c"; read -r _btype
-    [[ "$_btype" =~ ^[1-3]$ ]] || _btype=1
+    echo -e "${YELLOW}Select [0-3]:${NC} \c"; read -r _btype
+    case "$_btype" in
+        0) log_info "Cancelled."; return 0 ;;
+        1|2|3) ;;
+        *) log_warn "Invalid selection."; press_enter; return 1 ;;
+    esac
 
     local ts; ts=$(date +%Y%m%d_%H%M%S)
     local bdir; bdir="$(get_backup_dir "$domain")"
@@ -6419,26 +6424,49 @@ _active_backup_schedule_lines() {
 
 schedule_backup() {
     print_section "SCHEDULE AUTO BACKUP"
-    SELECTED_DOMAIN=""
-    local _scope_status=0
-    _select_domain "Select site (or 0 for all)" "All sites" || _scope_status=$?
-    [[ "$_scope_status" == "2" ]] && { press_enter; return 1; }
-    local _sdom="${SELECTED_DOMAIN:-all}"
+    echo -e "\n${BOLD}Backup scope:${NC}"
+    echo "  1) One website"
+    echo "  2) All websites"
+    echo "  0) Cancel"
+    local _scope_choice _sdom
+    echo -e "${YELLOW}Select [0-2]:${NC} \c"; read -r _scope_choice
+    case "$_scope_choice" in
+        1)
+            SELECTED_DOMAIN=""
+            _select_domain "Select site" || return 0
+            _sdom="$SELECTED_DOMAIN"
+            ;;
+        2) _sdom="all" ;;
+        0) log_info "Cancelled."; return 0 ;;
+        *) log_warn "Invalid selection."; press_enter; return 1 ;;
+    esac
 
     echo -e "\n${BOLD}Backup type:${NC}"
     echo "  1) Files + Database"
     echo "  2) Files only"
     echo "  3) Database only"
+    echo "  0) Cancel"
     local _sbtype
-    echo -e "${YELLOW}Select [1-3]:${NC} \c"; read -r _sbtype
-    [[ "$_sbtype" =~ ^[1-3]$ ]] || _sbtype=1
+    echo -e "${YELLOW}Select [0-3]:${NC} \c"; read -r _sbtype
+    case "$_sbtype" in
+        0) log_info "Cancelled."; return 0 ;;
+        1|2|3) ;;
+        *) log_warn "Invalid selection."; press_enter; return 1 ;;
+    esac
 
     echo -e "\n${BOLD}Frequency:${NC}"
     echo "  1) Daily"
     echo "  2) Weekly (every Sunday)"
-    echo -ne "${YELLOW}Select [1-2]:${NC} "; read -r _sfreq
+    echo "  0) Cancel"
+    echo -ne "${YELLOW}Select [0-2]:${NC} "; read -r _sfreq
+    case "$_sfreq" in
+        0) log_info "Cancelled."; return 0 ;;
+        1|2) ;;
+        *) log_warn "Invalid selection."; press_enter; return 1 ;;
+    esac
 
-    echo -ne "\n  Time (HH:MM, e.g. 02:30): "; read -r _stime
+    echo -ne "\n  Time (HH:MM, e.g. 02:30; 0=cancel): "; read -r _stime
+    [[ "$_stime" == "0" ]] && { log_info "Cancelled."; return 0; }
     local _sh="${_stime%%:*}" _sm="${_stime##*:}"
     if [[ ! "$_sh" =~ ^[0-9]{1,2}$ || ! "$_sm" =~ ^[0-9]{2}$ ]] \
        || (( 10#$_sh > 23 || 10#$_sm > 59 )); then
@@ -6448,7 +6476,8 @@ schedule_backup() {
     _sh=$((10#$_sh))
     _sm=$((10#$_sm))
 
-    echo -ne "  Retention — keep last N backup runs [7]: "; read -r _skeep
+    echo -ne "  Retention — keep last N backup runs [7, 0=cancel]: "; read -r _skeep
+    [[ "$_skeep" == "0" ]] && { log_info "Cancelled."; return 0; }
     [[ -z "$_skeep" ]] && _skeep=7
     if [[ ! "$_skeep" =~ ^[1-9][0-9]*$ ]] || (( _skeep > 10000 )); then
         log_error "Retention must be a whole number from 1 to 10000."
@@ -6459,7 +6488,6 @@ schedule_backup() {
     case "$_sfreq" in
         1) _scron_time="${_sm} ${_sh} * * *" ;;
         2) _scron_time="${_sm} ${_sh} * * 0" ;;
-        *) log_warn "Invalid selection."; press_enter; return ;;
     esac
 
     local _cron_arg; [[ "$_sdom" == "all" ]] && _cron_arg="--all" || _cron_arg="$_sdom"
@@ -6936,51 +6964,120 @@ menu_website() {
     while true; do
         _sub_header "WEBSITE"
         echo "   1  Create site"
-        echo "   2  Delete site"
-        echo "   3  List sites"
-        echo "   4  Site details"
-        echo "   5  Change PHP version"
-        echo "   6  HTTP/2 & HTTP/3"
-        echo "   7  PHP hardening (on/off)"
-        echo "   8  Lock / Unlock site"
-        echo "   9  Manage users"
-        echo "  10  View logs"
-        echo "  11  Upload & timeout settings"
-        echo "  12  SSL management"
-        echo "  13  PHP URL routing"
-        echo "  14  Gzip compression"
-        echo "  15  Static asset caching"
-        echo "  16  Maintenance mode"
-        echo "  17  Basic auth"
-        echo "  18  Redirects (www handling)"
-        echo "  19  Domain aliases"
-        echo "  20  Cron jobs"
-        echo "  21  Framework tools (Laravel / WordPress)"
+        echo "   2  List sites"
+        echo "   3  Site details"
+        echo "   4  Delete site"
+        echo "   5  Domain, SSL & redirects"
+        echo "   6  PHP & performance"
+        echo "   7  Users, SFTP & cron"
+        echo "   8  Operations & logs"
+        echo "   9  WordPress & Laravel"
         _sub_footer; read -r _ch
         case "$_ch" in
             1)  create_website ;;
-            2)  delete_website ;;
-            3)  list_websites ;;
-            4)  show_website_detail ;;
-            5)  change_php_version ;;
-            6)  toggle_http_protocol ;;
-            7)  toggle_php_hardening ;;
-            8)  toggle_site_lock ;;
-            9)  manage_site_users ;;
-            10) view_site_logs ;;
-            11) manage_upload_settings ;;
-            12) manage_site_ssl ;;
-            13) toggle_php_routing ;;
-            14) toggle_gzip ;;
-            15) toggle_static_cache ;;
-            16) toggle_maintenance ;;
-            17) manage_basic_auth ;;
-            18) manage_redirects ;;
-            19) manage_domain_aliases ;;
-            20) manage_cron_jobs ;;
-            21) menu_framework_tools ;;
+            2)  list_websites ;;
+            3)  show_website_detail ;;
+            4)  delete_website ;;
+            5)  menu_website_domain ;;
+            6)  menu_website_php ;;
+            7)  menu_website_access ;;
+            8)  menu_website_operations ;;
+            9)  menu_website_framework ;;
             0)  return ;;
             *)  log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+menu_website_domain() {
+    while true; do
+        _sub_header "WEBSITE — DOMAIN & SSL"
+        echo "   1  SSL management"
+        echo "   2  Redirects (www handling)"
+        echo "   3  Domain aliases"
+        echo "   4  HTTP/2 & HTTP/3"
+        _sub_footer; read -r _ch
+        case "$_ch" in
+            1) manage_site_ssl ;;
+            2) manage_redirects ;;
+            3) manage_domain_aliases ;;
+            4) toggle_http_protocol ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+menu_website_php() {
+    while true; do
+        _sub_header "WEBSITE — PHP & PERFORMANCE"
+        echo "   1  Change PHP version"
+        echo "   2  PHP hardening (on/off)"
+        echo "   3  Upload & timeout settings"
+        echo "   4  PHP URL routing"
+        echo "   5  Gzip compression"
+        echo "   6  Static asset caching"
+        _sub_footer; read -r _ch
+        case "$_ch" in
+            1) change_php_version ;;
+            2) toggle_php_hardening ;;
+            3) manage_upload_settings ;;
+            4) toggle_php_routing ;;
+            5) toggle_gzip ;;
+            6) toggle_static_cache ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+menu_website_access() {
+    while true; do
+        _sub_header "WEBSITE — USERS, SFTP & CRON"
+        echo "   1  Manage users for a website"
+        echo "   2  Manage all SFTP users"
+        echo "   3  Cron jobs"
+        echo "   4  HTTP Basic Authentication"
+        _sub_footer; read -r _ch
+        case "$_ch" in
+            1) manage_site_users ;;
+            2) menu_sftp ;;
+            3) manage_cron_jobs ;;
+            4) manage_basic_auth ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+menu_website_operations() {
+    while true; do
+        _sub_header "WEBSITE — OPERATIONS & LOGS"
+        echo "   1  Lock / Unlock site"
+        echo "   2  Maintenance mode"
+        echo "   3  View logs"
+        _sub_footer; read -r _ch
+        case "$_ch" in
+            1) toggle_site_lock ;;
+            2) toggle_maintenance ;;
+            3) view_site_logs ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+menu_website_framework() {
+    while true; do
+        _sub_header "WEBSITE — WORDPRESS & LARAVEL"
+        echo "   1  Framework tools"
+        echo "   2  Permission profiles"
+        _sub_footer; read -r _ch
+        case "$_ch" in
+            1) menu_framework_tools ;;
+            2) manage_framework_permissions ;;
+            0) return ;;
+            *) log_warn "Invalid selection." ;;
         esac
     done
 }

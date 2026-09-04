@@ -1,6 +1,6 @@
 # Liuer Panel
 
-[![Version](https://img.shields.io/badge/version-2.6.49-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
+[![Version](https://img.shields.io/badge/version-2.6.50-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
 [![Shell](https://img.shields.io/badge/shell-Bash-4EAA25.svg)](https://www.gnu.org/software/bash/)
 
 Liuer Panel is a lightweight command-line control panel for provisioning and managing Linux web servers. It manages Nginx, isolated PHP-FPM pools, databases, SSL certificates, website users, backups, security services, and common framework tasks from the `liuer` command.
@@ -86,6 +86,8 @@ Most management commands require root privileges. Use `sudo liuer ...` when you 
 - Protect a site with HTTP Basic Authentication
 - Configure `www` redirects and domain aliases
 - Enable HTTP/2 or HTTP/3 when supported by the installed Nginx build
+
+The Website menu groups related actions under Domain/SSL, PHP/performance, users/SFTP/cron, operations/logs, and WordPress/Laravel so common tools remain easy to locate without one long flat menu.
 
 Dynamic website files use the following layout:
 
