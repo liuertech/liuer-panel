@@ -2,7 +2,7 @@
 # =============================================================================
 # LIUER PANEL - CLI Web Server Management Tool
 # Command : liuer
-# Supports: AlmaLinux 8/9/10 | Ubuntu 20.04 / 22.04 / 24.04
+# Supports: AlmaLinux 8/9/10 | Ubuntu 20.04 / 22.04 / 24.04 | Debian 12/13
 # Usage   : bash liuer-panel.sh --install   (first time setup)
 #           liuer                            (management menu)
 #           liuer update / check-update / version
@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.6.51"
+readonly VERSION="2.7.2"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -27,13 +27,24 @@ readonly ISOLATED_CACHE_DIR="/etc/liuer-cache"
 readonly SELINUX_PREF_FILE="${CONFIG_DIR}/selinux_mode"
 readonly NGINX_CONF_DIR="/etc/nginx/conf.d"
 readonly WWW_DIR="/home/web"
-readonly LOG_FILE="/var/log/liuer-panel.log"
+# This can fall back to /dev/null when a non-root command only needs to show
+# help/version output and cannot create the system log yet.
+LOG_FILE="/var/log/liuer-panel.log"
 readonly REPO_SLUG="liuertech/liuer-panel"
 readonly REPO_URL="https://github.com/${REPO_SLUG}"
 readonly WEB_USERS_FILE="${CONFIG_DIR}/web_users.txt"
 readonly SFTP_USERS_FILE="${CONFIG_DIR}/sftp_users.txt"
 readonly CERTBOT_RENEW_SERVICE="/etc/systemd/system/liuer-certbot-renew.service"
 readonly CERTBOT_RENEW_TIMER="/etc/systemd/system/liuer-certbot-renew.timer"
+readonly WEB_PANEL_DIR="${INSTALL_DIR}/web-panel"
+readonly WEB_PANEL_CONFIG="${CONFIG_DIR}/web-panel.ini"
+readonly WEB_PANEL_CONTROL_CONFIG="${CONFIG_DIR}/web-panel-control.ini"
+readonly WEB_PANEL_WORKER_CONFIG="${CONFIG_DIR}/web-panel-worker.ini"
+readonly WEB_PANEL_STATE="${CONFIG_DIR}/web-panel.state"
+readonly WEB_PANEL_SERVICE="liuer-web-worker.service"
+readonly WEB_PANEL_CONTROL_SERVICE="liuer-web-control.service"
+readonly WEB_PANEL_NGINX_CONF="${NGINX_CONF_DIR}/liuer-web-panel.conf"
+readonly WEB_PANEL_DEFAULT_PORT="8443"
 readonly DANGEROUS_FUNCTIONS="exec,shell_exec,system,passthru,popen,proc_open,pcntl_exec,pcntl_fork,pcntl_signal,pcntl_waitpid,pcntl_wexitstatus,pcntl_wifexited,pcntl_wifsignaled,dl,putenv,show_source,highlight_file"
 
 # Fire-and-forget notification to liuercp so both sides stay in sync.
@@ -194,6 +205,7 @@ check_root() {
 OS_FAMILY=""
 OS_ID=""
 OS_VERSION_ID=""
+OS_CODENAME=""
 
 detect_os() {
     if [[ ! -f /etc/os-release ]]; then
@@ -203,18 +215,24 @@ detect_os() {
 
     OS_ID=$(grep -oP '(?<=^ID=)[^\n]+' /etc/os-release | tr -d '"')
     OS_VERSION_ID=$(grep -oP '(?<=^VERSION_ID=)[^\n]+' /etc/os-release | tr -d '"' | cut -d. -f1)
+    OS_CODENAME=$(grep -oP '(?<=^VERSION_CODENAME=)[^\n]+' /etc/os-release | tr -d '"' || true)
+    if [[ -z "$OS_CODENAME" ]] && command -v lsb_release &>/dev/null; then
+        OS_CODENAME=$(lsb_release -cs 2>/dev/null || true)
+    fi
 
     case "$OS_ID" in
         almalinux|centos|rhel|rocky)
             OS_FAMILY="rhel" ;;
-        ubuntu|debian)
+        ubuntu)
+            OS_FAMILY="debian" ;;
+        debian)
             OS_FAMILY="debian" ;;
         *)
             log_error "Unsupported OS: $OS_ID"
             exit 1 ;;
     esac
 
-    log_debug "OS: $OS_ID $OS_VERSION_ID ($OS_FAMILY)"
+    log_debug "OS: $OS_ID $OS_VERSION_ID ${OS_CODENAME:+($OS_CODENAME)} ($OS_FAMILY)"
 }
 
 # =============================================================================
@@ -351,17 +369,94 @@ EOF
             fi
             ;;
         debian)
-            if [[ ! -f /etc/apt/sources.list.d/nginx.list ]]; then
-                curl -fsSL https://nginx.org/keys/nginx_signing.key \
-                    | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg 2>/dev/null
-                local _codename; _codename=$(lsb_release -cs 2>/dev/null || echo "noble")
-                echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] \
-http://nginx.org/packages/mainline/ubuntu ${_codename} nginx" \
-                    > /etc/apt/sources.list.d/nginx.list
-                apt-get update -y 2>/dev/null || true
+            local _codename="${OS_CODENAME:-}"
+            [[ -n "$_codename" ]] || _codename=$(lsb_release -cs 2>/dev/null || true)
+            local _repo_os="ubuntu"
+            [[ "$OS_ID" == "debian" ]] && _repo_os="debian"
+            # Repair a stale repository written by older Liuer versions (which
+            # incorrectly used the Ubuntu URL on Debian).
+            if [[ ! -f /etc/apt/sources.list.d/nginx.list ]] || \
+               ! grep -Eq "nginx.org/packages/mainline/${_repo_os}[[:space:]]+${_codename}[[:space:]]" /etc/apt/sources.list.d/nginx.list 2>/dev/null; then
+                # nginx.org publishes separate repositories for Ubuntu and Debian.
+                # The old implementation always used the Ubuntu repository, which
+                # made Debian installations fail or mix incompatible packages.
+                if ! command -v gpg &>/dev/null; then
+                    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates gnupg 2>/dev/null || {
+                        log_warn "Cannot install GnuPG; using the distro Nginx repository."
+                        return 0
+                    }
+                fi
+                if [[ -z "$_codename" ]]; then
+                    log_warn "Cannot detect Debian/Ubuntu codename; using the distro Nginx repository."
+                    return 0
+                fi
+                install -d -m 0755 /usr/share/keyrings
+                if ! curl -fsSL https://nginx.org/keys/nginx_signing.key \
+                    | gpg --dearmor --yes -o /usr/share/keyrings/nginx-archive-keyring.gpg 2>/dev/null; then
+                    log_warn "Cannot install the Nginx signing key; using the distro Nginx repository."
+                    return 0
+                fi
+                printf 'deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/mainline/%s %s nginx\n' \
+                    "$_repo_os" "$_codename" > /etc/apt/sources.list.d/nginx.list
+                if ! apt-get update -y 2>/dev/null; then
+                    log_warn "Nginx mainline repository is unavailable for ${_repo_os}/${_codename}; using the distro repository."
+                    rm -f /etc/apt/sources.list.d/nginx.list
+                    apt-get update -y 2>/dev/null || true
+                fi
             fi
             ;;
     esac
+}
+
+# Configure the PHP repository for the detected Debian-family distribution.
+# Ubuntu uses Ondřej Surý's PPA; Debian uses packages.sury.org.  A Ubuntu PPA
+# must never be added to Debian because it can replace unrelated system libs.
+setup_php_repo() {
+    [[ "$OS_FAMILY" == "debian" ]] || return 0
+
+    if [[ "$OS_ID" == "ubuntu" ]]; then
+        command -v add-apt-repository &>/dev/null || \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common
+        if ! grep -Rqs '^deb .*ondrej/php' /etc/apt/sources.list.d /etc/apt/sources.list 2>/dev/null; then
+            add-apt-repository -y ppa:ondrej/php || {
+                log_error "Failed to add the Ondrej PHP repository."
+                return 1
+            }
+        fi
+        apt-get update -y
+        return 0
+    fi
+
+    if [[ "$OS_ID" == "debian" ]]; then
+        local _codename="${OS_CODENAME:-}"
+        local _repo_file="/etc/apt/sources.list.d/php-sury.list"
+        local _keyring="/usr/share/keyrings/debsuryorg-archive-keyring.gpg"
+        [[ -n "$_codename" ]] || _codename=$(lsb_release -cs 2>/dev/null || true)
+        [[ -n "$_codename" ]] || {
+            log_error "Cannot determine the Debian codename for the PHP repository."
+            return 1
+        }
+        if [[ ! -f "$_keyring" ]] || \
+           ! grep -Eq "packages\.sury\.org/php/[[:space:]]+${_codename}[[:space:]]" "$_repo_file" 2>/dev/null; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl 2>/dev/null || return 1
+            local _keyring_deb
+            _keyring_deb=$(mktemp /tmp/debsuryorg-archive-keyring.XXXXXX) || return 1
+            if ! curl -fsSL https://packages.sury.org/debsuryorg-archive-keyring.deb -o "$_keyring_deb" \
+                || ! dpkg -i "$_keyring_deb" >/dev/null; then
+                rm -f "$_keyring_deb"
+                log_error "Failed to install the Debian PHP repository keyring package."
+                return 1
+            fi
+            rm -f "$_keyring_deb"
+            [[ -f "$_keyring" ]] || {
+                log_error "The Debian PHP repository keyring was not installed at ${_keyring}."
+                return 1
+            }
+            printf 'deb [signed-by=%s] https://packages.sury.org/php/ %s main\n' \
+                "$_keyring" "$_codename" > "$_repo_file"
+        fi
+        apt-get update -y
+    fi
 }
 
 upgrade_nginx_mainline() {
@@ -1175,6 +1270,7 @@ server {
     listen [::]:80;
     server_name ${domain} www.${domain};
     root ${root};
+    disable_symlinks if_not_owner from=$document_root;
     index ${index_file} index.html;
 
     access_log /var/log/nginx/${domain}_access.log;
@@ -1209,6 +1305,7 @@ server {
     listen [::]:80;
     server_name ${domain} www.${domain};
     root ${root};
+    disable_symlinks if_not_owner from=$document_root;
     index index.php;
 
     access_log /var/log/nginx/${domain}_access.log;
@@ -1244,6 +1341,7 @@ server {
     listen [::]:80;
     server_name ${domain} www.${domain};
     root ${root};
+    disable_symlinks if_not_owner from=$document_root;
     index index.php;
 
     access_log /var/log/nginx/${domain}_access.log;
@@ -1281,6 +1379,7 @@ server {
     listen [::]:80;
     server_name ${domain} www.${domain};
     root ${root};
+    disable_symlinks if_not_owner from=$document_root;
     index index.html index.htm;
 
     access_log /var/log/nginx/${domain}_access.log;
@@ -1298,6 +1397,53 @@ server {
 $(_nginx_common_headers)
 }
 EOF
+}
+
+_ensure_nginx_symlink_protection() {
+    local backup_dir changed=0 meta domain conf tmp
+    backup_dir=$(mktemp -d /tmp/liuer-nginx-symlink.XXXXXX) || return 1
+    for meta in "${SITES_META_DIR}"/*.conf; do
+        [[ -f "$meta" ]] || continue
+        domain=$(basename "$meta" .conf)
+        [[ "$domain" == "default" || "$domain" == "phpmyadmin" ]] && continue
+        conf="${NGINX_CONF_DIR}/${domain}.conf"
+        [[ -f "$conf" ]] || continue
+        grep -qE '^[[:space:]]*disable_symlinks[[:space:]]' "$conf" && continue
+        cp -a "$conf" "${backup_dir}/${domain}.conf" || { rm -rf "$backup_dir"; return 1; }
+        tmp=$(mktemp /tmp/liuer-nginx-conf.XXXXXX) || { rm -rf "$backup_dir"; return 1; }
+        awk '
+            !done && /^[[:space:]]*root[[:space:]]+[^;]+;/ {
+                print
+                print "    disable_symlinks if_not_owner from=$document_root;"
+                done=1
+                next
+            }
+            { print }
+        ' "$conf" > "$tmp"
+        cat "$tmp" > "$conf"
+        rm -f "$tmp"
+        changed=1
+    done
+    if [[ "$changed" -eq 1 ]] && ! nginx -t &>/dev/null; then
+        for conf in "$backup_dir"/*.conf; do
+            [[ -f "$conf" ]] || continue
+            cp -a "$conf" "${NGINX_CONF_DIR}/$(basename "$conf")"
+        done
+        rm -rf "$backup_dir"
+        log_error "Nginx symlink protection could not be applied; all edited configs were restored."
+        return 1
+    fi
+    rm -rf "$backup_dir"
+    [[ "$changed" -eq 1 ]] && log_success "Enabled cross-site symlink protection in existing Nginx site configs."
+
+    local user count
+    while IFS= read -r user; do
+        [[ -n "$user" ]] || continue
+        count=$( { grep -l "^WEB_USER=${user}$" "${SITES_META_DIR}"/*.conf 2>/dev/null || true; } | wc -l | tr -d ' ')
+        if [[ "$count" -gt 1 ]]; then
+            log_warn "Security: Linux user '${user}' is shared by ${count} sites. Migrate each site to a dedicated user from Web user management."
+        fi
+    done < <(awk -F= '/^WEB_USER=/{print $2}' "${SITES_META_DIR}"/*.conf 2>/dev/null | sort -u)
 }
 
 # =============================================================================
@@ -1370,7 +1516,7 @@ _save_web_user() {
     local _username="$1" _password="$2" _login="${3:-0}"
     local _shell="/usr/sbin/nologin"
     [[ "$_login" == "1" ]] && _shell="/bin/bash"
-    useradd --system --no-create-home --shell "$_shell" "$_username" \
+    useradd --system --user-group --no-create-home --shell "$_shell" "$_username" \
         || { log_error "Failed to create system user '$_username'."; return 1; }
     echo "${_username}:${_password}" | chpasswd 2>/dev/null || log_warn "chpasswd failed for '${_username}' — password may not be set."
     mkdir -p "$CONFIG_DIR" && chmod 700 "$CONFIG_DIR"
@@ -1519,6 +1665,18 @@ change_web_user() {
 
     [[ "$_new_user" == "$_cur_user" ]] && { log_warn "Same user selected, nothing to do."; press_enter; return; }
     [[ -z "$_new_user" ]] && { log_warn "No user selected."; press_enter; return; }
+    local _used_by=""
+    for _other_meta in "${SITES_META_DIR}"/*.conf; do
+        [[ -f "$_other_meta" ]] || continue
+        [[ "$_other_meta" == "$_meta" ]] && continue
+        grep -q "^WEB_USER=${_new_user}$" "$_other_meta" 2>/dev/null \
+            && _used_by+="$(basename "$_other_meta" .conf) "
+    done
+    if [[ -n "$_used_by" ]]; then
+        log_error "User '${_new_user}' is already assigned to: ${_used_by}"
+        log_warn "Hosting isolation requires one Linux user per website."
+        press_enter; return 1
+    fi
 
     # Remove old pool if a per-site pool exists
     if [[ -n "$_cur_user" && -n "$_php_ver" ]]; then
@@ -1585,50 +1743,70 @@ migrate_site_users() {
         local _dom; _dom=$(basename "$_mf" .conf)
         local _cur_user; _cur_user=$(grep "^WEB_USER=" "$_mf" 2>/dev/null | cut -d= -f2)
         local _php_ver; _php_ver=$(grep "^PHP_VERSION=" "$_mf" 2>/dev/null | cut -d= -f2)
-
+        local _user_sites=0
         if [[ -n "$_cur_user" ]]; then
-            log_info "  ${_dom}: already has user '${_cur_user}' — skipped"
+            _user_sites=$( { grep -l "^WEB_USER=${_cur_user}$" "${SITES_META_DIR}"/*.conf 2>/dev/null || true; } | wc -l | tr -d ' ')
+        fi
+
+        if [[ -n "$_cur_user" && "$_user_sites" -le 1 ]]; then
+            log_info "  ${_dom}: already isolated as '${_cur_user}' — skipped"
             ((_skipped++)) || true
             continue
         fi
 
-        log_info "  ${_dom}: creating dedicated user..."
+        local _old_site_dir; _old_site_dir=$(get_site_dir "$_dom")
+        log_info "  ${_dom}: creating a unique Linux user..."
+        SELECTED_DOMAIN="$_dom"
         SELECTED_WEB_USER=""
         if ! _auto_create_web_user; then
             log_warn "  ${_dom}: failed to create user — skipped"
             continue
         fi
         local _new_user="$SELECTED_WEB_USER"
+        local _new_site_dir="/home/web/${_new_user}/${_dom}"
 
-        # Create PHP-FPM pool if PHP version is known
+        if [[ -d "$_old_site_dir" && "$_old_site_dir" != "$_new_site_dir" ]]; then
+            mkdir -p "/home/web/${_new_user}"
+            if ! mv "$_old_site_dir" "$_new_site_dir"; then
+                log_warn "  ${_dom}: could not move website files — skipped"
+                userdel "$_new_user" 2>/dev/null || true
+                sed -i "/^${_new_user}|/d" "$WEB_USERS_FILE" 2>/dev/null || true
+                continue
+            fi
+        fi
+
         if [[ -n "$_php_ver" ]]; then
-            create_php_pool "$_php_ver" "$_dom" "$_new_user"
-            # Update nginx fastcgi_pass socket
+            remove_php_pool "$_php_ver" "$_dom" 2>/dev/null || true
+            create_php_pool "$_php_ver" "$_dom" "$_new_user" 0 "$_new_site_dir"
             local _new_sock; _new_sock=$(get_php_pool_socket "$_php_ver" "$_dom")
             local _nginx_conf="${NGINX_CONF_DIR}/${_dom}.conf"
             [[ -f "$_nginx_conf" ]] && sed -i "s|fastcgi_pass unix:.*|fastcgi_pass unix:${_new_sock};|" "$_nginx_conf"
         fi
 
-        # Transfer file ownership (move /var/www/<dom> → /home/web/<user>/<dom> if needed)
-        local _site_dir; _site_dir="$(get_site_dir "$_dom")"
-        local _old_dir="/var/www/${_dom}"
-        if [[ -d "$_old_dir" && ! -d "$_site_dir" ]]; then
-            mkdir -p "/home/web/${_new_user}"
-            mv "$_old_dir" "$_site_dir"
-            local _nc="${NGINX_CONF_DIR}/${_dom}.conf"
-            [[ -f "$_nc" ]] && sed -i "s|${_old_dir}|${_site_dir}|g" "$_nc"
+        local _nc="${NGINX_CONF_DIR}/${_dom}.conf"
+        [[ -f "$_nc" && "$_old_site_dir" != "$_new_site_dir" ]] && sed -i "s|${_old_site_dir}|${_new_site_dir}|g" "$_nc"
+        sed -i "s|ChrootDirectory ${_old_site_dir}|ChrootDirectory ${_new_site_dir}|g" /etc/ssh/sshd_config 2>/dev/null || true
+        [[ -d "$_new_site_dir" ]] && _set_site_perms "$_new_site_dir" "$_new_user"
+        local _old_backup_dir _new_backup_dir="/home/backup/${_new_user}/${_dom}"
+        [[ -n "$_cur_user" ]] && _old_backup_dir="/home/backup/${_cur_user}/${_dom}" || _old_backup_dir="/backup/${_dom}"
+        if [[ -d "$_old_backup_dir" && "$_old_backup_dir" != "$_new_backup_dir" ]]; then
+            mkdir -p "/home/backup/${_new_user}"
+            mv "$_old_backup_dir" "$_new_backup_dir" \
+                || log_warn "  ${_dom}: existing backups remain at ${_old_backup_dir}; move them manually."
         fi
-        [[ -d "$_site_dir" ]] && _set_site_perms "$_site_dir" "$_new_user"
-
-        # Save to metadata
-        echo "WEB_USER=${_new_user}" >> "$_mf"
+        if grep -q '^WEB_USER=' "$_mf"; then sed -i "s/^WEB_USER=.*/WEB_USER=${_new_user}/" "$_mf"; else echo "WEB_USER=${_new_user}" >> "$_mf"; fi
+        if grep -q '^SITE_DIR=' "$_mf"; then sed -i "s|^SITE_DIR=.*|SITE_DIR=${_new_site_dir}|" "$_mf"; else echo "SITE_DIR=${_new_site_dir}" >> "$_mf"; fi
+        _update_isolated_cache_user "$_dom" "$_new_user"
+        grep -qE '^PERMISSION_PROFILE=framework_(hardened|strict)$' "$_mf" 2>/dev/null \
+            && _apply_framework_permissions "$_dom" 1 || true
         log_success "  ${_dom}: → ${_new_user}"
         ((_count++)) || true
     done
 
     nginx -t &>/dev/null && nginx -s reload 2>/dev/null || true
+    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
     echo ""
-    log_success "Migration done: ${_count} migrated, ${_skipped} already had users."
+    log_success "Migration done: ${_count} migrated, ${_skipped} already isolated."
     press_enter
 }
 
@@ -1708,6 +1886,7 @@ create_website() {
         log_error "Domain '$domain' already exists."
         press_enter; return 1
     fi
+    SELECTED_DOMAIN="$domain"
 
     # --- Site type ---
     echo -e "\n${BOLD}Site type:${NC}"
@@ -1733,30 +1912,15 @@ create_website() {
         php_ver="$SELECTED_PHP_VERSION"
     fi
 
-    # --- Web user ---
+    # --- Web user: one Linux identity per site is a hosting security boundary. ---
     local site_user=""
+    SELECTED_WEB_USER=""
+    if ! _auto_create_web_user; then
+        log_error "Could not create the dedicated system user for ${domain}."
+        return 1
+    fi
+    site_user="$SELECTED_WEB_USER"
     if [[ "$site_type" != "4" ]]; then
-        echo -e "\n${BOLD}Web user (PHP-FPM runs as this user):${NC}"
-        echo "  1) Select existing user"
-        echo "  2) Create new user"
-        echo "  0) Cancel"
-        local _uopt
-        echo -e "${YELLOW}Select [0-2]:${NC} \c"; read -r _uopt
-        SELECTED_WEB_USER=""
-        case "$_uopt" in
-            1)
-                _select_web_user "Select user" || return 1
-                site_user="$SELECTED_WEB_USER"
-                ;;
-            2)
-                _create_web_user_interactive || return 1
-                site_user="$SELECTED_WEB_USER"
-                echo ""
-                ;;
-            0) log_info "Cancelled."; return 0 ;;
-            *)
-                log_warn "Invalid selection."; return 1 ;;
-        esac
         socket=$(get_php_pool_socket "$php_ver" "$domain")
     fi
 
@@ -2272,15 +2436,145 @@ EOF
     return 1
 }
 
+_apply_managed_ssl_config() {
+    local domain="$1" cert_file="$2" key_file="$3"
+    local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ -f "$nginx_conf" ]] || { log_error "Active Nginx config not found for ${domain}."; return 1; }
+    [[ -s "$cert_file" && -s "$key_file" ]] || { log_error "SSL certificate or key file is missing."; return 1; }
+
+    # Do not rewrite an older/custom SSL layout that Liuer did not create.
+    if grep -q 'ssl_certificate' "$nginx_conf" 2>/dev/null \
+       && ! grep -q '# liuer-managed-ssl-start' "$nginx_conf" 2>/dev/null; then
+        log_info "Existing SSL directives retained for ${domain}."
+        nginx -t &>/dev/null && nginx -s reload
+        return $?
+    fi
+
+    local backup tmp
+    backup="${nginx_conf}.ssl-backup"
+    tmp=$(mktemp) || return 1
+    cp "$nginx_conf" "$backup" || { rm -f "$tmp"; return 1; }
+    awk -v cert="$cert_file" -v key="$key_file" '
+        /# liuer-managed-ssl-start/ { skip=1; next }
+        /# liuer-managed-ssl-end/   { skip=0; next }
+        skip { next }
+        {
+            print
+            if (!inserted && $0 ~ /^[[:space:]]*server_name[[:space:]]/) {
+                print ""
+                print "    # liuer-managed-ssl-start"
+                print "    listen 443 ssl;"
+                print "    listen [::]:443 ssl;"
+                print "    ssl_certificate " cert ";"
+                print "    ssl_certificate_key " key ";"
+                print "    ssl_protocols TLSv1.2 TLSv1.3;"
+                print "    ssl_session_cache shared:LiuerSiteSSL:10m;"
+                print "    ssl_session_timeout 1d;"
+                print "    ssl_session_tickets off;"
+                print "    # liuer-managed-ssl-end"
+                inserted=1
+            }
+        }
+        END { if (!inserted) exit 42 }
+    ' "$nginx_conf" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$nginx_conf"
+    chown root:root "$nginx_conf"
+    chmod 644 "$nginx_conf"
+    command -v restorecon &>/dev/null && restorecon "$nginx_conf" 2>/dev/null || true
+    if nginx -t &>/dev/null; then
+        nginx -s reload
+        rm -f "$backup"
+        return 0
+    fi
+    mv "$backup" "$nginx_conf"
+    nginx -t &>/dev/null && nginx -s reload || true
+    log_error "Nginx rejected the SSL configuration; original config restored."
+    return 1
+}
+
+_disable_managed_ssl_config() {
+    local domain="$1" nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ -f "$nginx_conf" ]] || { log_error "Active Nginx config not found for ${domain}."; return 1; }
+    grep -q '# liuer-managed-ssl-start' "$nginx_conf" \
+        || { log_error "SSL for ${domain} is not managed by this Liuer version; automatic removal was refused."; return 1; }
+    local backup tmp
+    backup="${nginx_conf}.ssl-backup"
+    tmp=$(mktemp) || return 1
+    cp "$nginx_conf" "$backup" || { rm -f "$tmp"; return 1; }
+    awk '
+        /# liuer-managed-ssl-start/ { skip=1; next }
+        /# liuer-managed-ssl-end/   { skip=0; next }
+        !skip { print }
+    ' "$nginx_conf" > "$tmp" && mv "$tmp" "$nginx_conf"
+    chown root:root "$nginx_conf"
+    chmod 644 "$nginx_conf"
+    command -v restorecon &>/dev/null && restorecon "$nginx_conf" 2>/dev/null || true
+    if nginx -t &>/dev/null; then
+        nginx -s reload
+        rm -f "$backup"
+        log_success "HTTPS listener disabled for ${domain}; certificate files were preserved."
+        return 0
+    fi
+    mv "$backup" "$nginx_conf"
+    nginx -t &>/dev/null && nginx -s reload || true
+    log_error "Nginx rejected the change; original config restored."
+    return 1
+}
+
+_install_custom_ssl_noninteractive() {
+    local domain="$1" cert_source="$2" key_source="$3"
+    validate_domain "$domain" || { log_error "Invalid domain: $domain"; return 1; }
+    [[ -s "$cert_source" && -s "$key_source" ]] || { log_error "Certificate and private key are required."; return 1; }
+    openssl x509 -in "$cert_source" -noout &>/dev/null \
+        || { log_error "Invalid X.509 certificate."; return 1; }
+    openssl pkey -in "$key_source" -noout &>/dev/null \
+        || { log_error "Invalid private key."; return 1; }
+
+    local cert_pub key_pub
+    cert_pub=$(openssl x509 -in "$cert_source" -pubkey -noout 2>/dev/null \
+        | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
+    key_pub=$(openssl pkey -in "$key_source" -pubout -outform DER 2>/dev/null \
+        | sha256sum | awk '{print $1}')
+    [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] \
+        || { log_error "Certificate and private key do not match."; return 1; }
+    openssl x509 -in "$cert_source" -noout -checkhost "$domain" &>/dev/null \
+        || { log_error "Certificate does not cover ${domain}."; return 1; }
+
+    local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+    if grep -q 'ssl_certificate' "$nginx_conf" 2>/dev/null \
+       && ! grep -q '# liuer-managed-ssl-start' "$nginx_conf" 2>/dev/null; then
+        log_error "Existing SSL layout is not managed by Liuer; custom replacement was refused to avoid damaging Nginx."
+        return 1
+    fi
+
+    local ssl_cert_dir="/etc/nginx/ssl/${domain}"
+    mkdir -p "$ssl_cert_dir"
+    cp "$cert_source" "${ssl_cert_dir}/fullchain.pem"
+    cp "$key_source" "${ssl_cert_dir}/privkey.pem"
+    chown root:root "${ssl_cert_dir}/fullchain.pem" "${ssl_cert_dir}/privkey.pem"
+    chmod 644 "${ssl_cert_dir}/fullchain.pem"
+    chmod 600 "${ssl_cert_dir}/privkey.pem"
+    command -v restorecon &>/dev/null && restorecon -R "$ssl_cert_dir" 2>/dev/null || true
+    _apply_managed_ssl_config "$domain" "${ssl_cert_dir}/fullchain.pem" "${ssl_cert_dir}/privkey.pem"
+}
+
 setup_ssl_free() {
-    local domain="$1"
+    local domain="$1" requested_email="${2:-}" noninteractive="${3:-0}"
     if ! command -v certbot &>/dev/null; then
         log_error "Certbot not installed. Go to System → Install extra service."
         return 1
     fi
 
     local ssl_email ssl_email_file="${CONFIG_DIR}/ssl_email"
-    if [[ -f "$ssl_email_file" ]]; then
+    if [[ "$noninteractive" == "1" ]]; then
+        ssl_email="${requested_email// /}"
+        if [[ ! "$ssl_email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+            log_error "Invalid Let's Encrypt email address."
+            return 1
+        fi
+        echo "$ssl_email" > "$ssl_email_file"
+        chmod 600 "$ssl_email_file"
+    elif [[ -f "$ssl_email_file" ]]; then
         ssl_email=$(cat "$ssl_email_file")
         log_info "Using saved SSL email: ${ssl_email}"
         echo -e "  ${DIM}(Enter new email to change, or press Enter to keep)${NC}"
@@ -2314,16 +2608,19 @@ setup_ssl_free() {
     command -v chcon &>/dev/null && chcon -R -t httpd_sys_content_t "$acme_root" 2>/dev/null || true
 
     log_info "Running certbot for ${domain}..."
+    local -a certbot_expand=()
+    [[ -d "/etc/letsencrypt/live/${domain}" ]] && certbot_expand=(--expand)
     # Use --webroot so certbot places challenge files where nginx serves them
-    if certbot certonly --webroot -w "$acme_root" \
+    if certbot certonly --webroot -w "$acme_root" --cert-name "$domain" "${certbot_expand[@]}" \
             -d "$domain" -d "www.${domain}" \
             --non-interactive --agree-tos -m "$ssl_email" 2>/dev/null \
-    || certbot certonly --webroot -w "$acme_root" \
+    || certbot certonly --webroot -w "$acme_root" --cert-name "$domain" \
             -d "$domain" \
             --non-interactive --agree-tos -m "$ssl_email"; then
-        # Install cert into nginx config
-        certbot install --nginx --cert-name "$domain" --non-interactive 2>/dev/null || true
-        nginx -t &>/dev/null && nginx -s reload
+        _apply_managed_ssl_config "$domain" \
+            "/etc/letsencrypt/live/${domain}/fullchain.pem" \
+            "/etc/letsencrypt/live/${domain}/privkey.pem" \
+            || return 1
     else
         log_error "certbot failed. Make sure DNS is pointing to this server."
         return 1
@@ -2353,29 +2650,8 @@ setup_ssl_paid() {
         log_error "Key file not found: $_key_path"; return 1
     fi
 
-    local ssl_cert_dir="/etc/nginx/ssl/${domain}"
-    mkdir -p "$ssl_cert_dir"
-    cp "$_cert_path" "${ssl_cert_dir}/fullchain.pem"
-    cp "$_key_path"  "${ssl_cert_dir}/privkey.pem"
-    chmod 600 "${ssl_cert_dir}/privkey.pem"
-
-    # Append SSL server block to nginx config
-    cat >> "$nginx_conf" <<EOF
-
-server {
-    listen 443 ssl;
-    server_name ${domain} www.${domain};
-    ssl_certificate     ${ssl_cert_dir}/fullchain.pem;
-    ssl_certificate_key ${ssl_cert_dir}/privkey.pem;
-    ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_ciphers         HIGH:!aNULL:!MD5;
-    include $(dirname "$nginx_conf")/snippets/security-headers.conf 2>/dev/null;
-}
-EOF
-
-    nginx -t &>/dev/null && nginx -s reload \
-        && log_success "Paid SSL configured for ${domain}." \
-        || { log_error "Nginx config invalid after SSL setup."; return 1; }
+    _install_custom_ssl_noninteractive "$domain" "$_cert_path" "$_key_path" \
+        && log_success "Custom SSL configured for ${domain}."
 }
 
 _nginx_remove_h2_h3() {
@@ -5136,9 +5412,7 @@ install_php_version() {
             ;;
         debian)
             if ! apt-cache show "php${ver}-fpm" &>/dev/null; then
-                DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common
-                add-apt-repository -y ppa:ondrej/php
-                apt-get update -y
+                setup_php_repo || return 1
             fi ;;
     esac
 
@@ -5358,6 +5632,7 @@ install_extra_service() {
     echo "  7) Git"
     echo "  8) phpMyAdmin"
     echo "  9) MariaDB 11.4"
+    echo " 10) Liuer Web Panel (Nginx + MariaDB)"
     echo "  0) Back"
     echo -e "${YELLOW}Select:${NC} \c"
     read -r _ch
@@ -5410,6 +5685,7 @@ install_extra_service() {
                confirm_action "Continue anyway?" || { log_info "Cancelled."; press_enter; return; }
            fi
            install_mariadb ;;
+       10) install_web_panel ; return ;;
         0) return ;;
         *) log_warn "Invalid selection." ;;
     esac
@@ -5436,7 +5712,8 @@ _get_github_sha() {
 
 _fetch_remote_ver() {
     # Use commit SHA to get version.txt — SHA-based URLs bypass CDN branch cache
-    local sha; sha=$(_get_github_sha)
+    local sha="${1:-}"
+    [[ -n "$sha" ]] || sha=$(_get_github_sha)
     local v=""
 
     if [[ -n "$sha" ]]; then
@@ -5482,7 +5759,7 @@ update_tool() {
     log_info "Fetching remote version..."
     # Get SHA once — reuse for both version check and download URL
     local sha; sha=$(_get_github_sha)
-    local remote_ver; remote_ver=$(_fetch_remote_ver)
+    local remote_ver; remote_ver=$(_fetch_remote_ver "$sha")
 
     if [[ -z "$remote_ver" ]]; then
         log_error "Cannot reach GitHub. Check your internet connection."
@@ -5514,8 +5791,10 @@ update_tool() {
     curl -fsSL --max-time 120 "$raw_url" -o "${target}.tmp"
     local dl_rc=$?
 
-    if [[ $dl_rc -eq 0 && -s "${target}.tmp" && \
-          $(grep -c 'readonly VERSION=' "${target}.tmp" 2>/dev/null) -gt 0 ]]; then
+    local downloaded_version=""
+    downloaded_version=$(sed -n 's/^readonly VERSION="\([0-9][0-9.]*\)"$/\1/p' "${target}.tmp" 2>/dev/null | head -1)
+    if [[ $dl_rc -eq 0 && -s "${target}.tmp" && "$downloaded_version" == "$remote_ver" ]] \
+          && bash -n "${target}.tmp"; then
         mv "${target}.tmp" "$target"
         chmod +x "$target"
         ln -sf "$target" "$BIN_LINK"
@@ -5523,6 +5802,7 @@ update_tool() {
         log_success "Updated to v${remote_ver}."
         log_info "Applying post-update system fixes..."
         bash "$target" _repair_auto 2>/dev/null || true
+        bash "$target" _update_web_panel_auto 2>/dev/null || true
         echo ""
         log_info "Restarting with new version..."
         sleep 1
@@ -5543,6 +5823,9 @@ do_repair() {
 
     # 0. Ensure each site's nginx fastcgi_pass points to the correct domain pool socket
     _repair_nginx_sockets
+
+    # 0.0 Block Nginx from following a symlink owned by another site user.
+    _ensure_nginx_symlink_protection || log_warn "Cross-site symlink protection repair failed."
 
     # 0a. Ensure all PHP-FPM services with active pool configs are running
     _ensure_php_fpm_running
@@ -5591,6 +5874,11 @@ do_repair() {
     # 4. Fix nginx catch-all conflicts
     rm -f /etc/nginx/conf.d/default.conf
     rm -f /etc/nginx/sites-enabled/default
+
+    # 4a. Remove the legacy phpMyAdmin global-privilege account and keep the
+    # interface reachable only through an SSH tunnel.
+    _remove_legacy_phpmyadmin_superuser || log_warn "Legacy phpMyAdmin database account still needs manual review."
+    _harden_phpmyadmin_access || log_warn "phpMyAdmin loopback-only repair failed."
 
     # 5. If Memcached is installed, ensure php-memcached extension is present
     if systemctl is-active --quiet memcached 2>/dev/null; then
@@ -5750,12 +6038,15 @@ install_mariadb() {
     fi
     log_info "Installing MariaDB 11.4..."
     case "$OS_FAMILY" in
-        rhel)   pkg_install MariaDB-server MariaDB-client ;;
-        debian) pkg_install mariadb-server mariadb-client ;;
+        rhel)   pkg_install MariaDB-server MariaDB-client || { log_error "MariaDB packages could not be installed."; return 1; } ;;
+        debian) pkg_install mariadb-server mariadb-client || { log_error "MariaDB packages could not be installed."; return 1; } ;;
     esac
     local _maria_svc="mariadb"
     systemctl list-unit-files 2>/dev/null | grep -q "^mysqld" && _maria_svc="mysqld"
-    systemctl enable "$_maria_svc" && systemctl start "$_maria_svc"
+    systemctl enable "$_maria_svc" && systemctl start "$_maria_svc" || {
+        log_error "MariaDB service ${_maria_svc} could not be enabled and started."
+        return 1
+    }
     mysql -u root -e "DELETE FROM mysql.user WHERE User='';" 2>/dev/null || true
     mysql -u root -e "DROP DATABASE IF EXISTS test;" 2>/dev/null || true
     mysql -u root -e "FLUSH PRIVILEGES;" 2>/dev/null || true
@@ -5781,6 +6072,42 @@ EOF
     fi
 }
 
+_remove_legacy_phpmyadmin_superuser() {
+    local record_file="${CONFIG_DIR}/pma_db_user" pma_db_user=""
+    [[ -f "$record_file" ]] || return 0
+    pma_db_user=$(cut -d'|' -f1 "$record_file" 2>/dev/null)
+    if [[ "$pma_db_user" =~ ^pma_[a-zA-Z0-9]{8}$ ]]; then
+        mysql_exec "DROP USER IF EXISTS '${pma_db_user}'@'localhost'; FLUSH PRIVILEGES;" \
+            && log_success "Removed legacy phpMyAdmin database superuser '${pma_db_user}'." \
+            || { log_warn "Could not remove legacy phpMyAdmin superuser '${pma_db_user}'."; return 1; }
+    else
+        log_warn "Legacy phpMyAdmin account record is invalid; refusing an unvalidated DROP USER."
+        return 1
+    fi
+    rm -f "$record_file"
+}
+
+_harden_phpmyadmin_access() {
+    local conf="${NGINX_CONF_DIR}/phpmyadmin.conf" backup
+    [[ -f "$conf" ]] || return 0
+    grep -qE '^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:8090' "$conf" && return 0
+    backup=$(mktemp /tmp/liuer-pma-nginx.XXXXXX) || return 1
+    cp -a "$conf" "$backup" || { rm -f "$backup"; return 1; }
+    sed -i -E \
+        -e 's/^[[:space:]]*listen[[:space:]]+80([[:space:]]+default_server)?;/    listen 127.0.0.1:8090;/' \
+        -e '/^[[:space:]]*listen[[:space:]]+\[::\]:80([[:space:]]+default_server)?;/d' \
+        -e 's/^[[:space:]]*server_name[[:space:]]+"";/    server_name localhost;/' \
+        "$conf"
+    if ! nginx -t &>/dev/null; then
+        cp -a "$backup" "$conf"
+        rm -f "$backup"
+        return 1
+    fi
+    rm -f "$backup"
+    systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
+    log_success "phpMyAdmin is now loopback-only on 127.0.0.1:8090."
+}
+
 install_phpmyadmin() {
     log_info "Installing phpMyAdmin..."
     mkdir -p "$CONFIG_DIR" && chmod 700 "$CONFIG_DIR"
@@ -5799,24 +6126,46 @@ install_phpmyadmin() {
     fi
 
     local pma_url="https://files.phpmyadmin.net/phpMyAdmin/${pma_ver}/phpMyAdmin-${pma_ver}-all-languages.tar.gz"
-
-    curl -fsSL "$pma_url" | tar -xz -C /var/www/ 2>/dev/null \
-        || { log_warn "phpMyAdmin download failed."; return 1; }
-    [[ -d "/var/www/phpMyAdmin-${pma_ver}-all-languages" ]] \
-        && mv "/var/www/phpMyAdmin-${pma_ver}-all-languages" /var/www/phpmyadmin
+    local pma_stage pma_archive pma_expected pma_actual pma_extracted
+    pma_stage=$(mktemp -d /tmp/liuer-pma.XXXXXX) || return 1
+    pma_archive="${pma_stage}/phpmyadmin.tar.gz"
+    if ! curl -fsSL --max-time 180 "$pma_url" -o "$pma_archive" \
+        || ! curl -fsSL --max-time 30 "${pma_url}.sha256" -o "${pma_archive}.sha256"; then
+        rm -rf "$pma_stage"
+        log_warn "phpMyAdmin archive or official checksum download failed."
+        return 1
+    fi
+    pma_expected=$(awk '{print $1; exit}' "${pma_archive}.sha256")
+    pma_actual=$(sha256sum "$pma_archive" 2>/dev/null | awk '{print $1}')
+    if [[ ! "$pma_expected" =~ ^[a-fA-F0-9]{64}$ || "${pma_actual,,}" != "${pma_expected,,}" ]]; then
+        rm -rf "$pma_stage"
+        log_error "phpMyAdmin SHA-256 verification failed; archive was not installed."
+        return 1
+    fi
+    if ! tar -tzf "$pma_archive" > "${pma_stage}/archive.list"; then
+        rm -rf "$pma_stage"
+        log_error "phpMyAdmin archive could not be inspected."
+        return 1
+    fi
+    if grep -qE '(^/|(^|/)\.\.(/|$))' "${pma_stage}/archive.list"; then
+        rm -rf "$pma_stage"
+        log_error "phpMyAdmin archive contains an unsafe path."
+        return 1
+    fi
+    tar -xzf "$pma_archive" -C "$pma_stage" || { rm -rf "$pma_stage"; log_warn "phpMyAdmin extraction failed."; return 1; }
+    pma_extracted="${pma_stage}/phpMyAdmin-${pma_ver}-all-languages"
+    [[ -d "$pma_extracted" && -f "${pma_extracted}/index.php" ]] \
+        || { rm -rf "$pma_stage"; log_error "Verified phpMyAdmin archive has an unexpected layout."; return 1; }
+    rm -rf /var/www/phpmyadmin
+    mv "$pma_extracted" /var/www/phpmyadmin || { rm -rf "$pma_stage"; return 1; }
+    rm -rf "$pma_stage"
 
     local secret; secret=$(rand_str 32)
 
-    # Create a dedicated MySQL user for phpMyAdmin (password auth, avoids unix_socket issue)
-    local pma_db_user="pma_$(rand_str 8)"
-    local pma_db_pass; pma_db_pass=$(rand_pass 20)
-    mysql -u root 2>/dev/null <<SQL
-CREATE USER IF NOT EXISTS '${pma_db_user}'@'localhost' IDENTIFIED BY '${pma_db_pass}';
-GRANT ALL PRIVILEGES ON *.* TO '${pma_db_user}'@'localhost' WITH GRANT OPTION;
-FLUSH PRIVILEGES;
-SQL
-    echo "${pma_db_user}|$(encrypt_pass "$pma_db_pass")" > "${CONFIG_DIR}/pma_db_user"
-    chmod 600 "${CONFIG_DIR}/pma_db_user"
+    # phpMyAdmin uses cookie authentication. It must never own a stored
+    # all-databases account; administrators sign in with an explicitly chosen
+    # MariaDB account instead.
+    _remove_legacy_phpmyadmin_superuser || return 1
 
     mkdir -p /var/www/phpmyadmin/tmp
     cat > /var/www/phpmyadmin/config.inc.php <<PHP
@@ -5858,13 +6207,12 @@ PHP
     rm -f /etc/nginx/conf.d/default.conf
     rm -f /etc/nginx/sites-enabled/default
 
-    # Add secret path location to default nginx server (public-facing, no extra port)
+    # Loopback only: remote administrators must use an encrypted SSH tunnel.
     cat > "${NGINX_CONF_DIR}/phpmyadmin.conf" <<EOF
-# phpMyAdmin — secret path access (no extra port needed)
+# phpMyAdmin — managed by Liuer Panel; intentionally not public-facing
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    server_name "";
+    listen 127.0.0.1:8090;
+    server_name localhost;
 
     location /${pma_token}/ {
         alias /var/www/phpmyadmin/;
@@ -5881,11 +6229,9 @@ server {
 EOF
     nginx -t &>/dev/null && nginx -s reload
 
-    local _ip; _ip=$(curl -fsSL --max-time 3 https://ifconfig.me 2>/dev/null \
-                     || curl -fsSL --max-time 3 https://api.ipify.org 2>/dev/null \
-                     || echo "SERVER_IP")
     log_success "phpMyAdmin installed."
-    echo -e "  URL: ${BOLD}http://${_ip}/${pma_token}/${NC}"
+    echo -e "  Tunnel : ${BOLD}ssh -L 8090:127.0.0.1:8090 root@SERVER_IP${NC}"
+    echo -e "  URL    : ${BOLD}http://127.0.0.1:8090/${pma_token}/${NC}"
     echo -e "${DIM}Path saved to: ${CONFIG_DIR}/pma_path${NC}"
 }
 
@@ -5898,12 +6244,828 @@ EOF
     chmod 644 /etc/profile.d/liuer-panel-hint.sh
 }
 
+# =============================================================================
+# OPTIONAL WEB PANEL (PHP + Nginx + MariaDB)
+# =============================================================================
+web_panel_installed() {
+    [[ -f "$WEB_PANEL_STATE" && -f "${WEB_PANEL_DIR}/public/index.php" ]]
+}
+
+_cleanup_incomplete_web_panel() {
+    [[ -f "$WEB_PANEL_STATE" ]] && return 0
+    _web_panel_fpm_details
+    systemctl disable --now "$WEB_PANEL_SERVICE" 2>/dev/null || true
+    systemctl disable --now "$WEB_PANEL_CONTROL_SERVICE" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${WEB_PANEL_SERVICE}" "/etc/systemd/system/${WEB_PANEL_CONTROL_SERVICE}" "$WEB_PANEL_NGINX_CONF" "$WEB_PANEL_FPM_CONF"
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl restart "$WEB_PANEL_FPM_SERVICE" 2>/dev/null || true
+    nginx -t &>/dev/null && systemctl reload nginx 2>/dev/null || true
+    rm -rf "$WEB_PANEL_DIR" /var/lib/liuer-panel/web-panel "${CONFIG_DIR}/web-panel-tls"
+    rm -f "$WEB_PANEL_CONFIG" "$WEB_PANEL_CONTROL_CONFIG" "$WEB_PANEL_WORKER_CONFIG"
+    mysql_exec "DROP USER IF EXISTS 'liuer_panel_web'@'127.0.0.1'; DROP USER IF EXISTS 'liuer_panel_control'@'127.0.0.1'; DROP USER IF EXISTS 'liuer_panel_worker'@'127.0.0.1'; FLUSH PRIVILEGES;" 2>/dev/null || true
+    chown root:root "$CONFIG_DIR" 2>/dev/null || true
+    chmod 700 "$CONFIG_DIR" 2>/dev/null || true
+}
+
+_web_panel_state_value() {
+    local key="$1"
+    [[ -f "$WEB_PANEL_STATE" ]] || return 0
+    awk -F= -v wanted="$key" '$1 == wanted {sub(/^[^=]*=/, ""); print; exit}' "$WEB_PANEL_STATE"
+}
+
+_web_panel_php_bin() {
+    case "$OS_FAMILY" in
+        rhel)
+            [[ -x /opt/remi/php82/root/usr/bin/php ]] && { echo /opt/remi/php82/root/usr/bin/php; return; }
+            command -v php82 2>/dev/null || true
+            ;;
+        debian)
+            command -v php8.2 2>/dev/null || true
+            ;;
+    esac
+}
+
+_web_panel_fpm_details() {
+    case "$OS_FAMILY" in
+        rhel)
+            WEB_PANEL_FPM_CONF="/etc/opt/remi/php82/php-fpm.d/liuer-web-panel.conf"
+            WEB_PANEL_FPM_SOCKET="/var/opt/remi/php82/run/php-fpm/liuer-web-panel.sock"
+            ;;
+        debian)
+            WEB_PANEL_FPM_CONF="/etc/php/8.2/fpm/pool.d/liuer-web-panel.conf"
+            WEB_PANEL_FPM_SOCKET="/run/php/php8.2-fpm-liuer-web-panel.sock"
+            ;;
+    esac
+    WEB_PANEL_FPM_SERVICE=$(get_php_service "8.2")
+}
+
+_open_web_panel_port() {
+    local port="$1" fw; fw=$(detect_firewall)
+    case "$fw" in
+        firewalld)
+            firewall-cmd --permanent --add-port="${port}/tcp" &>/dev/null || return 1
+            firewall-cmd --reload &>/dev/null || return 1
+            ;;
+        ufw)
+            ufw allow "${port}/tcp" &>/dev/null || return 1
+            ;;
+        none)
+            log_warn "No active firewall detected. Open TCP ${port} in your provider firewall if required."
+            ;;
+    esac
+}
+
+_close_web_panel_port() {
+    local port="$1" fw; fw=$(detect_firewall)
+    case "$fw" in
+        firewalld)
+            firewall-cmd --permanent --remove-port="${port}/tcp" &>/dev/null || true
+            firewall-cmd --reload &>/dev/null || true
+            ;;
+        ufw) ufw delete allow "${port}/tcp" &>/dev/null || true ;;
+    esac
+}
+
+_ensure_web_panel_stack() {
+    log_info "Checking required Web Panel stack (Nginx, MariaDB, PHP 8.2-FPM)..."
+
+    if ! command -v nginx &>/dev/null; then
+        setup_nginx_repo
+        pkg_install nginx || { log_error "Nginx installation failed."; return 1; }
+    fi
+    systemctl enable --now nginx || return 1
+
+    if ! command -v mariadb &>/dev/null && ! mysql --version 2>/dev/null | grep -qi mariadb; then
+        if command -v mysql &>/dev/null; then
+            log_error "MySQL is installed, but Liuer Web Panel requires MariaDB. Automatic replacement was refused to protect existing databases."
+            return 1
+        fi
+        install_mariadb || { log_error "MariaDB installation failed."; return 1; }
+    fi
+
+    local maria_svc="mariadb"
+    systemctl cat mariadb.service &>/dev/null || maria_svc="mysqld"
+    systemctl enable --now "$maria_svc" || { log_error "MariaDB could not be started."; return 1; }
+
+    local php_bin; php_bin=$(_web_panel_php_bin)
+    if [[ ! -x "$php_bin" ]] || ! php_extension_loaded "8.2" mysql || ! php_extension_loaded "8.2" mbstring; then
+        if [[ "$OS_FAMILY" == "debian" ]] && ! apt-cache show "php8.2-fpm" &>/dev/null; then
+            setup_php_repo || { log_error "PHP 8.2 repository setup failed."; return 1; }
+        fi
+        local php_pkgs; php_pkgs=$(get_php_packages "8.2")
+        # shellcheck disable=SC2086
+        pkg_install $php_pkgs || { log_error "PHP 8.2 packages could not be installed."; return 1; }
+    fi
+    php_bin=$(_web_panel_php_bin)
+    [[ -x "$php_bin" ]] || { log_error "PHP 8.2 CLI binary is not available."; return 1; }
+    "$php_bin" -m 2>/dev/null | grep -ixq openssl \
+        || { log_error "PHP 8.2 OpenSSL extension is required by the Web Panel."; return 1; }
+    _web_panel_fpm_details
+    systemctl enable --now "$WEB_PANEL_FPM_SERVICE" || return 1
+
+    command -v openssl &>/dev/null || pkg_install openssl || return 1
+    command -v curl &>/dev/null || pkg_install curl || return 1
+    log_success "Required Web Panel stack is ready."
+}
+
+_stage_web_panel_source() {
+    local destination="$1" force_remote="${2:-0}"
+    local local_source="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/web-panel"
+
+    mkdir -p "$destination"
+    if [[ "$force_remote" != "1" && -f "${local_source}/public/index.php" ]]; then
+        cp -a "${local_source}/." "$destination/"
+        return $?
+    fi
+
+    local archive tmpdir sha url
+    tmpdir=$(mktemp -d /tmp/liuer-web-panel.XXXXXX) || return 1
+    archive="${tmpdir}/source.tar.gz"
+    sha=$(_get_github_sha)
+    if [[ -n "$sha" ]]; then
+        url="https://codeload.github.com/${REPO_SLUG}/tar.gz/${sha}"
+    else
+        url="https://codeload.github.com/${REPO_SLUG}/tar.gz/refs/heads/main"
+    fi
+    log_info "Downloading Liuer Web Panel source..."
+    if ! curl -fsSL --max-time 120 "$url" -o "$archive"; then
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    if ! tar -tzf "$archive" > "${tmpdir}/archive.list" \
+        || grep -qE '(^/|(^|/)\.\.(/|$))' "${tmpdir}/archive.list"; then
+        rm -rf "$tmpdir"
+        log_error "Downloaded Web Panel archive is invalid or contains an unsafe path."
+        return 1
+    fi
+    tar -xzf "$archive" -C "$tmpdir" || { rm -rf "$tmpdir"; return 1; }
+    local extracted
+    extracted=$(find "$tmpdir" -mindepth 2 -maxdepth 2 -type d -name web-panel | head -1)
+    if [[ -z "$extracted" || ! -f "${extracted}/public/index.php" ]]; then
+        rm -rf "$tmpdir"
+        log_error "Downloaded release does not contain web-panel/."
+        return 1
+    fi
+    cp -a "${extracted}/." "$destination/"
+    local rc=$?
+    rm -rf "$tmpdir"
+    return $rc
+}
+
+_write_web_panel_ini() {
+    local file="$1" db_user="$2" db_pass="$3" app_key="${4:-}"
+    {
+        echo '[database]'
+        echo 'host = "127.0.0.1"'
+        echo 'port = 3306'
+        echo 'name = "liuer_panel"'
+        printf 'user = "%s"\n' "$db_user"
+        printf 'password = "%s"\n' "$db_pass"
+        if [[ -n "$app_key" ]]; then
+            echo ''
+            echo '[security]'
+            printf 'app_key = "%s"\n' "$app_key"
+        fi
+    } > "$file"
+}
+
+_create_web_panel_database() {
+    local web_db_pass="$1" control_db_pass="$2" worker_db_pass="$3" app_key="$4"
+    mysql_exec "CREATE DATABASE IF NOT EXISTS liuer_panel CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" || return 1
+    mysql_exec "CREATE USER IF NOT EXISTS 'liuer_panel_web'@'127.0.0.1' IDENTIFIED BY '${web_db_pass}'; ALTER USER 'liuer_panel_web'@'127.0.0.1' IDENTIFIED BY '${web_db_pass}';" || return 1
+    mysql_exec "CREATE USER IF NOT EXISTS 'liuer_panel_control'@'127.0.0.1' IDENTIFIED BY '${control_db_pass}'; ALTER USER 'liuer_panel_control'@'127.0.0.1' IDENTIFIED BY '${control_db_pass}'; GRANT SELECT, INSERT, UPDATE, DELETE ON liuer_panel.* TO 'liuer_panel_control'@'127.0.0.1';" || return 1
+    mysql_exec "CREATE USER IF NOT EXISTS 'liuer_panel_worker'@'127.0.0.1' IDENTIFIED BY '${worker_db_pass}'; ALTER USER 'liuer_panel_worker'@'127.0.0.1' IDENTIFIED BY '${worker_db_pass}'; GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, REFERENCES ON liuer_panel.* TO 'liuer_panel_worker'@'127.0.0.1'; FLUSH PRIVILEGES;" || return 1
+
+    _write_web_panel_ini "$WEB_PANEL_CONFIG" "liuer_panel_web" "$web_db_pass"
+    _write_web_panel_ini "$WEB_PANEL_CONTROL_CONFIG" "liuer_panel_control" "$control_db_pass" "$app_key"
+    _write_web_panel_ini "$WEB_PANEL_WORKER_CONFIG" "liuer_panel_worker" "$worker_db_pass" "$app_key"
+    chown root:liuerpanel "$CONFIG_DIR"
+    chmod 710 "$CONFIG_DIR"
+    chown root:liuerpanel "$WEB_PANEL_CONFIG"
+    chmod 640 "$WEB_PANEL_CONFIG"
+    chown root:liuercontrol "$WEB_PANEL_CONTROL_CONFIG"
+    chmod 640 "$WEB_PANEL_CONTROL_CONFIG"
+    chown root:root "$WEB_PANEL_WORKER_CONFIG"
+    chmod 600 "$WEB_PANEL_WORKER_CONFIG"
+}
+
+_apply_web_panel_db_grants() {
+    mysql_exec "REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT (id,email,display_name,role,parent_id,package_id,active,last_login_at,created_at,updated_at) ON liuer_panel.users TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.jobs TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_sites TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.settings TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.hosting_packages TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_databases TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_sftp_users TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_crons TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_backups TO 'liuer_panel_web'@'127.0.0.1'; FLUSH PRIVILEGES;"
+}
+
+_ensure_web_panel_app_key() {
+    local app_key=""
+    app_key=$(awk -F= '/^[[:space:]]*app_key[[:space:]]*=/{gsub(/[[:space:]\"]/, "", $2); print $2; exit}' "$WEB_PANEL_WORKER_CONFIG" 2>/dev/null || true)
+    if [[ ! "$app_key" =~ ^[a-f0-9]{64}$ ]]; then
+        app_key=$(awk -F= '/^[[:space:]]*app_key[[:space:]]*=/{gsub(/[[:space:]\"]/, "", $2); print $2; exit}' "$WEB_PANEL_CONTROL_CONFIG" 2>/dev/null || true)
+    fi
+    [[ "$app_key" =~ ^[a-f0-9]{64}$ ]] || app_key=$(openssl rand -hex 32)
+    local file
+    for file in "$WEB_PANEL_CONTROL_CONFIG" "$WEB_PANEL_WORKER_CONFIG"; do
+        [[ -f "$file" ]] || continue
+        if grep -q '^[[:space:]]*app_key[[:space:]]*=' "$file"; then
+            sed -i "s|^[[:space:]]*app_key[[:space:]]*=.*|app_key = \"${app_key}\"|" "$file"
+        else
+            printf '\n[security]\napp_key = "%s"\n' "$app_key" >> "$file"
+        fi
+    done
+}
+
+_web_panel_ini_value() {
+    local file="$1" section="$2" key="$3"
+    awk -F= -v wanted_section="$section" -v wanted_key="$key" '
+        /^\[/ { current=$0; gsub(/^\[|\]$/, "", current); next }
+        current == wanted_section {
+            name=$1; gsub(/[[:space:]]/, "", name)
+            if (name == wanted_key) {
+                value=substr($0, index($0, "=")+1)
+                gsub(/^[[:space:]\"]+|[[:space:]\"]+$/, "", value)
+                print value; exit
+            }
+        }
+    ' "$file" 2>/dev/null
+}
+
+_ensure_web_panel_control_plane() {
+    local nologin_shell="/usr/sbin/nologin"
+    [[ -x "$nologin_shell" ]] || nologin_shell="/sbin/nologin"
+    id liuercontrol &>/dev/null || useradd --system --home-dir /nonexistent --shell "$nologin_shell" liuercontrol || return 1
+
+    _ensure_web_panel_app_key
+    local app_key control_db_pass web_db_user web_db_pass
+    app_key=$(_web_panel_ini_value "$WEB_PANEL_WORKER_CONFIG" security app_key)
+    [[ "$app_key" =~ ^[a-f0-9]{64}$ ]] || return 1
+
+    control_db_pass=$(_web_panel_ini_value "$WEB_PANEL_CONTROL_CONFIG" database password)
+    if [[ -z "$control_db_pass" ]]; then
+        control_db_pass=$(rand_str 40)
+        _write_web_panel_ini "$WEB_PANEL_CONTROL_CONFIG" "liuer_panel_control" "$control_db_pass" "$app_key"
+    fi
+    mysql_exec "CREATE USER IF NOT EXISTS 'liuer_panel_control'@'127.0.0.1' IDENTIFIED BY '${control_db_pass}'; ALTER USER 'liuer_panel_control'@'127.0.0.1' IDENTIFIED BY '${control_db_pass}'; GRANT SELECT, INSERT, UPDATE, DELETE ON liuer_panel.* TO 'liuer_panel_control'@'127.0.0.1'; FLUSH PRIVILEGES;" || return 1
+
+    web_db_user=$(_web_panel_ini_value "$WEB_PANEL_CONFIG" database user)
+    web_db_pass=$(_web_panel_ini_value "$WEB_PANEL_CONFIG" database password)
+    [[ -n "$web_db_user" && -n "$web_db_pass" ]] || return 1
+    _write_web_panel_ini "$WEB_PANEL_CONFIG" "$web_db_user" "$web_db_pass"
+
+    chown root:liuerpanel "$WEB_PANEL_CONFIG"
+    chmod 640 "$WEB_PANEL_CONFIG"
+    chown root:liuercontrol "$WEB_PANEL_CONTROL_CONFIG"
+    chmod 640 "$WEB_PANEL_CONTROL_CONFIG"
+    chown root:root "$WEB_PANEL_WORKER_CONFIG"
+    chmod 600 "$WEB_PANEL_WORKER_CONFIG"
+    _apply_web_panel_db_grants || return 1
+    _configure_web_panel_control
+}
+
+_set_web_panel_source_permissions() {
+    chown -R root:liuerpanel "$WEB_PANEL_DIR"
+    chmod 755 "$INSTALL_DIR"
+    find "$WEB_PANEL_DIR" -type d -exec chmod 750 {} \;
+    find "$WEB_PANEL_DIR" -type f -exec chmod 640 {} \;
+    chmod 755 "$WEB_PANEL_DIR" "${WEB_PANEL_DIR}/public" "${WEB_PANEL_DIR}/public/assets"
+    find "${WEB_PANEL_DIR}/public/assets" -type d -exec chmod 755 {} \;
+    find "${WEB_PANEL_DIR}/public/assets" -type f -exec chmod 644 {} \;
+    chmod 750 "${WEB_PANEL_DIR}/bin/"*.php
+}
+
+_configure_web_panel_fpm() {
+    _web_panel_fpm_details
+    local nginx_user="nginx"
+    id nginx &>/dev/null || nginx_user="www-data"
+    local runtime="/var/lib/liuer-panel/web-panel"
+    mkdir -p "${runtime}/sessions" "${runtime}/tmp"
+    chown -R liuerpanel:liuerpanel "$runtime"
+    chmod 700 "$runtime" "${runtime}/sessions" "${runtime}/tmp"
+    touch /var/log/liuer-web-panel-php.log
+    chown liuerpanel:liuerpanel /var/log/liuer-web-panel-php.log
+    chmod 640 /var/log/liuer-web-panel-php.log
+
+    cat > "$WEB_PANEL_FPM_CONF" <<EOF
+[liuer-web-panel]
+user = liuerpanel
+group = liuerpanel
+listen = ${WEB_PANEL_FPM_SOCKET}
+listen.owner = ${nginx_user}
+listen.group = ${nginx_user}
+listen.mode = 0660
+pm = ondemand
+pm.max_children = 8
+pm.process_idle_timeout = 15s
+pm.max_requests = 500
+clear_env = yes
+catch_workers_output = yes
+security.limit_extensions = .php
+php_admin_flag[display_errors] = off
+php_admin_flag[log_errors] = on
+php_admin_value[error_log] = /var/log/liuer-web-panel-php.log
+php_admin_value[session.save_path] = ${runtime}/sessions
+php_admin_value[upload_tmp_dir] = ${runtime}/tmp
+php_admin_value[sys_temp_dir] = ${runtime}/tmp
+php_admin_value[open_basedir] = ${WEB_PANEL_DIR}:${CONFIG_DIR}:${runtime}:/usr/share/zoneinfo
+php_admin_value[disable_functions] = ${DANGEROUS_FUNCTIONS}
+EOF
+    systemctl restart "$WEB_PANEL_FPM_SERVICE"
+}
+
+_configure_web_panel_nginx() {
+    local port="$1" bind_address="${2:-0.0.0.0}" listen_directives
+    if [[ "$bind_address" == "127.0.0.1" ]]; then
+        listen_directives="    listen 127.0.0.1:${port} ssl;"
+    else
+        listen_directives="    listen ${port} ssl;
+    listen [::]:${port} ssl;"
+    fi
+    _web_panel_fpm_details
+    local tls_dir="${CONFIG_DIR}/web-panel-tls"
+    local cert="${tls_dir}/panel.crt" key="${tls_dir}/panel.key"
+    mkdir -p "$tls_dir"
+    chmod 700 "$tls_dir"
+    if [[ ! -s "$cert" || ! -s "$key" ]]; then
+        local server_ip; server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        [[ -z "$server_ip" ]] && server_ip="127.0.0.1"
+        openssl req -x509 -nodes -newkey rsa:3072 -sha256 -days 825 \
+            -keyout "$key" -out "$cert" -subj "/CN=${server_ip}" \
+            -addext "subjectAltName=IP:${server_ip},IP:127.0.0.1" &>/dev/null \
+            || openssl req -x509 -nodes -newkey rsa:3072 -sha256 -days 825 \
+                -keyout "$key" -out "$cert" -subj "/CN=${server_ip}" &>/dev/null \
+            || return 1
+        chmod 600 "$key"
+        chmod 644 "$cert"
+    fi
+
+    cat > "$WEB_PANEL_NGINX_CONF" <<EOF
+# Liuer Web Panel — managed by liuer-panel.sh
+server {
+${listen_directives}
+    server_name _;
+    root ${WEB_PANEL_DIR}/public;
+    index index.php;
+
+    ssl_certificate ${cert};
+    ssl_certificate_key ${key};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:LiuerPanelSSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header Content-Security-Policy "default-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" always;
+
+    client_max_body_size 16m;
+    location / { try_files \$uri \$uri/ /index.php?\$query_string; }
+    location /assets/ { try_files \$uri =404; expires 7d; access_log off; }
+    location = /index.php {
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME ${WEB_PANEL_DIR}/public/index.php;
+        fastcgi_param HTTP_PROXY "";
+        fastcgi_pass unix:${WEB_PANEL_FPM_SOCKET};
+        fastcgi_read_timeout 60s;
+    }
+    location ~ \.php$ { return 404; }
+    location ~ /\. { deny all; }
+}
+EOF
+    nginx -t || return 1
+    systemctl reload nginx
+}
+
+_configure_web_panel_control() {
+    local php_bin; php_bin=$(_web_panel_php_bin)
+    local maria_svc="mariadb"
+    systemctl cat mariadb.service &>/dev/null || maria_svc="mysqld"
+    cat > "/etc/systemd/system/${WEB_PANEL_CONTROL_SERVICE}" <<EOF
+[Unit]
+Description=Liuer Web Panel authentication and authorization service
+After=network.target ${maria_svc}.service
+Wants=${maria_svc}.service
+
+[Service]
+Type=simple
+User=liuercontrol
+Group=liuerpanel
+SupplementaryGroups=liuercontrol
+RuntimeDirectory=liuer-panel-control
+RuntimeDirectoryMode=0750
+ExecStart=${php_bin} ${WEB_PANEL_DIR}/bin/control.php
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0007
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now "$WEB_PANEL_CONTROL_SERVICE"
+}
+
+_configure_web_panel_worker() {
+    local php_bin; php_bin=$(_web_panel_php_bin)
+    local maria_svc="mariadb"
+    systemctl cat mariadb.service &>/dev/null || maria_svc="mysqld"
+    cat > "/etc/systemd/system/${WEB_PANEL_SERVICE}" <<EOF
+[Unit]
+Description=Liuer Web Panel privileged job worker
+After=network.target ${maria_svc}.service nginx.service ${WEB_PANEL_CONTROL_SERVICE}
+Wants=${maria_svc}.service ${WEB_PANEL_CONTROL_SERVICE}
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=${php_bin} ${WEB_PANEL_DIR}/bin/worker.php
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now "$WEB_PANEL_SERVICE"
+}
+
+install_web_panel() {
+    local preconfirmed="${1:-0}"
+    print_section "INSTALL LIUER WEB PANEL"
+    if web_panel_installed; then
+        log_warn "Liuer Web Panel is already installed."
+        press_enter
+        return 0
+    fi
+
+    echo -e "${DIM}Required stack: Nginx + MariaDB + PHP 8.2-FPM${NC}"
+    echo -e "${DIM}Safe default: access through an SSH tunnel; public IP access remains optional.${NC}\n"
+    if [[ "$preconfirmed" != "1" ]]; then
+        confirm_action "Install Liuer Web Panel?" || { log_info "Cancelled."; return 0; }
+    fi
+    _cleanup_incomplete_web_panel
+
+    local port admin_email admin_password generated_password=0 access_mode bind_address
+    port=$(prompt_default "HTTPS port" "$WEB_PANEL_DEFAULT_PORT")
+    validate_port "$port" || { log_error "Invalid TCP port: $port"; press_enter; return 1; }
+    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$"; then
+        log_error "TCP port ${port} is already in use."
+        press_enter; return 1
+    fi
+
+    echo -e "\n${BOLD}Panel network access:${NC}"
+    echo "  1) Private — SSH tunnel only (recommended)"
+    echo "  2) Public — direct HTTPS by server IP"
+    echo -e "${YELLOW}Select [1]:${NC} \c"; read -r access_mode
+    access_mode="${access_mode:-1}"
+    case "$access_mode" in
+        1) access_mode="private"; bind_address="127.0.0.1" ;;
+        2)
+            access_mode="public"; bind_address="0.0.0.0"
+            log_warn "Public IP mode uses a self-signed certificate until you configure a trusted certificate."
+            ;;
+        *) log_error "Invalid access mode."; press_enter; return 1 ;;
+    esac
+
+    admin_email=$(prompt_default "Administrator email" "admin@localhost.local")
+    if [[ ! "$admin_email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+        log_error "Invalid administrator email."
+        press_enter; return 1
+    fi
+    echo -e "${BOLD}Administrator password${NC} [leave empty to generate]: \c"
+    read -rs admin_password
+    echo ""
+    if [[ -z "$admin_password" ]]; then
+        admin_password=$(rand_pass 24)
+        generated_password=1
+    elif [[ ${#admin_password} -lt 12 ]]; then
+        log_error "Administrator password must contain at least 12 characters."
+        press_enter; return 1
+    fi
+
+    _ensure_web_panel_stack || { press_enter; return 1; }
+    local nologin_shell="/usr/sbin/nologin"
+    [[ -x "$nologin_shell" ]] || nologin_shell="/sbin/nologin"
+    id liuerpanel &>/dev/null || useradd --system --home-dir "$WEB_PANEL_DIR" --shell "$nologin_shell" liuerpanel
+    id liuercontrol &>/dev/null || useradd --system --home-dir /nonexistent --shell "$nologin_shell" liuercontrol
+    mkdir -p "$CONFIG_DIR"
+
+    local stage; stage=$(mktemp -d /tmp/liuer-web-stage.XXXXXX) || return 1
+    if ! _stage_web_panel_source "$stage"; then
+        rm -rf "$stage"
+        log_error "Unable to obtain Web Panel source."
+        press_enter; return 1
+    fi
+
+    local web_db_pass control_db_pass worker_db_pass app_key
+    web_db_pass=$(rand_str 40)
+    control_db_pass=$(rand_str 40)
+    worker_db_pass=$(rand_str 40)
+    app_key=$(openssl rand -hex 32)
+    _create_web_panel_database "$web_db_pass" "$control_db_pass" "$worker_db_pass" "$app_key" || {
+        rm -rf "$stage"; log_error "Unable to create the Web Panel database."; press_enter; return 1;
+    }
+
+    rm -rf "$WEB_PANEL_DIR"
+    mv "$stage" "$WEB_PANEL_DIR"
+    _set_web_panel_source_permissions
+
+    local php_bin; php_bin=$(_web_panel_php_bin)
+    LIUER_WEB_CONFIG="$WEB_PANEL_WORKER_CONFIG" "$php_bin" "${WEB_PANEL_DIR}/bin/migrate.php" || {
+        _cleanup_incomplete_web_panel
+        log_error "Database migration failed."; press_enter; return 1;
+    }
+    printf '%s\n%s\n%s\n' "$admin_email" "$admin_password" "Administrator" \
+        | LIUER_WEB_CONFIG="$WEB_PANEL_WORKER_CONFIG" "$php_bin" "${WEB_PANEL_DIR}/bin/create-admin.php" || {
+            _cleanup_incomplete_web_panel
+            log_error "Administrator account creation failed."; press_enter; return 1;
+        }
+
+    _apply_web_panel_db_grants || { _cleanup_incomplete_web_panel; log_error "Database privilege isolation failed."; press_enter; return 1; }
+    _configure_web_panel_control || { _cleanup_incomplete_web_panel; log_error "Control service setup failed."; press_enter; return 1; }
+    _configure_web_panel_fpm || { _cleanup_incomplete_web_panel; log_error "PHP-FPM configuration failed."; press_enter; return 1; }
+    _configure_web_panel_nginx "$port" "$bind_address" || { _cleanup_incomplete_web_panel; log_error "Nginx configuration failed."; press_enter; return 1; }
+    _configure_web_panel_worker || { _cleanup_incomplete_web_panel; log_error "Worker service setup failed."; press_enter; return 1; }
+    if [[ "$access_mode" == "public" ]]; then
+        _open_web_panel_port "$port" || log_warn "Could not update the firewall automatically."
+    fi
+
+    {
+        echo "PORT=${port}"
+        echo "ACCESS_MODE=${access_mode}"
+        echo "BIND_ADDRESS=${bind_address}"
+        echo "ADMIN_EMAIL=${admin_email}"
+        echo "INSTALLED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$WEB_PANEL_STATE"
+    chmod 600 "$WEB_PANEL_STATE"
+
+    local server_ip; server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [[ -z "$server_ip" ]] && server_ip="SERVER_IP"
+    log_success "Liuer Web Panel installed successfully."
+    if [[ "$access_mode" == "private" ]]; then
+        echo -e "  Tunnel   : ${BOLD}ssh -L ${port}:127.0.0.1:${port} root@${server_ip}${NC}"
+        echo -e "  URL      : ${BOLD}https://127.0.0.1:${port}${NC}"
+    else
+        echo -e "  URL      : ${BOLD}https://${server_ip}:${port}${NC}"
+    fi
+    echo -e "  Email    : ${BOLD}${admin_email}${NC}"
+    [[ "$generated_password" -eq 1 ]] && echo -e "  Password : ${BOLD}${admin_password}${NC}  ${YELLOW}(save it now)${NC}"
+    echo -e "${YELLOW}The generated certificate is self-signed, so the browser will show a warning.${NC}"
+    press_enter
+}
+
+update_web_panel() {
+    local automatic="${1:-0}"
+    web_panel_installed || {
+        [[ "$automatic" == "1" ]] || { log_warn "Liuer Web Panel is not installed."; press_enter; }
+        return 0
+    }
+    [[ "$automatic" == "1" ]] || print_section "UPDATE LIUER WEB PANEL"
+
+    local stage backup php_bin
+    stage=$(mktemp -d /tmp/liuer-web-update.XXXXXX) || return 1
+    if ! _stage_web_panel_source "$stage" 1; then
+        rm -rf "$stage"
+        log_error "Unable to download Web Panel source."
+        [[ "$automatic" == "1" ]] || press_enter
+        return 1
+    fi
+
+    local current_version new_version
+    current_version=$(cat "${WEB_PANEL_DIR}/VERSION" 2>/dev/null || echo unknown)
+    new_version=$(cat "${stage}/VERSION" 2>/dev/null || echo unknown)
+    if [[ "$automatic" != "1" ]]; then
+        echo -e "  Web Panel: ${DIM}${current_version}${NC} → ${BOLD}${GREEN}${new_version}${NC}"
+        confirm_action "Deploy this Web Panel version?" || { rm -rf "$stage"; log_info "Cancelled."; return 0; }
+    fi
+
+    backup="${WEB_PANEL_DIR}.rollback"
+    rm -rf "$backup"
+    mv "$WEB_PANEL_DIR" "$backup" || { rm -rf "$stage"; return 1; }
+    mv "$stage" "$WEB_PANEL_DIR"
+    _set_web_panel_source_permissions
+    _ensure_web_panel_app_key
+
+    php_bin=$(_web_panel_php_bin)
+    if ! LIUER_WEB_CONFIG="$WEB_PANEL_WORKER_CONFIG" "$php_bin" "${WEB_PANEL_DIR}/bin/migrate.php"; then
+        rm -rf "$WEB_PANEL_DIR"
+        mv "$backup" "$WEB_PANEL_DIR"
+        log_error "Web Panel migration failed; source was rolled back."
+        [[ "$automatic" == "1" ]] || press_enter
+        return 1
+    fi
+    if ! _ensure_web_panel_control_plane; then
+        log_error "Web Panel security boundary migration failed. The panel remains fail-closed; run Liuer Web Panel repair after correcting MariaDB/systemd."
+        [[ "$automatic" == "1" ]] || press_enter
+        return 1
+    fi
+    rm -rf "$backup"
+    systemctl restart "$WEB_PANEL_CONTROL_SERVICE" 2>/dev/null || true
+    systemctl restart "$WEB_PANEL_SERVICE" 2>/dev/null || true
+    systemctl restart "$(get_php_service "8.2")" 2>/dev/null || true
+    log_success "Liuer Web Panel updated to ${new_version}."
+    [[ "$automatic" == "1" ]] || press_enter
+}
+
+show_web_panel_status() {
+    print_section "LIUER WEB PANEL STATUS"
+    if ! web_panel_installed; then
+        log_warn "Liuer Web Panel is not installed."
+        press_enter; return 0
+    fi
+    local port access_mode; port=$(_web_panel_state_value PORT); access_mode=$(_web_panel_state_value ACCESS_MODE)
+    access_mode="${access_mode:-public}"
+    local server_ip; server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    if [[ "$access_mode" == "private" ]]; then
+        printf "  %-18s %s\n" "URL" "https://127.0.0.1:${port:-$WEB_PANEL_DEFAULT_PORT} (SSH tunnel)"
+        printf "  %-18s %s\n" "Tunnel" "ssh -L ${port:-$WEB_PANEL_DEFAULT_PORT}:127.0.0.1:${port:-$WEB_PANEL_DEFAULT_PORT} root@${server_ip:-SERVER_IP}"
+    else
+        printf "  %-18s %s\n" "URL" "https://${server_ip:-SERVER_IP}:${port:-$WEB_PANEL_DEFAULT_PORT}"
+    fi
+    printf "  %-18s %s\n" "Access mode" "$access_mode"
+    printf "  %-18s %s\n" "Nginx config" "$WEB_PANEL_NGINX_CONF"
+    printf "  %-18s %s\n" "Worker" "$(systemctl is-active "$WEB_PANEL_SERVICE" 2>/dev/null || echo unknown)"
+    printf "  %-18s %s\n" "Control service" "$(systemctl is-active "$WEB_PANEL_CONTROL_SERVICE" 2>/dev/null || echo unknown)"
+    printf "  %-18s %s\n" "Nginx" "$(systemctl is-active nginx 2>/dev/null || echo unknown)"
+    local maria="mariadb"; systemctl cat mariadb.service &>/dev/null || maria="mysqld"
+    printf "  %-18s %s\n" "MariaDB" "$(systemctl is-active "$maria" 2>/dev/null || echo unknown)"
+    press_enter
+}
+
+reset_web_panel_admin() {
+    print_section "RESET WEB PANEL ADMIN"
+    web_panel_installed || { log_warn "Liuer Web Panel is not installed."; press_enter; return 1; }
+    local current_email email password generated=0
+    current_email=$(_web_panel_state_value ADMIN_EMAIL)
+    email=$(prompt_default "Administrator email" "${current_email:-admin@localhost.local}")
+    if [[ ! "$email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+        log_error "Invalid administrator email."
+        press_enter; return 1
+    fi
+    echo -e "${BOLD}New password${NC} [leave empty to generate]: \c"
+    read -rs password
+    echo ""
+    if [[ -z "$password" ]]; then
+        password=$(rand_pass 24)
+        generated=1
+    elif [[ ${#password} -lt 12 ]]; then
+        log_error "Administrator password must contain at least 12 characters."
+        press_enter; return 1
+    fi
+    local php_bin; php_bin=$(_web_panel_php_bin)
+    printf '%s\n%s\n%s\n' "$email" "$password" "Administrator" \
+        | LIUER_WEB_CONFIG="$WEB_PANEL_WORKER_CONFIG" "$php_bin" "${WEB_PANEL_DIR}/bin/create-admin.php" \
+        || { log_error "Administrator password reset failed."; press_enter; return 1; }
+    sed -i "s|^ADMIN_EMAIL=.*|ADMIN_EMAIL=${email}|" "$WEB_PANEL_STATE"
+    log_success "Administrator account updated: ${email}"
+    [[ "$generated" -eq 1 ]] && echo -e "  Password : ${BOLD}${password}${NC}  ${YELLOW}(save it now)${NC}"
+    press_enter
+}
+
+repair_web_panel() {
+    print_section "REPAIR LIUER WEB PANEL"
+    web_panel_installed || { log_warn "Liuer Web Panel is not installed."; press_enter; return 1; }
+    local port bind_address access_mode
+    port=$(_web_panel_state_value PORT); port="${port:-$WEB_PANEL_DEFAULT_PORT}"
+    access_mode=$(_web_panel_state_value ACCESS_MODE); access_mode="${access_mode:-public}"
+    bind_address=$(_web_panel_state_value BIND_ADDRESS)
+    [[ -n "$bind_address" ]] || { [[ "$access_mode" == "private" ]] && bind_address="127.0.0.1" || bind_address="0.0.0.0"; }
+    _ensure_web_panel_stack || { press_enter; return 1; }
+    _ensure_web_panel_control_plane || { log_error "Control service repair failed."; press_enter; return 1; }
+    _configure_web_panel_fpm || { log_error "PHP-FPM repair failed."; press_enter; return 1; }
+    _configure_web_panel_nginx "$port" "$bind_address" || { log_error "Nginx repair failed."; press_enter; return 1; }
+    _configure_web_panel_worker || { log_error "Worker repair failed."; press_enter; return 1; }
+    if [[ "$access_mode" == "public" ]]; then _open_web_panel_port "$port" || true; else _close_web_panel_port "$port"; fi
+    log_success "Liuer Web Panel repaired. Website and hosting data were not modified."
+    press_enter
+}
+
+uninstall_web_panel() {
+    print_section "UNINSTALL LIUER WEB PANEL"
+    web_panel_installed || { log_warn "Liuer Web Panel is not installed."; press_enter; return 0; }
+    print_warning_box
+    echo -e "${YELLOW}This removes only the Web Panel UI. Managed websites, site databases and backups are preserved.${NC}"
+    confirm_danger "Uninstall Liuer Web Panel" || { log_info "Cancelled."; return 0; }
+    local port access_mode; port=$(_web_panel_state_value PORT); port="${port:-$WEB_PANEL_DEFAULT_PORT}"; access_mode=$(_web_panel_state_value ACCESS_MODE); access_mode="${access_mode:-public}"
+    _web_panel_fpm_details
+    systemctl disable --now "$WEB_PANEL_SERVICE" 2>/dev/null || true
+    systemctl disable --now "$WEB_PANEL_CONTROL_SERVICE" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${WEB_PANEL_SERVICE}" "/etc/systemd/system/${WEB_PANEL_CONTROL_SERVICE}" "$WEB_PANEL_NGINX_CONF" "$WEB_PANEL_FPM_CONF"
+    systemctl daemon-reload
+    systemctl restart "$WEB_PANEL_FPM_SERVICE" 2>/dev/null || true
+    nginx -t &>/dev/null && systemctl reload nginx || true
+    [[ "$access_mode" == "public" ]] && _close_web_panel_port "$port"
+    rm -rf "$WEB_PANEL_DIR" /var/lib/liuer-panel/web-panel "${CONFIG_DIR}/web-panel-tls"
+    rm -f "$WEB_PANEL_CONFIG" "$WEB_PANEL_CONTROL_CONFIG" "$WEB_PANEL_WORKER_CONFIG" "$WEB_PANEL_STATE"
+    mysql_exec "DROP USER IF EXISTS 'liuer_panel_web'@'127.0.0.1'; DROP USER IF EXISTS 'liuer_panel_control'@'127.0.0.1'; DROP USER IF EXISTS 'liuer_panel_worker'@'127.0.0.1'; FLUSH PRIVILEGES;" \
+        || log_warn "Web Panel MariaDB service accounts could not be removed."
+    chown root:root "$CONFIG_DIR" 2>/dev/null || true
+    chmod 700 "$CONFIG_DIR" 2>/dev/null || true
+    log_success "Web Panel UI removed. The liuer_panel database was retained for recovery."
+    press_enter
+}
+
+change_web_panel_access() {
+    print_section "WEB PANEL NETWORK ACCESS"
+    web_panel_installed || { log_warn "Liuer Web Panel is not installed."; press_enter; return 1; }
+    local port mode bind_address
+    port=$(_web_panel_state_value PORT); port="${port:-$WEB_PANEL_DEFAULT_PORT}"
+    echo "  1) Private — SSH tunnel only (recommended)"
+    echo "  2) Public — direct HTTPS by server IP"
+    echo "  0) Cancel"
+    echo -e "${YELLOW}Select [0-2]:${NC} \c"; read -r mode
+    case "$mode" in
+        1) mode="private"; bind_address="127.0.0.1" ;;
+        2)
+            mode="public"; bind_address="0.0.0.0"
+            log_warn "Public mode exposes the login page to the Internet. Use a trusted TLS certificate and a provider firewall allowlist."
+            confirm_action "Enable public access?" || { log_info "Cancelled."; return 0; }
+            ;;
+        *) log_info "Cancelled."; return 0 ;;
+    esac
+    _configure_web_panel_nginx "$port" "$bind_address" || { log_error "Nginx configuration failed; access mode was not changed."; press_enter; return 1; }
+    if [[ "$mode" == "public" ]]; then _open_web_panel_port "$port" || true; else _close_web_panel_port "$port"; fi
+    if grep -q '^ACCESS_MODE=' "$WEB_PANEL_STATE"; then sed -i "s/^ACCESS_MODE=.*/ACCESS_MODE=${mode}/" "$WEB_PANEL_STATE"; else echo "ACCESS_MODE=${mode}" >> "$WEB_PANEL_STATE"; fi
+    if grep -q '^BIND_ADDRESS=' "$WEB_PANEL_STATE"; then sed -i "s/^BIND_ADDRESS=.*/BIND_ADDRESS=${bind_address}/" "$WEB_PANEL_STATE"; else echo "BIND_ADDRESS=${bind_address}" >> "$WEB_PANEL_STATE"; fi
+    log_success "Web Panel access mode changed to ${mode}."
+    press_enter
+}
+
+manage_web_panel() {
+    while true; do
+        print_section "LIUER WEB PANEL"
+        if web_panel_installed; then
+            local port; port=$(_web_panel_state_value PORT)
+            echo -e "  Status: ${GREEN}installed${NC}  ·  HTTPS port: ${port:-$WEB_PANEL_DEFAULT_PORT}"
+            echo "  1) Show status and URL"
+            echo "  2) Update Web Panel"
+            echo "  3) Repair configuration"
+            echo "  4) Reset administrator password"
+            echo "  5) Restart panel services"
+            echo "  6) Change private/public access"
+            echo "  7) Uninstall Web Panel"
+        else
+            echo -e "  Status: ${YELLOW}not installed${NC}"
+            echo "  1) Install Web Panel"
+        fi
+        echo "  0) Back"
+        echo -e "${YELLOW}Select:${NC} \c"
+        read -r _ch
+        if web_panel_installed; then
+            case "$_ch" in
+                1) show_web_panel_status ;;
+                2) update_web_panel ;;
+                3) repair_web_panel ;;
+                4) reset_web_panel_admin ;;
+                5) systemctl restart "$WEB_PANEL_CONTROL_SERVICE" "$WEB_PANEL_SERVICE" \
+                       && log_success "Control and worker services restarted." \
+                       || log_error "One or more panel services failed to restart."; press_enter ;;
+                6) change_web_panel_access ;;
+                7) uninstall_web_panel ;;
+                0) return ;;
+                *) log_warn "Invalid selection." ;;
+            esac
+        else
+            case "$_ch" in
+                1) install_web_panel ;;
+                0) return ;;
+                *) log_warn "Invalid selection." ;;
+            esac
+        fi
+    done
+}
+
 do_install() {
     print_header
     echo -e "${BOLD}${BOLD}LIUER PANEL — INSTALLATION${NC}\n"
 
     check_root
     detect_os
+
+    if [[ "$OS_ID" == "debian" && "$OS_VERSION_ID" != "12" && "$OS_VERSION_ID" != "13" ]]; then
+        log_error "Unsupported Debian version for installation: ${OS_VERSION_ID:-unknown}. Supported versions are Debian 12 and 13."
+        return 1
+    fi
 
     echo -e "${BOLD}Operating system: ${BOLD}${OS_ID} ${OS_VERSION_ID} (${OS_FAMILY})${NC}\n"
 
@@ -5924,8 +7086,10 @@ do_install() {
             dnf install -y epel-release curl wget tar gzip zip unzip python3 openssl git cronie ;;
         debian)
             apt-get update -y
-            DEBIAN_FRONTEND=noninteractive apt-get install -y \
-                curl wget tar gzip zip unzip python3 openssl git cron software-properties-common ;;
+            local _debian_base_pkgs="curl wget tar gzip zip unzip python3 openssl git cron ca-certificates gnupg lsb-release"
+            [[ "$OS_ID" == "ubuntu" ]] && _debian_base_pkgs+=" software-properties-common"
+            # shellcheck disable=SC2086
+            DEBIAN_FRONTEND=noninteractive apt-get install -y $_debian_base_pkgs ;;
     esac
 
     # ── Nginx (mainline 1.25+ from nginx.org for HTTP/2 & HTTP/3 support) ────
@@ -5954,8 +7118,14 @@ do_install() {
             [[ "${OS_VERSION_ID}" -lt 10 ]] && dnf module reset php -y 2>/dev/null || true
             ;;
         debian)
-            add-apt-repository -y ppa:ondrej/php
-            apt-get update -y ;;
+            # Prefer the distribution PHP package when PHP 8.2 is available.
+            # Debian 13 may need packages.sury.org for this fixed version.
+            if ! apt-cache show "php8.2-fpm" &>/dev/null; then
+                setup_php_repo || {
+                    log_error "PHP repository setup failed."
+                    return 1
+                }
+            fi ;;
     esac
 
     local php_pkgs; php_pkgs=$(get_php_packages "8.2")
@@ -5967,7 +7137,7 @@ do_install() {
     log_success "PHP 8.2 OK"
 
     # ── MariaDB 11.4 ──────────────────────────────────────────────────────────
-    install_mariadb
+    install_mariadb || return 1
 
     # ── Certbot ───────────────────────────────────────────────────────────────
     log_info "Installing Certbot..."
@@ -6098,8 +7268,7 @@ do_install() {
     local _pma_path=""
     [[ -f "${CONFIG_DIR}/pma_path" ]] && _pma_path=$(cat "${CONFIG_DIR}/pma_path")
     if [[ -n "$_pma_path" ]]; then
-        local _pma_ip; _pma_ip=$(curl -fsSL --max-time 3 https://ifconfig.me 2>/dev/null || echo "SERVER_IP")
-        echo -e "${DIM}phpMyAdmin: http://${_pma_ip}/${_pma_path}/${NC}\n"
+        echo -e "${DIM}phpMyAdmin: http://127.0.0.1:8090/${_pma_path}/ (SSH tunnel required)${NC}\n"
     else
         echo -e "${DIM}Web-based MySQL/MariaDB management${NC}\n"
     fi
@@ -6122,6 +7291,16 @@ do_install() {
     chmod +x "${INSTALL_DIR}/${SCRIPT_NAME}"
     ln -sf "${INSTALL_DIR}/${SCRIPT_NAME}" "$BIN_LINK"
     log_success "Symlink: $BIN_LINK → ${INSTALL_DIR}/${SCRIPT_NAME}"
+
+    # ── Optional: PHP Web Panel ──────────────────────────────────────────────
+    echo -e "\n${BOLD}─── Liuer Web Panel ───${NC}"
+    echo -e "${DIM}Optional browser UI on HTTPS port ${WEB_PANEL_DEFAULT_PORT}.${NC}"
+    echo -e "${DIM}It requires the Nginx, MariaDB and PHP-FPM stack installed above.${NC}\n"
+    if confirm_action "Install Liuer Web Panel?"; then
+        install_web_panel 1
+    else
+        log_info "Skipping Web Panel. Install it later from: liuer → Web Panel"
+    fi
 
     # ── Log file ──────────────────────────────────────────────────────────────
     touch "$LOG_FILE" && chmod 640 "$LOG_FILE"
@@ -6153,10 +7332,7 @@ do_install() {
     # phpMyAdmin secret path
     if [[ -f "${CONFIG_DIR}/pma_path" ]]; then
         local _pma; _pma=$(cat "${CONFIG_DIR}/pma_path")
-        local _ip; _ip=$(curl -fsSL --max-time 3 https://ifconfig.me 2>/dev/null \
-                         || curl -fsSL --max-time 3 https://api.ipify.org 2>/dev/null \
-                         || echo "SERVER_IP")
-        echo -e "  ${BOLD}phpMyAdmin   :${NC} http://${_ip}/${_pma}/"
+        echo -e "  ${BOLD}phpMyAdmin   :${NC} http://127.0.0.1:8090/${_pma}/ (SSH tunnel)"
     fi
 
     echo ""
@@ -7288,12 +8464,14 @@ show_pma_url() {
                   || curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null \
                   || hostname -I 2>/dev/null | awk '{print $1}' \
                   || echo "SERVER_IP")
-    local _url="http://${_ip}/${_pma}/"
+    local _url="http://127.0.0.1:8090/${_pma}/"
 
     echo ""
     echo -e "  ${BOLD}phpMyAdmin URL:${NC}"
     echo ""
     echo "${_url}"
+    echo ""
+    echo -e "  ${BOLD}SSH tunnel:${NC} ssh -L 8090:127.0.0.1:8090 root@${_ip}"
     echo ""
     echo "$_url" > "${CONFIG_DIR}/pma_url"
     echo -e "  ${DIM}Saved: cat ${CONFIG_DIR}/pma_url${NC}"
@@ -7352,7 +8530,7 @@ main_menu() {
         printf "  %-28s%s\n"  " 2  Database"     " 7  PHP Manager"
         printf "  %-28s%s\n"  " 3  Cache"        " 8  Update"
         printf "  %-28s%s\n"  " 4  System"       " 9  Web Users"
-        printf "  %-28s%s\n"  " 5  Security"     ""
+        printf "  %-28s%s\n"  " 5  Security"     "10  Web Panel"
         echo -e "  ${DIM}──────────────────────────────────────────────────────────${NC}"
         echo -e "${DIM}   0  Exit${NC}"
         echo -ne "${YELLOW}  Select: ${NC}"
@@ -7368,6 +8546,7 @@ main_menu() {
             7) manage_php ;;
             8) manage_updates ;;
             9) manage_web_users ;;
+           10) manage_web_panel ;;
             0) echo -e "\n${BOLD}Goodbye!${NC}\n"; exit 0 ;;
             *) log_warn "Invalid selection." ;;
         esac
@@ -7375,11 +8554,25 @@ main_menu() {
 }
 
 # =============================================================================
-# NON-INTERACTIVE API (called by liuercp via lcp_exec_panel)
+# NON-INTERACTIVE API (called by the Liuer Web worker and legacy liuercp)
 # =============================================================================
 
+_api_rollback_new_site() {
+    local domain="$1" site_user="$2" site_dir="$3" php_ver="${4:-}"
+    rm -f "${NGINX_CONF_DIR}/${domain}.conf" "${NGINX_CONF_DIR}/${domain}.conf.disabled"
+    [[ -n "$php_ver" ]] && remove_php_pool "$php_ver" "$domain" 2>/dev/null || true
+    rm -rf "${PHP_RUNTIME_BASE:?}/${domain}" "$site_dir"
+    _delete_db_for "$domain" &>/dev/null || true
+    if [[ -n "$site_user" ]]; then
+        userdel "$site_user" 2>/dev/null || true
+        sed -i "/^${site_user}|/d" "$WEB_USERS_FILE" 2>/dev/null || true
+        rmdir "/home/web/${site_user}" 2>/dev/null || true
+    fi
+}
+
 _api_create_site() {
-    local domain="$1" type="${2:-php}" php_ver="${3:-8.3}"
+    local domain="$1" type="${2:-php}" php_ver="${3:-8.2}"
+    local source_mode="${4:-empty}" with_db="${5:-0}"
     [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
     validate_domain "$domain" || { log_error "Invalid domain: $domain"; exit 1; }
     [[ -f "${NGINX_CONF_DIR}/${domain}.conf" ]] && { log_error "Domain already exists: $domain"; exit 1; }
@@ -7399,6 +8592,7 @@ _api_create_site() {
     local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
     local meta="${SITES_META_DIR}/${domain}.conf"
     local socket=""
+    local result_db_name="" result_db_user="" result_db_pass=""
 
     case "$type" in
         php)
@@ -7416,6 +8610,16 @@ _api_create_site() {
             socket=$(get_php_pool_socket "$php_ver" "$domain")
             nginx_tpl_wordpress "$domain" "$web_root" "$socket" > "$nginx_conf"
             create_php_pool "$php_ver" "$domain" "$site_user" 0 "$site_dir"
+            case "$source_mode" in
+                latest)
+                    log_info "Downloading the latest WordPress core..."
+                    curl -fsSL --max-time 180 https://wordpress.org/latest.tar.gz \
+                        | tar -xz -C "$web_root" --strip-components=1 \
+                        || { _api_rollback_new_site "$domain" "$site_user" "$site_dir" "$php_ver"; log_error "WordPress download failed."; exit 1; }
+                    ;;
+                empty) ;;
+                *) _api_rollback_new_site "$domain" "$site_user" "$site_dir" "$php_ver"; log_error "Unknown WordPress source mode: $source_mode"; exit 1 ;;
+            esac
             ;;
         static)
             nginx_tpl_static "$domain" "$web_root" > "$nginx_conf"
@@ -7426,8 +8630,33 @@ _api_create_site() {
             php_ver=""
             ;;
         *)
+            _api_rollback_new_site "$domain" "$site_user" "$site_dir" "$php_ver"
             log_error "Unknown site type: $type"; exit 1 ;;
     esac
+
+    if [[ "$with_db" == "1" ]]; then
+        [[ "$type" == "static" ]] && { _api_rollback_new_site "$domain" "$site_user" "$site_dir" "$php_ver"; log_error "A static website cannot have an automatic database."; exit 1; }
+        _create_db_for "$domain" mysql >/dev/null || { _api_rollback_new_site "$domain" "$site_user" "$site_dir" "$php_ver"; log_error "Database creation failed."; exit 1; }
+        local _db_line _db_enc _db_type
+        _db_line=$(grep "^${domain}|" "$DB_LIST_FILE" 2>/dev/null | tail -1)
+        IFS='|' read -r _ result_db_name result_db_user _db_enc _db_type <<< "$_db_line"
+        result_db_pass=$(decrypt_pass "$_db_enc" 2>/dev/null) || { _api_rollback_new_site "$domain" "$site_user" "$site_dir" "$php_ver"; log_error "Could not read generated database credentials."; exit 1; }
+        if [[ "$type" == "wordpress" && "$source_mode" == "latest" && -f "${web_root}/wp-config-sample.php" ]]; then
+            cp "${web_root}/wp-config-sample.php" "${web_root}/wp-config.php"
+            sed -i "s/database_name_here/${result_db_name}/; s/username_here/${result_db_user}/; s/password_here/${result_db_pass}/" "${web_root}/wp-config.php"
+            local _salts _wp_tmp
+            _salts=$(curl -fsSL --max-time 15 "https://api.wordpress.org/secret-key/1.1/salt/" 2>/dev/null || true)
+            if [[ -n "$_salts" ]]; then
+                _wp_tmp="${web_root}/wp-config.php.tmp"
+                awk -v salts="$_salts" '
+                    /define\(.AUTH_KEY/ { found=1 }
+                    found && /define\(.NONCE_SALT/ { print salts; found=0; next }
+                    !found { print }
+                ' "${web_root}/wp-config.php" > "$_wp_tmp" && mv "$_wp_tmp" "${web_root}/wp-config.php"
+            fi
+            chmod 640 "${web_root}/wp-config.php"
+        fi
+    fi
 
     _set_site_perms "$site_dir" "$site_user"
 
@@ -7440,6 +8669,7 @@ _api_create_site() {
         echo "SITE_DIR=${site_dir}"
         echo "WEB_ROOT=${web_root}"
         echo "INDEX_FILE=index.php"
+        [[ "$type" == "wordpress" ]] && echo "SOURCE_MODE=${source_mode}"
         echo "STATUS=active"
     } > "$meta"
     chmod 600 "$meta"
@@ -7448,9 +8678,19 @@ _api_create_site() {
         local _php_svc; _php_svc=$(get_php_service "$php_ver")
         systemctl reload "$_php_svc" 2>/dev/null || systemctl restart "$_php_svc" 2>/dev/null || true
     fi
-    nginx -t &>/dev/null && nginx -s reload
+    if ! nginx -t &>/dev/null; then
+        _api_rollback_new_site "$domain" "$site_user" "$site_dir" "$php_ver"
+        rm -f "$meta"
+        log_error "Nginx rejected the generated website configuration. Changes were rolled back."
+        exit 1
+    fi
+    nginx -s reload
     lcp_notify "site_created" "\"domain\":\"${domain}\",\"type\":\"${type}\",\"php_version\":\"${php_ver}\""
     log_success "Site created: $domain (user: $site_user)"
+    if [[ -n "$result_db_name" ]]; then
+        printf 'LIUER_SECRET_JSON:{"db_name":"%s","db_user":"%s","db_password":"%s","db_host":"localhost"}\n' \
+            "$result_db_name" "$result_db_user" "$result_db_pass"
+    fi
 }
 
 _api_delete_site() {
@@ -7483,7 +8723,7 @@ _api_delete_site() {
 _api_create_db() {
     local domain="$1" db_type="${2:-mysql}"
     [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
-    _create_db_for "$domain" "$db_type" >&2 || exit 1
+    _create_db_for "$domain" "$db_type" >/dev/null || exit 1
     local db_line _db_name _db_user _enc _type
     db_line=$(grep "^${domain}|" "$DB_LIST_FILE" 2>/dev/null | tail -1)
     [[ -z "$db_line" ]] && { log_error "Failed to read db info"; exit 1; }
@@ -8214,9 +9454,27 @@ _api_restore_backup_file() {
         if tar -tzf "$_target" 2>/dev/null | grep -qE '(^\.\.|/\.\.)'; then
             printf '{"error":"invalid backup: path traversal detected"}\n'; exit 1
         fi
-        rm -rf "${_sdir:?}"
-        tar -xzf "$_target" -C "$_parent" --no-absolute-names 2>/dev/null \
-            || { printf '{"error":"file restore failed"}\n'; exit 1; }
+        local _stage _restored _rollback
+        _stage=$(mktemp -d "${_parent}/.liuer-restore.XXXXXX") \
+            || { printf '{"error":"cannot create restore staging directory"}\n'; exit 1; }
+        if ! tar -xzf "$_target" -C "$_stage" --no-absolute-names 2>/dev/null; then
+            rm -rf "$_stage"
+            printf '{"error":"file restore extraction failed"}\n'; exit 1
+        fi
+        _restored="${_stage}/$(basename "$_sdir")"
+        if [[ ! -d "$_restored" ]]; then
+            rm -rf "$_stage"
+            printf '{"error":"backup does not contain the expected website directory"}\n'; exit 1
+        fi
+        _rollback="${_parent}/.$(basename "$_sdir").restore-rollback"
+        rm -rf "$_rollback"
+        [[ -e "$_sdir" ]] && mv "$_sdir" "$_rollback"
+        if ! mv "$_restored" "$_sdir"; then
+            [[ -e "$_rollback" ]] && mv "$_rollback" "$_sdir"
+            rm -rf "$_stage"
+            printf '{"error":"failed to activate restored website; original was restored"}\n'; exit 1
+        fi
+        rm -rf "$_rollback" "$_stage"
         local _ru; _ru=$(grep "^WEB_USER=" "${SITES_META_DIR}/${domain}.conf" 2>/dev/null | cut -d= -f2)
         [[ -n "$_ru" ]] && _set_site_perms "$_sdir" "$_ru" 2>/dev/null || true
 
@@ -8227,6 +9485,9 @@ _api_restore_backup_file() {
         IFS='|' read -r _ _dbn _dbu _enc _dbt <<< "$_dbline"
         case "$_dbt" in
             mysql|mariadb)
+                local _safety="${_bdir}/db_pre_restore_$(date +%Y%m%d_%H%M%S).sql.gz"
+                mysqldump -u root "$_dbn" 2>/dev/null | gzip > "$_safety" \
+                    || { rm -f "$_safety"; printf '{"error":"could not create pre-restore database safety backup"}\n'; exit 1; }
                 zcat "$_target" | mysql -u root "$_dbn" 2>/dev/null \
                     || { printf '{"error":"database restore failed"}\n'; exit 1; } ;;
             postgresql|pgsql)
@@ -8431,12 +9692,33 @@ _api_request_ssl() {
     local domain="$1" email="$2"
     [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
     [[ -z "$email" ]] && { log_error "Email required"; exit 1; }
+    validate_domain "$domain" || { log_error "Invalid domain: $domain"; exit 1; }
+    [[ "$email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] \
+        || { log_error "Invalid email address"; exit 1; }
+    [[ -f "${NGINX_CONF_DIR}/${domain}.conf" ]] \
+        || { log_error "Website must be active before requesting SSL: $domain"; exit 1; }
 
-    local ssl_email_file="${CONFIG_DIR}/ssl_email"
-    echo "$email" > "$ssl_email_file"
-    chmod 600 "$ssl_email_file"
+    setup_ssl_free "$domain" "$email" 1
+}
 
-    setup_ssl_free "$domain"
+_api_install_custom_ssl() {
+    local domain="$1" cert_file="$2" key_file="$3"
+    [[ -n "$domain" && -n "$cert_file" && -n "$key_file" ]] \
+        || { log_error "Domain, certificate and private key are required"; exit 1; }
+    [[ -f "${NGINX_CONF_DIR}/${domain}.conf" ]] \
+        || { log_error "Website must be active before installing SSL: $domain"; exit 1; }
+    _install_custom_ssl_noninteractive "$domain" "$cert_file" "$key_file"
+}
+
+_api_disable_ssl() {
+    local domain="$1"
+    validate_domain "$domain" || { log_error "Invalid domain: $domain"; exit 1; }
+    _disable_managed_ssl_config "$domain"
+}
+
+_api_test_ssl_renewal() {
+    command -v certbot &>/dev/null || { log_error "Certbot is not installed"; exit 1; }
+    certbot renew --dry-run --no-random-sleep-on-renew
 }
 
 # =============================================================================
@@ -8479,6 +9761,26 @@ main() {
             do_repair
             ;;
 
+        _update_web_panel_auto)
+            check_root
+            detect_os
+            update_web_panel 1
+            ;;
+
+        web-panel)
+            check_root
+            detect_os
+            case "${2:-menu}" in
+                install) install_web_panel ;;
+                status)  show_web_panel_status ;;
+                update)  update_web_panel ;;
+                repair)  repair_web_panel ;;
+                reset-password) reset_web_panel_admin ;;
+                menu)    manage_web_panel ;;
+                *) log_error "Usage: liuer web-panel [install|status|update|repair|reset-password]"; exit 1 ;;
+            esac
+            ;;
+
         # ── Check for updates ─────────────────────────────────────────────────
         check-update)
             detect_os
@@ -8504,6 +9806,7 @@ main() {
             echo "  repair         Re-apply system fixes (SELinux, firewall, nginx)"
             echo "  check-update   Check if a new version is available"
             echo "  version        Show current version"
+            echo "  web-panel      Install or manage the optional browser panel"
             echo "  help           Show this help"
             echo ""
             ;;
@@ -8528,7 +9831,7 @@ main() {
             ;;
 
         # ── Internal API (called non-interactively by liuercp) ────────────────
-        create_site)       check_root; detect_os; _api_create_site    "${2:-}" "${3:-php}"  "${4:-8.3}" ;;
+        create_site)       check_root; detect_os; _api_create_site    "${2:-}" "${3:-php}" "${4:-8.2}" "${5:-empty}" "${6:-0}" ;;
         delete_site)       check_root; detect_os; _api_delete_site    "${2:-}" ;;
         create_db)         check_root; detect_os; _api_create_db      "${2:-}" "${3:-mysql}" ;;
         delete_db)         check_root; detect_os; _api_delete_db      "${2:-}" ;;
@@ -8547,6 +9850,9 @@ main() {
         unlock_site)       check_root; detect_os; _api_unlock_site    "${2:-}" ;;
         restart_php)       check_root; detect_os; _api_restart_php    "${2:-}" ;;
         request_ssl)       check_root; detect_os; _api_request_ssl   "${2:-}" "${3:-}" ;;
+        install_custom_ssl) check_root; detect_os; _api_install_custom_ssl "${2:-}" "${3:-}" "${4:-}" ;;
+        disable_ssl)       check_root; detect_os; _api_disable_ssl   "${2:-}" ;;
+        test_ssl_renewal)  check_root; detect_os; _api_test_ssl_renewal ;;
 
         get_advanced_settings) detect_os; _api_get_advanced_settings "${2:-}" ;;
         set_http_protocol)     check_root; detect_os; _api_set_http_protocol    "${2:-}" "${3:-h1}" ;;

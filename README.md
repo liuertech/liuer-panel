@@ -1,9 +1,9 @@
 # Liuer Panel
 
-[![Version](https://img.shields.io/badge/version-2.6.51-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
+[![Version](https://img.shields.io/badge/version-2.7.2-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
 [![Shell](https://img.shields.io/badge/shell-Bash-4EAA25.svg)](https://www.gnu.org/software/bash/)
 
-Liuer Panel is a lightweight command-line control panel for provisioning and managing Linux web servers. It manages Nginx, isolated PHP-FPM pools, databases, SSL certificates, website users, backups, security services, and common framework tasks from the `liuer` command.
+Liuer Panel is a lightweight control panel for provisioning and managing Linux web servers. The `liuer` command remains the management engine, while the optional PHP Web Panel provides browser access through Nginx and MariaDB.
 
 ## Supported systems
 
@@ -13,8 +13,9 @@ Officially supported:
 | --- | --- |
 | AlmaLinux | 8, 9, 10 |
 | Ubuntu | 20.04, 22.04, 24.04 |
+| Debian | 12, 13 |
 
-The OS detector also recognizes Rocky Linux, RHEL, CentOS, and Debian, but the versions above are the primary tested targets. A fresh VPS and root access are recommended.
+The OS detector also recognizes Rocky Linux, RHEL, and CentOS as RHEL-family systems. Debian uses its own Nginx repository and, when the required PHP version is not available in the native repositories, the Debian packages.sury.org repository; Ubuntu continues to use the Ondřej PHP PPA. Debian 11 is not supported because its security support ended in August 2026. A fresh VPS and root access are recommended.
 
 ## Installation
 
@@ -50,6 +51,7 @@ During installation, you can optionally add:
 - Redis or Memcached as a legacy global/shared service
 - Fail2ban
 - phpMyAdmin
+- Liuer Web Panel on a dedicated HTTPS port
 
 Additional PHP versions, extensions, and services can be installed later from the management menu.
 
@@ -63,9 +65,83 @@ liuer check-update    # Check for a newer release
 liuer repair          # Repair Nginx, PHP-FPM, firewall, SFTP, cron, and SSL timer
 liuer version         # Show the installed version
 liuer help            # Show command help
+liuer web-panel       # Install or manage the optional browser panel
 ```
 
 Most management commands require root privileges. Use `sudo liuer ...` when you are not logged in as root.
+
+## Optional Web Panel
+
+Liuer Web Panel is an optional module managed by `liuer-panel.sh`. Select it during the initial installation, or install it later from `liuer → Web Panel`:
+
+```bash
+sudo liuer web-panel install
+```
+
+The Web Panel requires and verifies all of the following components:
+
+- Nginx
+- MariaDB
+- PHP 8.2-FPM with PDO MySQL and mbstring
+- systemd for the privileged background worker
+
+Liuer installs missing required packages automatically. If Oracle MySQL is already installed instead of MariaDB, the installer stops rather than replacing the database server and risking existing data.
+
+The secure default binds the panel to loopback only. Connect from your computer through an SSH tunnel:
+
+```bash
+ssh -L 8443:127.0.0.1:8443 root@SERVER_IP
+```
+
+Then open `https://127.0.0.1:8443`. Direct IP access remains available as an explicit installation/menu option. In public mode, Liuer opens the selected TCP port in UFW or firewalld; restrict it again at the VPS provider firewall whenever possible. Liuer creates a self-signed certificate for initial access, so the browser warns until a trusted certificate is configured.
+
+The browser-facing PHP-FPM pool runs as the unprivileged `liuerpanel` user and cannot execute shell commands or write panel tables. It has explicit read-only MariaDB grants and cannot read password hashes or the credential-encryption key. Authentication, authorization, audit writes, and job creation pass through a separate non-root Unix-socket control service. A root systemd worker independently revalidates every queued job before performing a supported system action. Panel source files are root-owned, sessions and temporary files use private runtime directories, and all three services use separate MariaDB credentials.
+
+The Website screen currently supports:
+
+- Creating plain PHP and static HTML websites
+- Creating an empty WordPress site or downloading the latest WordPress core
+- Optionally creating a dedicated MariaDB database during site provisioning
+- Automatically configuring `wp-config.php` when WordPress core and a database are requested together
+- Locking and unlocking a website through queued background jobs
+- Displaying database credentials to the authenticated administrator from AES-256-GCM encrypted job results, without writing plaintext passwords to worker logs
+- Displaying SSL state, certificate issuer, expiry, and remaining days for each website
+- Issuing or checking renewal of a Let's Encrypt certificate through the privileged worker
+- Installing a validated custom PEM certificate/key pair, or disabling Liuer-managed HTTPS without deleting certificate files
+- Running a Certbot renewal dry-run from the browser
+- Showing whether the 10-day automatic renewal timer is active
+- Managing per-site MariaDB databases and one-time encrypted credentials
+- Creating and removing chrooted SFTP users
+- Adding and removing per-site cron jobs under the website system user
+- Creating full/files/database backups and restoring or deleting an explicitly confirmed backup file
+- Splitting access into Admin, Reseller, and Customer scopes with server-side authorization in both the PHP application and privileged worker
+- Creating hosting packages with enforced limits for websites, databases, SFTP users, and cron entries
+- Assigning imported/legacy websites to an account without changing their Nginx, PHP-FPM, source, database, or backup data
+
+SSL requests from the browser use the administrator-provided ACME email and the existing Liuer Certbot webroot flow. The worker requires an active website and validates the domain and email again before invoking `liuer request_ssl`. Certbot first requests the bare domain plus `www`, then falls back to the bare domain when `www` DNS is unavailable. Existing certificates are not forcibly renewed before their normal renewal window, which avoids unnecessary Let's Encrypt rate-limit usage.
+
+The dedicated **SSL** screen also accepts a custom PEM full chain and private key. Before installation, Liuer verifies the X.509 data, key format, public-key match, and hostname coverage. Automatic renewal only applies to Let's Encrypt certificates. Disabling SSL removes only the marked configuration created by this Web Panel version; legacy or hand-written Nginx SSL blocks are deliberately left untouched.
+
+The **Hosting** screen is the first operational hosting layer for administrators. Destructive database, SFTP, and backup actions require the exact domain, username, or filename to be typed again. Backups are preserved when the Web Panel itself is uninstalled.
+
+The **Accounts** screen implements hosting-style scopes:
+
+- **Admin** can see the entire server, create Reseller or Customer accounts, define packages, and assign any website.
+- **Reseller** can create and manage direct Customer accounts and can only see resources owned by itself or those customers. Its package is an aggregate ceiling across the reseller and all direct customers, so creating many customers cannot bypass the reseller limit.
+- **Customer** can only see and operate websites and resources assigned to its own account.
+
+Existing websites are deliberately imported without an owner and remain visible only to Admin until assigned. Packages can be created, edited, and reassigned without deleting data; an account already above a newly lowered limit simply cannot create more resources. Resource limits are checked once in the web request and again by the privileged worker, so changing a form payload cannot bypass a package. Disabling an account immediately blocks login and causes its queued privileged jobs to fail authorization; website data remains intact.
+
+Useful commands:
+
+```bash
+sudo liuer web-panel status
+sudo liuer web-panel update
+sudo liuer web-panel repair
+sudo liuer web-panel reset-password
+```
+
+Removing the Web Panel only removes its UI, Nginx/PHP-FPM configuration, control service, worker, and firewall rule. Existing hosted websites, website databases, and backups are preserved; the `liuer_panel` database is retained for recovery.
 
 ## Features
 
@@ -74,7 +150,7 @@ Most management commands require root privileges. Use `sudo liuer ...` when you 
 - Create plain PHP, Laravel, WordPress, and static HTML websites
 - Create WordPress with the latest core, a selected core version, or an empty web root with a database for manual upload/restore
 - Generate and validate an Nginx virtual host automatically
-- Use a dedicated Linux web user and PHP-FPM pool for each dynamic site
+- Use a dedicated Linux web user for every site and a dedicated PHP-FPM pool for each dynamic site
 - Change a site's PHP version without recreating the website
 - View site details, logs, PHP socket, database information, and SSL expiry
 - Lock or unlock a website
@@ -253,6 +329,7 @@ Stopping or flushing a global cache affects every website still connected to its
 - Choose balanced or strict WordPress permissions, or protect Laravel application code
 - Inspect, disable, or re-enable SELinux on supported systems
 - Require explicit confirmation for destructive operations
+- Prevent Nginx from following a symlink into files owned by another website user
 
 #### WordPress and Laravel permission profiles
 
@@ -302,13 +379,13 @@ The script also exposes non-interactive internal commands used by LiuerCP. These
 
 ## phpMyAdmin
 
-phpMyAdmin is optional. When installed, Liuer Panel creates a dedicated system user and PHP-FPM pool, then exposes phpMyAdmin through a randomly generated secret URL on the default Nginx server:
+phpMyAdmin is optional. When installed, Liuer Panel creates a dedicated system user and PHP-FPM pool. It binds only to `127.0.0.1:8090`; use an SSH tunnel instead of exposing the database login publicly:
 
-```text
-http://<server-ip>/pma_<random-token>/
+```bash
+ssh -L 8090:127.0.0.1:8090 root@SERVER_IP
 ```
 
-Display the saved URL from `liuer` → **System** → **Show phpMyAdmin URL**. The secret path reduces casual discovery but is not a replacement for firewall restrictions, trusted-IP rules, or additional authentication.
+Then open `http://127.0.0.1:8090/pma_<random-token>/`. Display the saved URL from `liuer` → **System** → **Show phpMyAdmin URL**. phpMyAdmin uses cookie authentication and Liuer does not create or store a MariaDB superuser for it. Upgrading and running `liuer repair` removes the legacy `pma_*` account that older releases created with global privileges.
 
 ## Important paths
 
@@ -329,7 +406,7 @@ Display the saved URL from `liuer` → **System** → **Show phpMyAdmin URL**. T
 - The panel performs privileged package, service, firewall, user, and filesystem operations; review the script before running it on a production server.
 - `/etc/liuer-panel` contains sensitive metadata and encrypted credentials and should remain root-only.
 - Backups are root-only because they can contain source code, environment files, and database data.
-- Reusing one web user for multiple websites remains supported, but those websites intentionally share the same Linux permission boundary.
+- New websites always receive a unique Linux user. Existing websites that share a user remain one permission boundary and are reported by `liuer repair`; migrate them from **Web user management** before treating them as isolated hosting accounts.
 - Global Redis or Memcached instances are shared. Use the per-site Unix-socket cache option when websites require cache isolation.
 - SELinux is disabled by default on RHEL-family installations for compatibility, but it can be re-enabled from the Security menu; custom policies may be required.
 - Stored password encryption depends on `/etc/liuer-panel/secret.key`; protect this key and include it in secure disaster-recovery planning.
