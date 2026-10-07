@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.3"
+readonly VERSION="2.7.4"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -1231,7 +1231,7 @@ confirm_danger() {
 
 prompt_default() {
     local prompt="$1" default="$2" _input
-    echo -e "${BOLD}${prompt}${NC} [${default}]: \c"
+    printf '%b' "${BOLD}${prompt}${NC} [${default}]: " >&2
     read -r _input
     echo "${_input:-$default}"
 }
