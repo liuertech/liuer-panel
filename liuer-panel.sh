@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.4"
+readonly VERSION="2.7.5"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -6253,6 +6253,7 @@ web_panel_installed() {
 
 _cleanup_incomplete_web_panel() {
     [[ -f "$WEB_PANEL_STATE" ]] && return 0
+    local preserve_source="${1:-0}"
     _web_panel_fpm_details
     systemctl disable --now "$WEB_PANEL_SERVICE" 2>/dev/null || true
     systemctl disable --now "$WEB_PANEL_CONTROL_SERVICE" 2>/dev/null || true
@@ -6260,7 +6261,11 @@ _cleanup_incomplete_web_panel() {
     systemctl daemon-reload 2>/dev/null || true
     systemctl restart "$WEB_PANEL_FPM_SERVICE" 2>/dev/null || true
     nginx -t &>/dev/null && systemctl reload nginx 2>/dev/null || true
-    rm -rf "$WEB_PANEL_DIR" /var/lib/liuer-panel/web-panel "${CONFIG_DIR}/web-panel-tls"
+    if [[ "$preserve_source" == "1" && -f "${WEB_PANEL_DIR}/public/index.php" ]]; then
+        rm -rf /var/lib/liuer-panel/web-panel "${CONFIG_DIR}/web-panel-tls"
+    else
+        rm -rf "$WEB_PANEL_DIR" /var/lib/liuer-panel/web-panel "${CONFIG_DIR}/web-panel-tls"
+    fi
     rm -f "$WEB_PANEL_CONFIG" "$WEB_PANEL_CONTROL_CONFIG" "$WEB_PANEL_WORKER_CONFIG"
     mysql_exec "DROP USER IF EXISTS 'liuer_panel_web'@'127.0.0.1'; DROP USER IF EXISTS 'liuer_panel_control'@'127.0.0.1'; DROP USER IF EXISTS 'liuer_panel_worker'@'127.0.0.1'; FLUSH PRIVILEGES;" 2>/dev/null || true
     chown root:root "$CONFIG_DIR" 2>/dev/null || true
@@ -6723,7 +6728,7 @@ install_web_panel() {
     if [[ "$preconfirmed" != "1" ]]; then
         confirm_action "Install Liuer Web Panel?" || { log_info "Cancelled."; return 0; }
     fi
-    _cleanup_incomplete_web_panel
+    _cleanup_incomplete_web_panel 1
 
     local port admin_email admin_password generated_password=0 access_mode bind_address
     port=$(prompt_default "HTTPS port" "$WEB_PANEL_DEFAULT_PORT")
