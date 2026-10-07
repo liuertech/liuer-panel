@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.5"
+readonly VERSION="2.7.6"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -580,11 +580,8 @@ pm.start_servers = 2
 pm.min_spare_servers = 1
 pm.max_spare_servers = 3
 EOF
-    # umask is supported on Debian/Ubuntu PHP-FPM but not REMI builds
-    # Double-guard: check both OS_FAMILY and pool path (path is reliable even if OS_FAMILY unset)
-    if [[ "${OS_FAMILY:-}" == "debian" && "$pool_conf" != *"remi"* ]]; then
-        echo "umask = 0007" >> "$pool_conf"
-    fi
+    # PHP-FPM pool configuration has no umask directive. Keep per-site
+    # isolation through the dedicated user and private runtime directories.
     cat >> "$pool_conf" <<EOF
 php_admin_value[error_log] = /var/log/nginx/${domain}_php_error.log
 php_admin_flag[log_errors] = on
@@ -699,13 +696,40 @@ _ensure_php_fpm_running() {
             debian)
                 pool_dir="/etc/php/${ver}/fpm/pool.d"
                 svc="php${ver}-fpm"
+                # Older Liuer builds incorrectly wrote an unsupported umask
+                # directive into Debian pool files. Back up and remove it before
+                # trying to start FPM so one bad pool cannot take all sites down.
+                while IFS= read -r _pc; do
+                    if grep -Eq '^[[:space:]]*umask[[:space:]]*=' "$_pc" 2>/dev/null; then
+                        cp -a "$_pc" "${_pc}.pre-umask-fix.bak" || {
+                            log_warn "Could not back up Debian PHP-FPM pool before repairing it: $_pc"
+                            continue
+                        }
+                        if sed -i '/^[[:space:]]*umask[[:space:]]*=/d' "$_pc"; then
+                            log_success "Removed unsupported 'umask' directive from Debian PHP-FPM pool: $_pc"
+                        else
+                            cp -a "${_pc}.pre-umask-fix.bak" "$_pc" 2>/dev/null || true
+                            log_warn "Could not repair Debian PHP-FPM pool: $_pc"
+                        fi
+                    fi
+                done < <(find "$pool_dir" -maxdepth 1 -name "*.conf" ! -name "*.disabled" 2>/dev/null)
                 ;;
         esac
         local active_pools; active_pools=$(find "$pool_dir" -maxdepth 1 -name "*.conf" ! -name "*.disabled" 2>/dev/null | wc -l)
         [[ "$active_pools" -eq 0 ]] && continue
         if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
-            systemctl start "$svc" 2>/dev/null && systemctl enable "$svc" 2>/dev/null || true
-            log_success "Started PHP ${ver} FPM (was stopped — had ${active_pools} active pool(s))"
+            systemctl reset-failed "$svc" 2>/dev/null || true
+            local fpm_bin="/usr/sbin/php-fpm${ver}"
+            if [[ -x "$fpm_bin" ]] && ! "$fpm_bin" -t >/dev/null 2>&1; then
+                log_warn "PHP ${ver} FPM configuration is still invalid; not starting the service. Check: ${fpm_bin} -tt"
+                continue
+            fi
+            if systemctl start "$svc" 2>/dev/null; then
+                systemctl enable "$svc" 2>/dev/null || true
+                log_success "Started PHP ${ver} FPM (had ${active_pools} active pool(s))"
+            else
+                log_warn "Could not start PHP ${ver} FPM; inspect: journalctl -u ${svc} -n 80 --no-pager"
+            fi
         fi
     done
 }

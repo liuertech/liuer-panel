@@ -1,6 +1,6 @@
 # Liuer Panel
 
-[![Version](https://img.shields.io/badge/version-2.7.5-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
+[![Version](https://img.shields.io/badge/version-2.7.6-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
 [![Shell](https://img.shields.io/badge/shell-Bash-4EAA25.svg)](https://www.gnu.org/software/bash/)
 
 Liuer Panel is a lightweight control panel for provisioning and managing Linux web servers. The `liuer` command remains the management engine, while the optional PHP Web Panel provides browser access through Nginx and MariaDB.
