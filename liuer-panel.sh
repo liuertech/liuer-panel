@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.2"
+readonly VERSION="2.7.3"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -8468,15 +8468,14 @@ show_pma_url() {
 
     echo ""
     echo -e "  ${BOLD}phpMyAdmin URL:${NC}"
-    echo ""
-    echo "${_url}"
-    echo ""
     echo -e "  ${BOLD}SSH tunnel:${NC} ssh -L 8090:127.0.0.1:8090 root@${_ip}"
     echo ""
     echo "$_url" > "${CONFIG_DIR}/pma_url"
     echo -e "  ${DIM}Saved: cat ${CONFIG_DIR}/pma_url${NC}"
     echo ""
-    press_enter
+    echo "Select/copy this URL, then press Enter to return:"
+    printf '%s\n' "$_url"
+    read -r -p "  Press Enter to continue..."
 }
 
 menu_system() {
