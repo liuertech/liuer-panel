@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.9"
+readonly VERSION="2.7.10"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -2973,11 +2973,14 @@ _select_domain() {
     local -a _domains=()
     for conf in "${NGINX_CONF_DIR}"/*.conf "${NGINX_CONF_DIR}"/*.conf.disabled; do
         [[ -f "$conf" ]] || continue
-        local dom; dom=$(basename "$conf" .conf)
-        dom="${dom%.disabled}"
+        local base dom; base=$(basename "$conf")
+        if [[ "$base" == *.conf.disabled ]]; then dom="${base%.conf.disabled}"; else dom="${base%.conf}"; fi
         [[ "$dom" == "default" || "$dom" == "phpmyadmin" ]] && continue
-        # skip non-site configs (e.g. 00-fastcgi-buffers.conf)
-        grep -q "fastcgi_pass" "$conf" 2>/dev/null || continue
+        # Static sites have metadata but no PHP handler in their vhost.
+        # Continue to skip global/non-site Nginx snippets.
+        if [[ ! -f "${SITES_META_DIR}/${dom}.conf" ]]; then
+            grep -q "fastcgi_pass" "$conf" 2>/dev/null || continue
+        fi
         # avoid duplicates
         [[ " ${_domains[*]} " == *" ${dom} "* ]] && continue
         _domains+=("$dom")
@@ -4177,6 +4180,314 @@ _site_meta_set() {
         echo "${key}=${value}" >> "$meta"
     fi
     chmod 600 "$meta"
+}
+
+# Change only the site's Nginx routing/type metadata. Website files, database
+# contents/credentials, and the Linux site user are deliberately left alone.
+_change_site_type_cleanup_pool() {
+    local pool_conf="$1" php_ver="$2" created="$3"
+    [[ "$created" == "1" && -n "$pool_conf" ]] || return 0
+    rm -f "$pool_conf"
+    systemctl reload "$(get_php_service "$php_ver")" >/dev/null 2>&1 || true
+}
+
+change_site_type() {
+    print_section "CHANGE SITE TYPE"
+    _select_domain "Select site to change" || { press_enter; return 1; }
+
+    local domain="$SELECTED_DOMAIN"
+    local meta="${SITES_META_DIR}/${domain}.conf"
+    local conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ -f "$meta" && -f "$conf" ]] || {
+        log_error "Active site metadata or Nginx config is missing; nothing changed."
+        press_enter; return 1
+    }
+    if [[ -f "${NGINX_CONF_DIR}/${domain}.conf.disabled" ]] || \
+       [[ "$(grep '^STATUS=' "$meta" 2>/dev/null | cut -d= -f2)" == "locked" ]]; then
+        log_error "Unlock this site first. Locked sites are not changed."
+        press_enter; return 1
+    fi
+
+    local old_type site_dir site_user php_ver old_root target_type target_name
+    old_type=$(grep '^TYPE=' "$meta" | head -n1 | cut -d= -f2-)
+    site_dir=$(grep '^SITE_DIR=' "$meta" | head -n1 | cut -d= -f2-)
+    site_user=$(grep '^WEB_USER=' "$meta" | head -n1 | cut -d= -f2-)
+    php_ver=$(grep '^PHP_VERSION=' "$meta" | head -n1 | cut -d= -f2-)
+    old_root=$(grep '^WEB_ROOT=' "$meta" | head -n1 | cut -d= -f2-)
+    if [[ ! "$domain" =~ ^[A-Za-z0-9.-]+$ || -z "$site_dir" || -z "$site_user" || ! -d "$site_dir" ]]; then
+        log_error "Site metadata is incomplete or invalid; nothing changed."
+        press_enter; return 1
+    fi
+    case "$old_type" in php|wordpress|laravel|static) ;; *)
+        log_error "Unsupported current type '${old_type:-unknown}'."
+        press_enter; return 1 ;;
+    esac
+
+    echo -e "  Current type: ${BOLD}${old_type}${NC}"
+    echo "  Choose the type that should match the existing site files:"
+    echo "  1) PHP (plain)"
+    echo "  2) Laravel"
+    echo "  3) WordPress"
+    echo "  4) Static (HTML)"
+    echo "  0) Cancel"
+    echo -ne "  Select: "; read -r _type_choice
+    case "$_type_choice" in
+        1) target_type="php"; target_name="PHP" ;;
+        2) target_type="laravel"; target_name="Laravel" ;;
+        3) target_type="wordpress"; target_name="WordPress" ;;
+        4) target_type="static"; target_name="Static" ;;
+        0|"") log_info "Cancelled; no changes made."; press_enter; return 0 ;;
+        *) log_warn "Invalid selection."; press_enter; return 1 ;;
+    esac
+    if [[ "$target_type" == "$old_type" ]]; then
+        log_info "Site is already set to ${target_name}; no changes made."
+        press_enter; return 0
+    fi
+
+    local new_root index_file socket="" pool_conf="" pool_created=0
+    if [[ "$target_type" == "laravel" ]]; then
+        new_root="${site_dir}/public"
+        if [[ ! -f "${site_dir}/artisan" || ! -f "${new_root}/index.php" ]]; then
+            log_error "Laravel requires existing ${site_dir}/artisan and ${new_root}/index.php. No data was changed."
+            press_enter; return 1
+        fi
+        index_file="index.php"
+    else
+        new_root="${site_dir}/public_html"
+        if [[ ! -d "$new_root" ]]; then
+            log_error "Expected document root ${new_root} does not exist. No data was changed."
+            press_enter; return 1
+        fi
+        if [[ "$target_type" == "static" ]]; then
+            index_file="index.html index.htm"
+        elif [[ "$target_type" == "wordpress" ]]; then
+            index_file="index.php"
+        else
+            index_file=$(grep '^INDEX_FILE=' "$meta" | head -n1 | cut -d= -f2-)
+            [[ "$index_file" =~ ^[A-Za-z0-9._-]+$ ]] || index_file="index.php"
+        fi
+    fi
+
+    echo ""
+    echo "  Nginx document root: ${old_root}  ->  ${new_root}"
+    echo "  Only Nginx routing and Liuer site metadata will change."
+    echo "  No site files, database data/credentials, or Linux users will be moved, deleted, or rewritten."
+    log_warn "If the application files are not already in the new document root, the site may show an error until you deploy them there."
+    confirm_danger "Change ${domain} from ${old_type} to ${target_type}" || {
+        log_info "Cancelled; no changes made."; press_enter; return 0;
+    }
+
+    # Validate the vhost before creating any missing runtime config.
+    local servers roots indexes locations php_locations
+    servers=$(grep -cE '^[[:space:]]*server[[:space:]]*\{' "$conf" || true)
+    roots=$(grep -cE '^[[:space:]]*root[[:space:]]+[^;]+;' "$conf" || true)
+    indexes=$(grep -cE '^[[:space:]]*index[[:space:]]+[^;]+;' "$conf" || true)
+    locations=$(grep -cE '^[[:space:]]*location[[:space:]]+/[[:space:]]*\{' "$conf" || true)
+    php_locations=$(grep -cE '^[[:space:]]*location[[:space:]]+~[[:space:]]+.*php' "$conf" || true)
+    if [[ "$servers" -ne 1 || "$roots" -ne 1 || "$indexes" -ne 1 || "$locations" -ne 1 ]] || \
+       { [[ "$old_type" == "static" && "$php_locations" -ne 0 ]]; } || \
+       { [[ "$old_type" != "static" && "$php_locations" -ne 1 ]]; }; then
+        log_error "This Nginx config has a custom/unsupported layout. It was left unchanged; simplify or back it up before changing type."
+        press_enter; return 1
+    fi
+
+    if [[ "$target_type" != "static" ]]; then
+        if [[ -z "$php_ver" ]]; then
+            SELECTED_PHP_VERSION=""
+            select_php_version || { log_info "Cancelled; no changes made."; press_enter; return 1; }
+            php_ver="$SELECTED_PHP_VERSION"
+        fi
+        if [[ ! "$php_ver" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]; then
+            log_error "Invalid PHP version in site metadata; no changes made."
+            press_enter; return 1
+        fi
+        pool_conf=$(get_php_pool_conf "$php_ver" "$domain")
+        socket=$(get_php_pool_socket "$php_ver" "$domain")
+        if [[ ! -f "$pool_conf" ]]; then
+            if ! id "$site_user" >/dev/null 2>&1; then
+                log_error "Site Linux user '${site_user}' does not exist; cannot create its PHP-FPM pool."
+                press_enter; return 1
+            fi
+            create_php_pool "$php_ver" "$domain" "$site_user" 0 "$site_dir"
+            pool_created=1
+            if [[ ! -f "$pool_conf" ]]; then
+                _change_site_type_cleanup_pool "$pool_conf" "$php_ver" "$pool_created"
+                log_error "Could not create the PHP-FPM pool. Site files and database were not changed."
+                press_enter; return 1
+            fi
+            local php_service; php_service=$(get_php_service "$php_ver")
+            if ! systemctl is-active --quiet "$php_service" 2>/dev/null; then
+                _change_site_type_cleanup_pool "$pool_conf" "$php_ver" "$pool_created"
+                log_error "PHP-FPM service ${php_service} is not active; no site config was changed."
+                press_enter; return 1
+            fi
+        fi
+    fi
+
+    local backup_dir stamp tmp_conf tmp_meta script_mode
+    stamp=$(date '+%Y%m%d-%H%M%S')
+    install -d -m 700 "${CONFIG_DIR}/backups" || { _change_site_type_cleanup_pool "$pool_conf" "$php_ver" "$pool_created"; return 1; }
+    backup_dir=$(mktemp -d "${CONFIG_DIR}/backups/site-type-${domain}-${stamp}.XXXXXX") || {
+        _change_site_type_cleanup_pool "$pool_conf" "$php_ver" "$pool_created"; return 1;
+    }
+    chmod 700 "$backup_dir"
+    cp -a "$conf" "${backup_dir}/nginx.conf" && cp -a "$meta" "${backup_dir}/site.conf" || {
+        log_error "Could not back up the site config; no conversion was applied."
+        _change_site_type_cleanup_pool "$pool_conf" "$php_ver" "$pool_created"
+        press_enter; return 1
+    }
+
+    [[ "$target_type" == "laravel" ]] && script_mode="realpath" || script_mode="documentroot"
+    tmp_conf=$(mktemp "${NGINX_CONF_DIR}/.${domain}.type.XXXXXX") || {
+        _change_site_type_cleanup_pool "$pool_conf" "$php_ver" "$pool_created"; press_enter; return 1;
+    }
+    if ! awk -v type="$target_type" -v root="$new_root" -v index_file="$index_file" \
+        -v socket="$socket" -v script_mode="$script_mode" '
+        function brace_delta(s, t, opens, closes) {
+            t=s; opens=gsub(/\{/, "", t); t=s; closes=gsub(/\}/, "", t)
+            return opens-closes
+        }
+        function wp_rules() {
+            print "    # WordPress security rules"
+            print "    location ~* /(?:uploads|files)/.*\\.php$  { deny all; }"
+            print "    location ~* /(?:xmlrpc|wp-trackback)\\.php { deny all; }"
+        }
+        BEGIN { depth=0; in_php=0; skip_php=0; added_wp=0; inserted_php=(type == "static") }
+        {
+            line=$0
+            if (skip_php) {
+                depth += brace_delta(line)
+                if (depth <= 0) skip_php=0
+                next
+            }
+            if (line ~ /^[[:space:]]*location[[:space:]]+~[[:space:]]+.*php/) {
+                if (type == "static") {
+                    skip_php=1; depth=brace_delta(line)
+                    if (depth <= 0) skip_php=0
+                    next
+                }
+                inserted_php=1
+                if (type == "wordpress" && !added_wp) { wp_rules(); added_wp=1 }
+                in_php=1
+            }
+            if (line ~ /^[[:space:]]*location[[:space:]]+~\*[[:space:]]+\// && line ~ /(uploads|xmlrpc|wp-trackback)/) next
+            if (line ~ /^[[:space:]]*root[[:space:]]+[^;]+;/) {
+                match(line, /^[[:space:]]*/); indent=substr(line,1,RLENGTH)
+                print indent "root " root ";"; depth += brace_delta(line); next
+            }
+            if (line ~ /^[[:space:]]*index[[:space:]]+[^;]+;/) {
+                match(line, /^[[:space:]]*/); indent=substr(line,1,RLENGTH)
+                print indent "index " index_file ";"; depth += brace_delta(line); next
+            }
+            if (line ~ /^[[:space:]]*location[[:space:]]+\/[[:space:]]*\{/) {
+                match(line, /^[[:space:]]*/); indent=substr(line,1,RLENGTH)
+                if (type == "laravel") route="try_files $uri $uri/ /index.php?$query_string;"
+                else if (type == "wordpress") route="try_files $uri $uri/ /index.php?$args;"
+                else route="try_files $uri $uri/ =404;"
+                print indent "location / { " route " }"; depth += brace_delta(line); next
+            }
+            if (in_php && line ~ /^[[:space:]]*fastcgi_pass[[:space:]]+/) {
+                match(line, /^[[:space:]]*/); indent=substr(line,1,RLENGTH)
+                print indent "fastcgi_pass unix:" socket ";"; depth += brace_delta(line); next
+            }
+            if (in_php && line ~ /^[[:space:]]*fastcgi_index[[:space:]]+/) {
+                match(line, /^[[:space:]]*/); indent=substr(line,1,RLENGTH)
+                print indent "fastcgi_index index.php;"; depth += brace_delta(line); next
+            }
+            if (in_php && line ~ /^[[:space:]]*fastcgi_param[[:space:]]+SCRIPT_FILENAME[[:space:]]+/) {
+                match(line, /^[[:space:]]*/); indent=substr(line,1,RLENGTH)
+                if (script_mode == "realpath") print indent "fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;"
+                else print indent "fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;"
+                depth += brace_delta(line); next
+            }
+            if (type == "wordpress" && line ~ /^[[:space:]]*location[[:space:]]+~\*[[:space:]]+\// && line ~ /(uploads|xmlrpc|wp-trackback)/) {
+                if (!added_wp) { wp_rules(); added_wp=1 }
+                next
+            }
+            if (line ~ /^[[:space:]]*\}[[:space:]]*$/ && depth == 1) {
+                if (type == "wordpress" && !added_wp) { wp_rules(); added_wp=1 }
+                if (type != "static" && !in_php && !inserted_php) {
+                    print "    location ~ \\.php$ {"
+                    print "        fastcgi_pass unix:" socket ";"
+                    print "        fastcgi_index index.php;"
+                    if (script_mode == "realpath") print "        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;"
+                    else print "        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;"
+                    print "        include fastcgi_params;"
+                    print "    }"
+                    inserted_php=1
+                }
+            }
+            print line
+            depth += brace_delta(line)
+            if (in_php && depth <= 1) in_php=0
+        }
+        END {
+            if (type != "static" && !inserted_php && !in_php) {
+                # Existing PHP handler was retained and updated.
+                inserted_php=1
+            }
+            if (!inserted_php) exit 3
+        }
+    ' "$conf" > "$tmp_conf"; then
+        rm -f "$tmp_conf"
+        _change_site_type_cleanup_pool "$pool_conf" "$php_ver" "$pool_created"
+        log_error "Could not safely transform this Nginx config; original files remain intact."
+        press_enter; return 1
+    fi
+    chown --reference="$conf" "$tmp_conf" 2>/dev/null || true
+    chmod --reference="$conf" "$tmp_conf" 2>/dev/null || true
+    mv -f "$tmp_conf" "$conf" || {
+        _change_site_type_cleanup_pool "$pool_conf" "$php_ver" "$pool_created"
+        log_error "Could not install the new Nginx config; original config is preserved."
+        press_enter; return 1
+    }
+
+    if ! nginx -t; then
+        cp -a "${backup_dir}/nginx.conf" "$conf"
+        _change_site_type_cleanup_pool "$pool_conf" "$php_ver" "$pool_created"
+        log_error "Nginx rejected the new config; original Nginx config restored."
+        press_enter; return 1
+    fi
+
+    tmp_meta=$(mktemp "${SITES_META_DIR}/.${domain}.type.XXXXXX") || {
+        cp -a "${backup_dir}/nginx.conf" "$conf"
+        _change_site_type_cleanup_pool "$pool_conf" "$php_ver" "$pool_created"
+        return 1
+    }
+    awk -v type="$target_type" -v root="$new_root" -v php="$php_ver" '
+        BEGIN { got_type=0; got_root=0; got_php=0 }
+        /^TYPE=/ { if (!got_type++) print "TYPE=" type; next }
+        /^WEB_ROOT=/ { if (!got_root++) print "WEB_ROOT=" root; next }
+        /^PHP_VERSION=/ { if (!got_php++) print "PHP_VERSION=" php; next }
+        { print }
+        END {
+            if (!got_type) print "TYPE=" type
+            if (!got_root) print "WEB_ROOT=" root
+            if (!got_php) print "PHP_VERSION=" php
+        }
+    ' "$meta" > "$tmp_meta" && chmod 600 "$tmp_meta" && mv -f "$tmp_meta" "$meta" || {
+        rm -f "$tmp_meta"
+        cp -a "${backup_dir}/nginx.conf" "$conf"
+        cp -a "${backup_dir}/site.conf" "$meta"
+        _change_site_type_cleanup_pool "$pool_conf" "$php_ver" "$pool_created"
+        nginx -t >/dev/null 2>&1 && nginx -s reload >/dev/null 2>&1 || true
+        log_error "Metadata update failed; original config and metadata restored."
+        press_enter; return 1
+    }
+
+    if ! nginx -s reload; then
+        cp -a "${backup_dir}/nginx.conf" "$conf"
+        cp -a "${backup_dir}/site.conf" "$meta"
+        _change_site_type_cleanup_pool "$pool_conf" "$php_ver" "$pool_created"
+        nginx -t >/dev/null 2>&1 && nginx -s reload >/dev/null 2>&1 || true
+        log_error "Nginx reload failed; original config and metadata restored."
+        press_enter; return 1
+    fi
+    [[ "$target_type" != "static" ]] && systemctl reload "$(get_php_service "$php_ver")" >/dev/null 2>&1 || true
+    log_success "${domain} is now configured as ${target_name}."
+    log_info "Site files, database data/credentials, and Linux user were not modified."
+    log_info "Backup of the previous Nginx and site metadata: ${backup_dir}"
+    press_enter
 }
 
 _show_cache_connection_guide() {
@@ -8417,6 +8728,7 @@ menu_website() {
         echo "   7  Users, SFTP & cron"
         echo "   8  Operations & logs"
         echo "   9  WordPress & Laravel"
+        echo "  10  Change site type"
         _sub_footer; read -r _ch
         case "$_ch" in
             1)  create_website ;;
@@ -8428,6 +8740,7 @@ menu_website() {
             7)  menu_website_access ;;
             8)  menu_website_operations ;;
             9)  menu_website_framework ;;
+            10) change_site_type ;;
             0)  return ;;
             *)  log_warn "Invalid selection." ;;
         esac
