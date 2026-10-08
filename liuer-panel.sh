@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.10"
+readonly VERSION="2.7.11"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -1294,7 +1294,7 @@ server {
     listen [::]:80;
     server_name ${domain} www.${domain};
     root ${root};
-    disable_symlinks if_not_owner from=$document_root;
+    disable_symlinks if_not_owner from=\$document_root;
     index ${index_file} index.html;
 
     access_log /var/log/nginx/${domain}_access.log;
@@ -1329,7 +1329,7 @@ server {
     listen [::]:80;
     server_name ${domain} www.${domain};
     root ${root};
-    disable_symlinks if_not_owner from=$document_root;
+    disable_symlinks if_not_owner from=\$document_root;
     index index.php;
 
     access_log /var/log/nginx/${domain}_access.log;
@@ -1365,7 +1365,7 @@ server {
     listen [::]:80;
     server_name ${domain} www.${domain};
     root ${root};
-    disable_symlinks if_not_owner from=$document_root;
+    disable_symlinks if_not_owner from=\$document_root;
     index index.php;
 
     access_log /var/log/nginx/${domain}_access.log;
@@ -1403,7 +1403,7 @@ server {
     listen [::]:80;
     server_name ${domain} www.${domain};
     root ${root};
-    disable_symlinks if_not_owner from=$document_root;
+    disable_symlinks if_not_owner from=\$document_root;
     index index.html index.htm;
 
     access_log /var/log/nginx/${domain}_access.log;
@@ -1421,6 +1421,90 @@ server {
 $(_nginx_common_headers)
 }
 EOF
+}
+
+# Rebuild only an empty Nginx vhost from the site's root-owned metadata. This
+# deliberately refuses non-empty configs so it cannot overwrite user changes.
+repair_empty_site_vhost() {
+    local domain="$1"
+    validate_domain "$domain" || { log_error "Invalid domain: ${domain}"; return 1; }
+    local meta="${SITES_META_DIR}/${domain}.conf"
+    local conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ -f "$meta" && -f "$conf" ]] || {
+        log_error "Site metadata or Nginx vhost not found for ${domain}."; return 1;
+    }
+    [[ ! -s "$conf" ]] || {
+        log_error "Refusing to overwrite non-empty Nginx config: ${conf}"; return 1;
+    }
+
+    local type php_ver web_root site_dir socket="" pool_conf index_file="index.php"
+    type=$(grep '^TYPE=' "$meta" | head -n1 | cut -d= -f2-)
+    php_ver=$(grep '^PHP_VERSION=' "$meta" | head -n1 | cut -d= -f2-)
+    web_root=$(grep '^WEB_ROOT=' "$meta" | head -n1 | cut -d= -f2-)
+    site_dir=$(grep '^SITE_DIR=' "$meta" | head -n1 | cut -d= -f2-)
+    [[ -n "$web_root" && -d "$web_root" && -n "$site_dir" ]] || {
+        log_error "Site root is missing from metadata or on disk; nothing changed."; return 1;
+    }
+
+    case "$type" in
+        php|wordpress|static)
+            [[ "$web_root" == "${site_dir}/public_html" ]] || {
+                log_error "Metadata document root does not match the expected public_html path; refusing repair."; return 1;
+            } ;;
+        laravel)
+            [[ "$web_root" == "${site_dir}/public" ]] || {
+                log_error "Metadata document root does not match the expected Laravel public path; refusing repair."; return 1;
+            } ;;
+        *) log_error "Unsupported site type '${type:-unknown}'; nothing changed."; return 1 ;;
+    esac
+
+    if [[ "$type" != "static" ]]; then
+        [[ "$php_ver" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]] || {
+            log_error "PHP version is missing or invalid in site metadata."; return 1;
+        }
+        pool_conf=$(get_php_pool_conf "$php_ver" "$domain")
+        [[ -f "$pool_conf" ]] || { log_error "PHP-FPM pool is missing: ${pool_conf}"; return 1; }
+        socket=$(get_php_pool_socket "$php_ver" "$domain")
+        [[ -n "$socket" ]] || { log_error "Could not determine the PHP-FPM socket."; return 1; }
+    fi
+
+    local backup_dir tmp
+    install -d -m 700 "${CONFIG_DIR}/backups" || return 1
+    backup_dir=$(mktemp -d "${CONFIG_DIR}/backups/empty-vhost-${domain}-$(date '+%Y%m%d-%H%M%S').XXXXXX") || return 1
+    cp -a "$conf" "${backup_dir}/empty-vhost.conf" || { log_error "Could not back up the empty vhost."; return 1; }
+    tmp=$(mktemp "${NGINX_CONF_DIR}/.${domain}.repair.XXXXXX") || return 1
+
+    case "$type" in
+        php)
+            index_file=$(grep '^INDEX_FILE=' "$meta" | head -n1 | cut -d= -f2-)
+            [[ "$index_file" =~ ^[A-Za-z0-9._-]+$ ]] || index_file="index.php"
+            nginx_tpl_php "$domain" "$web_root" "$socket" 0 "$index_file" > "$tmp" ;;
+        laravel)   nginx_tpl_laravel "$domain" "$web_root" "$socket" > "$tmp" ;;
+        wordpress) nginx_tpl_wordpress "$domain" "$web_root" "$socket" > "$tmp" ;;
+        static)    nginx_tpl_static "$domain" "$web_root" > "$tmp" ;;
+    esac
+    if [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp"
+        log_error "Template generation failed; the original empty vhost remains untouched."
+        return 1
+    fi
+
+    chown root:root "$tmp" 2>/dev/null || true
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$conf" || { log_error "Could not install the repaired vhost."; return 1; }
+    if ! nginx -t; then
+        cp -a "${backup_dir}/empty-vhost.conf" "$conf"
+        log_error "Nginx rejected the repaired vhost; the original file was restored."
+        return 1
+    fi
+    if ! nginx -s reload; then
+        cp -a "${backup_dir}/empty-vhost.conf" "$conf"
+        nginx -t >/dev/null 2>&1 && nginx -s reload >/dev/null 2>&1 || true
+        log_error "Nginx reload failed; the original file was restored."
+        return 1
+    fi
+    log_success "Rebuilt the empty ${type} vhost for ${domain}."
+    log_info "Website files and database were not changed. Empty config backup: ${backup_dir}"
 }
 
 _ensure_nginx_symlink_protection() {
@@ -10269,6 +10353,12 @@ main() {
             press_enter
             ;;
 
+        repair-site-config)
+            check_root
+            detect_os
+            repair_empty_site_vhost "${2:-}"
+            ;;
+
         # ── Auto repair (called internally after update, no interaction) ──────
         _repair_auto)
             check_root
@@ -10319,6 +10409,7 @@ main() {
             echo "  install        First-time installation"
             echo "  update         Update tool to latest version"
             echo "  repair         Re-apply system fixes (SELinux, firewall, nginx)"
+            echo "  repair-site-config DOMAIN  Rebuild an empty Nginx vhost from site metadata"
             echo "  check-update   Check if a new version is available"
             echo "  version        Show current version"
             echo "  web-panel      Install or manage the optional browser panel"
