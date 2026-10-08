@@ -1,6 +1,6 @@
 # Liuer Panel
 
-[![Version](https://img.shields.io/badge/version-2.7.6-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
+[![Version](https://img.shields.io/badge/version-2.7.7-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
 [![Shell](https://img.shields.io/badge/shell-Bash-4EAA25.svg)](https://www.gnu.org/software/bash/)
 
 Liuer Panel is a lightweight control panel for provisioning and managing Linux web servers. The `liuer` command remains the management engine, while the optional PHP Web Panel provides browser access through Nginx and MariaDB.
@@ -181,6 +181,7 @@ The empty WordPress option creates the site and MySQL/MariaDB credentials but do
 - Fall back to a certificate for the primary domain if `www` DNS is unavailable
 - Install a custom certificate and private key
 - Reissue or renew a Let's Encrypt certificate from the site menu
+- Remove Liuer-managed SSL and its known certificate files before reinstalling; unmanaged Nginx SSL blocks are left untouched
 - Automatically install and enable `liuer-certbot-renew.timer`
 
 The first check runs approximately 15 minutes after the timer is installed. After a successful check, Liuer runs Certbot every 10 days. If renewal fails, systemd retries every 12 hours until it succeeds and then returns to the normal 10-day cycle. Certbot only renews certificates that have entered their renewal window, and Nginx is reloaded through a deploy hook only after a certificate is renewed successfully. Custom/paid certificates are not automatically renewed.

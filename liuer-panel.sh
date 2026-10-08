@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.6"
+readonly VERSION="2.7.7"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -2545,6 +2545,53 @@ _disable_managed_ssl_config() {
     return 1
 }
 
+_remove_managed_ssl() {
+    local domain="$1" nginx_conf="${NGINX_CONF_DIR}/${1}.conf"
+    validate_domain "$domain" || { log_error "Invalid domain: ${domain}"; return 1; }
+    [[ -f "$nginx_conf" ]] || { log_error "Nginx config not found for ${domain}."; return 1; }
+    grep -q '# liuer-managed-ssl-start' "$nginx_conf" \
+        || { log_error "SSL for ${domain} is not managed by Liuer; automatic removal was refused."; return 1; }
+
+    local cert_file cert_name="" custom_cert_dir=""
+    cert_file=$(awk '
+        /# liuer-managed-ssl-start/ { inside=1; next }
+        /# liuer-managed-ssl-end/ { inside=0 }
+        inside && /^[[:space:]]*ssl_certificate[[:space:]]/ {
+            sub(/^[[:space:]]*ssl_certificate[[:space:]]+/, "")
+            sub(/[[:space:]]*;.*/, "")
+            print
+            exit
+        }
+    ' "$nginx_conf")
+    case "$cert_file" in
+        "/etc/letsencrypt/live/"*/fullchain.pem)
+            cert_name="${cert_file#/etc/letsencrypt/live/}"
+            cert_name="${cert_name%/fullchain.pem}"
+            [[ "$cert_name" != */* && -n "$cert_name" ]] || cert_name=""
+            ;;
+        "/etc/nginx/ssl/${domain}/fullchain.pem")
+            custom_cert_dir="/etc/nginx/ssl/${domain}"
+            ;;
+    esac
+
+    _disable_managed_ssl_config "$domain" || return 1
+
+    if [[ -n "$cert_name" ]]; then
+        if command -v certbot &>/dev/null && certbot delete --cert-name "$cert_name" --non-interactive; then
+            log_success "Removed Let's Encrypt certificate lineage '${cert_name}'."
+        else
+            log_warn "HTTPS was disabled, but Certbot could not remove '${cert_name}'. The certificate files were left intact."
+        fi
+    elif [[ -n "$custom_cert_dir" && -d "$custom_cert_dir" ]]; then
+        rm -f -- "${custom_cert_dir}/fullchain.pem" "${custom_cert_dir}/privkey.pem"
+        rmdir -- "$custom_cert_dir" 2>/dev/null || true
+        log_success "Removed Liuer-managed custom certificate files for ${domain}."
+    else
+        log_warn "HTTPS was disabled. The certificate source is not a recognized Liuer path, so its files were preserved."
+    fi
+    log_success "SSL configuration removed for ${domain}. You can install a certificate again from this menu."
+}
+
 _install_custom_ssl_noninteractive() {
     local domain="$1" cert_source="$2" key_source="$3"
     validate_domain "$domain" || { log_error "Invalid domain: $domain"; return 1; }
@@ -3816,6 +3863,7 @@ manage_site_ssl() {
         echo ""
         echo "  1) Renew / re-issue Let's Encrypt"
         echo "  2) Replace with custom certificate"
+        echo "  3) Remove SSL to install again"
         echo "  0) Back"
     else
         echo -e "  SSL Status : ${YELLOW}Not installed${NC}"
@@ -3835,6 +3883,18 @@ manage_site_ssl() {
                log_warn "SSL setup failed. Check DNS and port 80 are accessible."
            fi ;;
         2) setup_ssl_paid "$domain" && log_success "Custom SSL installed for ${domain}." ;;
+        3)
+            echo -e "${YELLOW}This disables HTTPS and removes Liuer-managed certificate files when safe.${NC}"
+            echo -e "${BOLD}Type ${domain} to confirm, or 0 to cancel:${NC} \c"
+            local _confirm_domain
+            read -r _confirm_domain
+            if [[ "$_confirm_domain" == "$domain" ]]; then
+                _remove_managed_ssl "$domain" \
+                    && lcp_notify "site_updated" "\"domain\":\"${domain}\",\"ssl_enabled\":false"
+            else
+                log_info "SSL removal cancelled."
+            fi
+            ;;
         0) return ;;
         *) log_warn "Invalid selection." ;;
     esac
