@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.8"
+readonly VERSION="2.7.9"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -1964,7 +1964,8 @@ create_website() {
     local web_user="${site_user:-www-data}"
 
     # --- Site-type specific setup ---
-    local type_name="" wp_ver_used="" wp_source_mode="" wp_core_ready=0 laravel_ver_used=""
+    local type_name="" wp_ver_used="" wp_source_mode="" wp_core_ready=0
+    local laravel_ver_used="" laravel_source_mode="" laravel_constraint="" _lver=""
     local db_name_created="" db_user_created="" db_pass_created=""
 
     case "$site_type" in
@@ -1987,34 +1988,81 @@ PHP
 
         2) # Laravel
             type_name="laravel"
-            echo -e "\n${BOLD}Laravel version [Enter for latest]:${NC} \c"
-            read -r _lver
+            echo -e "\n${BOLD}Laravel source:${NC}"
+            echo "  1) Install latest Laravel"
+            echo "  2) Choose Laravel version/major"
+            echo "  3) Empty directory (upload or deploy source manually)"
+            echo "  0) Cancel"
+            local _laravel_choice
+            while true; do
+                echo -e "${YELLOW}Select [1-3]:${NC} \c"
+                read -r _laravel_choice
+                if [[ "$_laravel_choice" == "0" ]]; then
+                    userdel "$site_user" 2>/dev/null || true
+                    sed -i "/^${site_user}|/d" "$WEB_USERS_FILE" 2>/dev/null || true
+                    rmdir "/home/web/${site_user}" 2>/dev/null || true
+                    log_info "Cancelled."
+                    return 0
+                fi
+                [[ "$_laravel_choice" =~ ^[1-3]$ ]] && break
+                log_warn "Invalid selection."
+            done
 
-            # Ensure composer is installed
-            if ! command -v composer &>/dev/null; then
-                log_info "Installing Composer..."
-                curl -fsSL https://getcomposer.org/installer \
-                    | php -- --install-dir=/usr/local/bin --filename=composer --quiet 2>/dev/null \
-                    || { log_error "Failed to install Composer."; return 1; }
-            fi
+            case "$_laravel_choice" in
+                1)
+                    laravel_source_mode="latest"
+                    laravel_ver_used="latest"
+                    ;;
+                2)
+                    while true; do
+                        echo -e "${BOLD}Laravel major/minor version (e.g. 12, 11, 10.0):${NC} \c"
+                        read -r _lver
+                        if [[ "$_lver" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+                            break
+                        fi
+                        log_warn "Enter a version such as 12, 11, 10.0, or 10.48."
+                    done
+                    laravel_source_mode="version"
+                    laravel_ver_used="$_lver"
+                    if [[ "$_lver" =~ ^[0-9]+$ ]]; then
+                        laravel_constraint="^${_lver}.0"
+                    else
+                        laravel_constraint="^${_lver}"
+                    fi
+                    ;;
+                3)
+                    laravel_source_mode="empty"
+                    laravel_ver_used="not downloaded"
+                    ;;
+            esac
 
-            # Remove leftover dir from any previous failed attempt (nginx conf doesn't exist = safe to clean)
-            if [[ -d "$site_dir" ]]; then
-                log_info "Removing leftover directory from previous attempt..."
-                rm -rf "$site_dir"
-            fi
+            if [[ "$laravel_source_mode" != "empty" ]]; then
+                # Ensure Composer is installed only when a source download is requested.
+                if ! command -v composer &>/dev/null; then
+                    log_info "Installing Composer..."
+                    curl -fsSL https://getcomposer.org/installer \
+                        | php -- --install-dir=/usr/local/bin --filename=composer --quiet 2>/dev/null \
+                        || { log_error "Failed to install Composer."; return 1; }
+                fi
 
-            log_info "Creating Laravel project (this may take a few minutes)..."
-            if [[ -z "$_lver" ]]; then
-                COMPOSER_ALLOW_SUPERUSER=1 composer create-project laravel/laravel "$site_dir" \
-                    --prefer-dist --no-interaction \
-                    && laravel_ver_used="latest" \
-                    || { log_error "Laravel install failed."; return 1; }
+                if [[ -e "$site_dir" ]]; then
+                    log_error "The target directory already exists: ${site_dir}. Move or review it before retrying; Liuer will not delete it automatically."
+                    return 1
+                fi
+
+                log_info "Creating Laravel project (this may take a few minutes)..."
+                if [[ "$laravel_source_mode" == "latest" ]]; then
+                    COMPOSER_ALLOW_SUPERUSER=1 composer create-project laravel/laravel "$site_dir" \
+                        --prefer-dist --no-interaction \
+                        || { log_error "Laravel install failed."; return 1; }
+                else
+                    COMPOSER_ALLOW_SUPERUSER=1 composer create-project laravel/laravel "$site_dir" "$laravel_constraint" \
+                        --prefer-dist --no-interaction \
+                        || { log_error "Laravel ${_lver} install failed."; return 1; }
+                fi
             else
-                COMPOSER_ALLOW_SUPERUSER=1 composer create-project "laravel/laravel:^${_lver}" "$site_dir" \
-                    --prefer-dist --no-interaction \
-                    && laravel_ver_used="$_lver" \
-                    || { log_error "Laravel ${_lver} install failed."; return 1; }
+                mkdir -p "$site_dir"
+                log_info "Creating an empty Laravel web root for manual upload or deployment."
             fi
 
             # Create ACME challenge dir now that composer has built the structure
@@ -2077,6 +2125,8 @@ PHP
                             sed -i "s/^#\? *DB_USERNAME=.*/DB_USERNAME=${_ldb_user}/" "$env_file"
                             sed -i "s/^#\? *DB_PASSWORD=.*/DB_PASSWORD=${_ldb_pass}/" "$env_file"
                             log_success "Laravel .env configured with MySQL."
+                        else
+                            log_info "Database created; configure Laravel .env after uploading/deploying the source."
                         fi
                     else
                         log_warn "Database creation failed. Configure .env manually."
@@ -2105,6 +2155,8 @@ PHP
                             sed -i "s/^#\? *DB_USERNAME=.*/DB_USERNAME=${_ldb_user}/" "$env_file"
                             sed -i "s/^#\? *DB_PASSWORD=.*/DB_PASSWORD=${_ldb_pass}/" "$env_file"
                             log_success "Laravel .env configured with PostgreSQL."
+                        else
+                            log_info "Database created; configure Laravel .env after uploading/deploying the source."
                         fi
                     else
                         log_warn "PostgreSQL database creation failed. Configure .env manually."
@@ -2112,12 +2164,15 @@ PHP
                     ;;
 
                 "SQLite")
+                    mkdir -p "${site_dir}/database"
                     touch "${site_dir}/database/database.sqlite" 2>/dev/null || true
                     if [[ -f "$env_file" ]]; then
                         sed -i "s/^DB_CONNECTION=.*/DB_CONNECTION=sqlite/" "$env_file"
+                        log_success "Laravel .env configured with SQLite."
+                    else
+                        log_info "SQLite database file prepared; configure Laravel .env after uploading/deploying the source."
                     fi
-                    log_success "Laravel .env configured with SQLite."
-                    log_warn "Ensure php-sqlite3 extension is installed."
+                    [[ -f "$env_file" ]] && log_warn "Ensure php-sqlite3 extension is installed."
                     ;;
             esac
 
@@ -2130,9 +2185,13 @@ PHP
             _set_site_perms "$site_dir" "$web_user"
 
             # Generate app key
-            cd "$site_dir" && php artisan key:generate --quiet 2>/dev/null || true
-            cd - >/dev/null
-            log_success "Laravel installed."
+            if [[ "$laravel_source_mode" != "empty" ]]; then
+                cd "$site_dir" && php artisan key:generate --quiet 2>/dev/null || true
+                cd - >/dev/null
+                log_success "Laravel ${laravel_ver_used} installed."
+            else
+                log_info "Laravel source was not downloaded; upload/deploy the application before running Artisan commands."
+            fi
             ;;
 
         3) # WordPress
@@ -2295,12 +2354,15 @@ WEB_USER=${site_user}
 DISABLE_FUNCTIONS=1
 CREATED=$(date '+%Y-%m-%d %H:%M:%S')
 ${wp_source_mode:+WP_SOURCE_MODE=${wp_source_mode}}
+${laravel_source_mode:+LARAVEL_SOURCE_MODE=${laravel_source_mode}}
+${laravel_ver_used:+LARAVEL_VERSION=${laravel_ver_used}}
 EOF
     chmod 600 "${SITES_META_DIR}/${domain}.conf"
 
     # Framework-aware write protection is offered only where Liuer knows the
     # required writable directories. Plain PHP remains fully user-managed.
-    if [[ "$site_type" == "2" || ( "$site_type" == "3" && "$wp_core_ready" == "1" ) ]]; then
+    if [[ ( "$site_type" == "2" && "$laravel_source_mode" != "empty" ) \
+          || ( "$site_type" == "3" && "$wp_core_ready" == "1" ) ]]; then
         echo ""
         if [[ "$site_type" == "3" ]]; then
             log_info "Optional security: protect WordPress core while keeping wp-content manageable."
@@ -2310,6 +2372,8 @@ EOF
         fi
         confirm_action "Enable the balanced framework permission profile for ${domain}?" \
             && _apply_framework_permissions "$domain" || true
+    elif [[ "$site_type" == "2" && "$laravel_source_mode" == "empty" ]]; then
+        log_info "Permissions remain editable so you can upload or deploy the Laravel source."
     elif [[ "$site_type" == "3" && "$wp_core_ready" != "1" ]]; then
         echo ""
         log_info "Permissions remain editable so the WordPress files can be uploaded or restored."
@@ -2343,6 +2407,8 @@ EOF
     printf "  %-12s: %s\n"  "SSL"      "$ssl_status"
     [[ "$site_type" == "3" ]] \
         && printf "  %-12s: %s\n" "WP source" "$wp_ver_used"
+    [[ "$site_type" == "2" ]] \
+        && printf "  %-12s: %s\n" "Laravel src" "$laravel_ver_used"
     if [[ -n "$db_name_created" ]]; then
         printf "  %-12s: %s\n"  "DB name"  "$db_name_created"
         printf "  %-12s: %s\n"  "DB user"  "$db_user_created"
@@ -2997,16 +3063,19 @@ show_website_detail() {
 
     local meta="${SITES_META_DIR}/${domain}.conf"
     if [[ -f "$meta" ]]; then
-        local _type _php _root _created _idx
+        local _type _php _root _created _idx _laravel_ver _laravel_source
         _type=$(    grep -oP '(?<=TYPE=)[^\n]*'         "$meta" 2>/dev/null || echo "N/A")
         _php=$(     grep -oP '(?<=PHP_VERSION=)[^\n]*'  "$meta" 2>/dev/null || echo "N/A")
         _root=$(    grep -oP '(?<=WEB_ROOT=)[^\n]*'     "$meta" 2>/dev/null || echo "N/A")
         _created=$( grep -oP '(?<=CREATED=)[^\n]*'      "$meta" 2>/dev/null || echo "N/A")
         _idx=$(     grep -oP '(?<=INDEX_FILE=)[^\n]*'   "$meta" 2>/dev/null)
+        _laravel_ver=$(grep -oP '(?<=LARAVEL_VERSION=)[^\n]*' "$meta" 2>/dev/null || true)
+        _laravel_source=$(grep -oP '(?<=LARAVEL_SOURCE_MODE=)[^\n]*' "$meta" 2>/dev/null || true)
         echo -e "${BOLD}Type        :${NC} $_type"
         echo -e "${BOLD}PHP version :${NC} $_php"
         [[ -n "$_idx" ]] && echo -e "${BOLD}Index file  :${NC} $_idx"
         echo -e "${BOLD}Web root    :${NC} $_root"
+        [[ -n "$_laravel_source" ]] && echo -e "${BOLD}Laravel src :${NC} ${_laravel_ver:-$_laravel_source}"
         echo -e "${BOLD}Created     :${NC} $_created"
         [[ -n "$_php" && "$_php" != "N/A" ]] \
             && echo -e "${BOLD}PHP socket  :${NC} $(get_php_socket "$_php")"

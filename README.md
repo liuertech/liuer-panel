@@ -1,6 +1,6 @@
 # Liuer Panel
 
-[![Version](https://img.shields.io/badge/version-2.7.8-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
+[![Version](https://img.shields.io/badge/version-2.7.9-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
 [![Shell](https://img.shields.io/badge/shell-Bash-4EAA25.svg)](https://www.gnu.org/software/bash/)
 
 Liuer Panel is a lightweight control panel for provisioning and managing Linux web servers. The `liuer` command remains the management engine, while the optional PHP Web Panel provides browser access through Nginx and MariaDB.
@@ -148,6 +148,7 @@ Removing the Web Panel only removes its UI, Nginx/PHP-FPM configuration, control
 ### Website management
 
 - Create plain PHP, Laravel, WordPress, and static HTML websites
+- Choose latest Laravel, a major/minor version constraint, or an empty web root for manual deployment
 - Create WordPress with the latest core, a selected core version, or an empty web root with a database for manual upload/restore
 - Generate and validate an Nginx virtual host automatically
 - Use a dedicated Linux web user for every site and a dedicated PHP-FPM pool for each dynamic site
