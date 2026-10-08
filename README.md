@@ -1,6 +1,6 @@
 # Liuer Panel
 
-[![Version](https://img.shields.io/badge/version-2.7.7-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
+[![Version](https://img.shields.io/badge/version-2.7.8-blue.svg)](https://github.com/liuertech/liuer-panel/releases)
 [![Shell](https://img.shields.io/badge/shell-Bash-4EAA25.svg)](https://www.gnu.org/software/bash/)
 
 Liuer Panel is a lightweight control panel for provisioning and managing Linux web servers. The `liuer` command remains the management engine, while the optional PHP Web Panel provides browser access through Nginx and MariaDB.
@@ -380,13 +380,7 @@ The script also exposes non-interactive internal commands used by LiuerCP. These
 
 ## phpMyAdmin
 
-phpMyAdmin is optional. When installed, Liuer Panel creates a dedicated system user and PHP-FPM pool. It binds only to `127.0.0.1:8090`; use an SSH tunnel instead of exposing the database login publicly:
-
-```bash
-ssh -L 8090:127.0.0.1:8090 root@SERVER_IP
-```
-
-Then open `http://127.0.0.1:8090/pma_<random-token>/`. Display the saved URL from `liuer` → **System** → **Show phpMyAdmin URL**. phpMyAdmin uses cookie authentication and Liuer does not create or store a MariaDB superuser for it. Upgrading and running `liuer repair` removes the legacy `pma_*` account that older releases created with global privileges.
+phpMyAdmin is optional. When installed, Liuer Panel creates a dedicated system user and PHP-FPM pool, then publishes it on the VPS IP at `http://SERVER_IP/pma_<random-token>/`. The random path is not a substitute for authentication: use a strong database password and restrict port 80 to trusted IPs in your firewall when possible. This URL uses plain HTTP, so credentials are not encrypted in transit; use it only on a trusted network or place it behind HTTPS before entering database credentials. Display the saved URL from `liuer` → **System** → **Show phpMyAdmin URL**. phpMyAdmin uses cookie authentication and Liuer does not create or store a MariaDB superuser for it. Upgrading and running `liuer repair` removes the legacy `pma_*` account that older releases created with global privileges and restores the public-IP listener.
 
 ## Important paths
 

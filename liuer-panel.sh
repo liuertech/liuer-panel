@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.7"
+readonly VERSION="2.7.8"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -5959,10 +5959,10 @@ do_repair() {
     rm -f /etc/nginx/conf.d/default.conf
     rm -f /etc/nginx/sites-enabled/default
 
-    # 4a. Remove the legacy phpMyAdmin global-privilege account and keep the
-    # interface reachable only through an SSH tunnel.
+    # 4a. Remove the legacy phpMyAdmin global-privilege account and restore
+    # access to phpMyAdmin by the VPS public IP at its secret path.
     _remove_legacy_phpmyadmin_superuser || log_warn "Legacy phpMyAdmin database account still needs manual review."
-    _harden_phpmyadmin_access || log_warn "phpMyAdmin loopback-only repair failed."
+    _publish_phpmyadmin_access || log_warn "Could not publish phpMyAdmin on the server IP; the previous Nginx configuration was restored."
 
     # 5. If Memcached is installed, ensure php-memcached extension is present
     if systemctl is-active --quiet memcached 2>/dev/null; then
@@ -6171,25 +6171,50 @@ _remove_legacy_phpmyadmin_superuser() {
     rm -f "$record_file"
 }
 
-_harden_phpmyadmin_access() {
+_phpmyadmin_server_ip() {
+    local ip
+    ip=$(curl -4fsSL --max-time 5 https://api.ipify.org 2>/dev/null || true)
+    if [[ -z "$ip" ]]; then
+        ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    printf '%s' "${ip:-SERVER_IP}"
+}
+
+_publish_phpmyadmin_access() {
     local conf="${NGINX_CONF_DIR}/phpmyadmin.conf" backup
     [[ -f "$conf" ]] || return 0
-    grep -qE '^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:8090' "$conf" && return 0
     backup=$(mktemp /tmp/liuer-pma-nginx.XXXXXX) || return 1
     cp -a "$conf" "$backup" || { rm -f "$backup"; return 1; }
     sed -i -E \
-        -e 's/^[[:space:]]*listen[[:space:]]+80([[:space:]]+default_server)?;/    listen 127.0.0.1:8090;/' \
-        -e '/^[[:space:]]*listen[[:space:]]+\[::\]:80([[:space:]]+default_server)?;/d' \
-        -e 's/^[[:space:]]*server_name[[:space:]]+"";/    server_name localhost;/' \
+        -e 's/^([[:space:]]*)listen[[:space:]]+127\.0\.0\.1:8090;/\1listen 80 default_server;/' \
+        -e 's/^([[:space:]]*)listen[[:space:]]+80([[:space:]]+default_server)?;/\1listen 80 default_server;/' \
+        -e 's/^([[:space:]]*)listen[[:space:]]+\[::\]:80([[:space:]]+default_server)?;/\1listen [::]:80 default_server;/' \
+        -e 's/^([[:space:]]*)server_name[[:space:]]+localhost;/\1server_name "";/' \
+        -e 's/(client_max_body_size[[:space:]]+[0-9]+)MB;/\1M;/' \
         "$conf"
+    if ! grep -qE '^[[:space:]]*listen[[:space:]]+\[::\]:80' "$conf"; then
+        sed -i '/^[[:space:]]*listen 80 default_server;/a\    listen [::]:80 default_server;' "$conf"
+    fi
     if ! nginx -t &>/dev/null; then
         cp -a "$backup" "$conf"
         rm -f "$backup"
         return 1
     fi
+    if ! systemctl reload nginx 2>/dev/null && ! nginx -s reload 2>/dev/null; then
+        cp -a "$backup" "$conf"
+        rm -f "$backup"
+        return 1
+    fi
     rm -f "$backup"
-    systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
-    log_success "phpMyAdmin is now loopback-only on 127.0.0.1:8090."
+    if [[ -f "${CONFIG_DIR}/pma_path" ]]; then
+        local token ip
+        token=$(<"${CONFIG_DIR}/pma_path")
+        ip=$(_phpmyadmin_server_ip)
+        printf '%s\n' "http://${ip}/${token}/" > "${CONFIG_DIR}/pma_url"
+        printf '%s\n' "public" > "${CONFIG_DIR}/pma_access_mode"
+        chmod 600 "${CONFIG_DIR}/pma_url" "${CONFIG_DIR}/pma_access_mode"
+    fi
+    log_success "phpMyAdmin is reachable by server IP on HTTP port 80 at its secret path."
 }
 
 install_phpmyadmin() {
@@ -6291,12 +6316,20 @@ PHP
     rm -f /etc/nginx/conf.d/default.conf
     rm -f /etc/nginx/sites-enabled/default
 
-    # Loopback only: remote administrators must use an encrypted SSH tunnel.
-    cat > "${NGINX_CONF_DIR}/phpmyadmin.conf" <<EOF
-# phpMyAdmin — managed by Liuer Panel; intentionally not public-facing
+    # Public-IP access preserves the original Liuer behavior. The random path
+    # is an extra layer, not a substitute for strong database credentials.
+    local pma_conf="${NGINX_CONF_DIR}/phpmyadmin.conf" pma_conf_backup=""
+    if [[ -f "$pma_conf" ]]; then
+        pma_conf_backup=$(mktemp /tmp/liuer-pma-nginx.XXXXXX) || return 1
+        cp -a "$pma_conf" "$pma_conf_backup" || { rm -f "$pma_conf_backup"; return 1; }
+    fi
+    cat > "$pma_conf" <<EOF
+# phpMyAdmin — managed by Liuer Panel; access by server IP and secret path
 server {
-    listen 127.0.0.1:8090;
-    server_name localhost;
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name "";
+    client_max_body_size 256M;
 
     location /${pma_token}/ {
         alias /var/www/phpmyadmin/;
@@ -6311,11 +6344,32 @@ server {
     }
 }
 EOF
-    nginx -t &>/dev/null && nginx -s reload
+    if ! nginx -t &>/dev/null; then
+        if [[ -n "$pma_conf_backup" ]]; then
+            cp -a "$pma_conf_backup" "$pma_conf"
+            rm -f "$pma_conf_backup"
+        else
+            rm -f "$pma_conf"
+        fi
+        log_error "Nginx rejected the phpMyAdmin configuration; the previous configuration was restored. Check nginx -t."
+        return 1
+    fi
+    if ! systemctl reload nginx 2>/dev/null && ! nginx -s reload; then
+        [[ -n "$pma_conf_backup" ]] && cp -a "$pma_conf_backup" "$pma_conf"
+        rm -f "$pma_conf_backup"
+        return 1
+    fi
+    rm -f "$pma_conf_backup"
 
     log_success "phpMyAdmin installed."
-    echo -e "  Tunnel : ${BOLD}ssh -L 8090:127.0.0.1:8090 root@SERVER_IP${NC}"
-    echo -e "  URL    : ${BOLD}http://127.0.0.1:8090/${pma_token}/${NC}"
+    local pma_ip pma_public_url
+    pma_ip=$(_phpmyadmin_server_ip)
+    pma_public_url="http://${pma_ip}/${pma_token}/"
+    printf '%s\n' "$pma_public_url" > "${CONFIG_DIR}/pma_url"
+    printf '%s\n' "public" > "${CONFIG_DIR}/pma_access_mode"
+    chmod 600 "${CONFIG_DIR}/pma_url" "${CONFIG_DIR}/pma_access_mode"
+    echo -e "  URL    : ${BOLD}${pma_public_url}${NC}"
+    echo -e "${YELLOW}Warning: this public URL uses HTTP; database credentials are not encrypted in transit.${NC}"
     echo -e "${DIM}Path saved to: ${CONFIG_DIR}/pma_path${NC}"
 }
 
@@ -7354,13 +7408,7 @@ do_install() {
 
     # ── Optional: phpMyAdmin ──────────────────────────────────────────────────
     echo -e "\n${BOLD}─── phpMyAdmin ───${NC}"
-    local _pma_path=""
-    [[ -f "${CONFIG_DIR}/pma_path" ]] && _pma_path=$(cat "${CONFIG_DIR}/pma_path")
-    if [[ -n "$_pma_path" ]]; then
-        echo -e "${DIM}phpMyAdmin: http://127.0.0.1:8090/${_pma_path}/ (SSH tunnel required)${NC}\n"
-    else
-        echo -e "${DIM}Web-based MySQL/MariaDB management${NC}\n"
-    fi
+    echo -e "${DIM}Optional web-based MySQL/MariaDB management; the public-IP URL is shown after installation.${NC}\n"
     confirm_action "Install phpMyAdmin?" && install_phpmyadmin || log_info "Skipping phpMyAdmin."
 
     # ── Directory structure ───────────────────────────────────────────────────
@@ -7419,9 +7467,9 @@ do_install() {
     fi
 
     # phpMyAdmin secret path
-    if [[ -f "${CONFIG_DIR}/pma_path" ]]; then
-        local _pma; _pma=$(cat "${CONFIG_DIR}/pma_path")
-        echo -e "  ${BOLD}phpMyAdmin   :${NC} http://127.0.0.1:8090/${_pma}/ (SSH tunnel)"
+    if [[ -f "${CONFIG_DIR}/pma_url" ]]; then
+        local _pma_url; _pma_url=$(<"${CONFIG_DIR}/pma_url")
+        echo -e "  ${BOLD}phpMyAdmin   :${NC} ${_pma_url}"
     fi
 
     echo ""
@@ -8549,15 +8597,12 @@ show_pma_url() {
 
     local _pma; _pma=$(cat "${CONFIG_DIR}/pma_path")
     log_info "Fetching server IP..."
-    local _ip; _ip=$(curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null \
-                  || curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null \
-                  || hostname -I 2>/dev/null | awk '{print $1}' \
-                  || echo "SERVER_IP")
-    local _url="http://127.0.0.1:8090/${_pma}/"
+    local _ip; _ip=$(_phpmyadmin_server_ip)
+    local _url="http://${_ip}/${_pma}/"
 
     echo ""
     echo -e "  ${BOLD}phpMyAdmin URL:${NC}"
-    echo -e "  ${BOLD}SSH tunnel:${NC} ssh -L 8090:127.0.0.1:8090 root@${_ip}"
+    echo -e "  ${YELLOW}Public HTTP URL (database credentials are not encrypted in transit):${NC}"
     echo ""
     echo "$_url" > "${CONFIG_DIR}/pma_url"
     echo -e "  ${DIM}Saved: cat ${CONFIG_DIR}/pma_url${NC}"
