@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.11"
+readonly VERSION="2.7.12"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -4364,10 +4364,26 @@ change_site_type() {
     # Validate the vhost before creating any missing runtime config.
     local servers roots indexes locations php_locations
     servers=$(grep -cE '^[[:space:]]*server[[:space:]]*\{' "$conf" || true)
-    roots=$(grep -cE '^[[:space:]]*root[[:space:]]+[^;]+;' "$conf" || true)
-    indexes=$(grep -cE '^[[:space:]]*index[[:space:]]+[^;]+;' "$conf" || true)
-    locations=$(grep -cE '^[[:space:]]*location[[:space:]]+/[[:space:]]*\{' "$conf" || true)
-    php_locations=$(grep -cE '^[[:space:]]*location[[:space:]]+~[[:space:]]+.*php' "$conf" || true)
+    # Count only server-level directives. Liuer's standard vhost has a nested
+    # ACME location with its own `root`, which must neither trip validation nor
+    # be rewritten to the site's document root below.
+    read -r roots indexes locations php_locations <<< "$(awk '
+        function brace_delta(s, t, opens, closes) {
+            t=s; opens=gsub(/\{/, "", t); t=s; closes=gsub(/\}/, "", t)
+            return opens-closes
+        }
+        {
+            line=$0
+            if (depth == 1) {
+                if (line ~ /^[[:space:]]*root[[:space:]]+[^;]+;/) roots++
+                if (line ~ /^[[:space:]]*index[[:space:]]+[^;]+;/) indexes++
+                if (line ~ /^[[:space:]]*location[[:space:]]+\/[[:space:]]*\{/) locations++
+                if (line ~ /^[[:space:]]*location[[:space:]]+~[[:space:]]+.*php/) php_locations++
+            }
+            depth += brace_delta(line)
+        }
+        END { printf "%d %d %d %d\n", roots, indexes, locations, php_locations }
+    ' "$conf")"
     if [[ "$servers" -ne 1 || "$roots" -ne 1 || "$indexes" -ne 1 || "$locations" -ne 1 ]] || \
        { [[ "$old_type" == "static" && "$php_locations" -ne 0 ]]; } || \
        { [[ "$old_type" != "static" && "$php_locations" -ne 1 ]]; }; then
@@ -4455,11 +4471,11 @@ change_site_type() {
                 in_php=1
             }
             if (line ~ /^[[:space:]]*location[[:space:]]+~\*[[:space:]]+\// && line ~ /(uploads|xmlrpc|wp-trackback)/) next
-            if (line ~ /^[[:space:]]*root[[:space:]]+[^;]+;/) {
+            if (depth == 1 && line ~ /^[[:space:]]*root[[:space:]]+[^;]+;/) {
                 match(line, /^[[:space:]]*/); indent=substr(line,1,RLENGTH)
                 print indent "root " root ";"; depth += brace_delta(line); next
             }
-            if (line ~ /^[[:space:]]*index[[:space:]]+[^;]+;/) {
+            if (depth == 1 && line ~ /^[[:space:]]*index[[:space:]]+[^;]+;/) {
                 match(line, /^[[:space:]]*/); indent=substr(line,1,RLENGTH)
                 print indent "index " index_file ";"; depth += brace_delta(line); next
             }
