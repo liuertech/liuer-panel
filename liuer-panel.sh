@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.12"
+readonly VERSION="2.7.13"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -737,10 +737,11 @@ _ensure_php_fpm_running() {
 # Ensure each site's nginx config points to the correct domain-specific PHP-FPM socket
 _repair_nginx_sockets() {
     [[ ! -d "$SITES_META_DIR" ]] && return 0
-    local _fixed=0
+    local _only_domain="${1:-}" _fixed=0
     for _mf in "${SITES_META_DIR}"/*.conf; do
         [[ -f "$_mf" ]] || continue
         local _dom; _dom=$(basename "$_mf" .conf)
+        [[ -n "$_only_domain" && "$_dom" != "$_only_domain" ]] && continue
         local _ver; _ver=$(grep "^PHP_VERSION=" "$_mf" | cut -d= -f2)
         [[ -z "$_ver" ]] && continue
         local _nginx_conf="${NGINX_CONF_DIR}/${_dom}.conf"
@@ -832,8 +833,8 @@ _set_site_perms() {
     # Reset top-level dir to root:root 755 — required for SFTP ChrootDirectory
     chown root:root "$site_dir" 2>/dev/null || true
     chmod 755 "$site_dir"
-    find "$site_dir" -mindepth 1 -type d -exec chmod 750 {} \;
-    find "$site_dir" -type f -exec chmod 640 {} \;
+    find "$site_dir" -mindepth 1 -type d -exec chmod 750 {} +
+    find "$site_dir" -type f -exec chmod 640 {} +
     # Add nginx to site group — restart required (not just reload) to apply new group
     if ! groups "$nginx_user" 2>/dev/null | grep -qw "$site_user"; then
         usermod -aG "$site_user" "$nginx_user" 2>/dev/null || true
@@ -843,11 +844,12 @@ _set_site_perms() {
 
 # Re-apply group-writable perms for all SFTP chroot dirs (run AFTER _set_site_perms)
 _repair_sftp_perms() {
+    local _only_domain="${1:-}"
     local _sshd="/etc/ssh/sshd_config"
     if [[ ! -f "$_sshd" ]]; then
         # Framework profiles are part of website permissions, not SFTP. Always
         # restore them even on systems without an sshd configuration file.
-        _reapply_framework_hardening
+        _reapply_framework_hardening "$_only_domain"
         return 0
     fi
     local _sfuser="" _in_match=0
@@ -858,9 +860,10 @@ _repair_sftp_perms() {
         elif [[ $_in_match -eq 1 && "$_line" =~ ^[[:space:]]*ChrootDirectory[[:space:]]+([^[:space:]]+) ]]; then
             local _croot="${BASH_REMATCH[1]}"
             if [[ -d "$_croot" ]]; then
+                local _dom; _dom=$(basename "$_croot")
+                [[ -n "$_only_domain" && "$_dom" != "$_only_domain" ]] && continue
                 chown root:root "$_croot" && chmod 755 "$_croot"
                 # Detect web_user group from site meta (most reliable)
-                local _dom; _dom=$(basename "$_croot")
                 local _grp; _grp=$(grep "^WEB_USER=" "${SITES_META_DIR}/${_dom}.conf" 2>/dev/null \
                     | cut -d= -f2 || true)
                 # Fallback: detect from subdirs
@@ -868,7 +871,7 @@ _repair_sftp_perms() {
                     -exec stat -c '%G' {} \; 2>/dev/null | grep -v '^root$' | head -1 || true)
                 if [[ -n "$_grp" ]] && getent group "$_grp" &>/dev/null; then
                     # Fix group ownership so all files/dirs belong to web group
-                    find "$_croot" -mindepth 1 -exec chown :"$_grp" {} \; 2>/dev/null || true
+                    find "$_croot" -mindepth 1 -exec chown :"$_grp" {} + 2>/dev/null || true
                     # Fix primary group for sftp_user (suppress "no changes" stdout)
                     usermod -g "$_grp" "$_sfuser" &>/dev/null || true
                     # Fix PHP-FPM pool umask so PHP-created files are 660 not 644
@@ -879,14 +882,14 @@ _repair_sftp_perms() {
                         [[ -f "$_pool" ]] && [[ "${OS_FAMILY:-}" == "debian" && "$_pool" != *"remi"* ]] && _php_pool_set "$_pool" "umask" "0007" || true
                     fi
                 fi
-                find "$_croot" -mindepth 1 -type d -exec chmod 770 {} \; 2>/dev/null || true
-                find "$_croot" -mindepth 1 -type f -exec chmod 660 {} \; 2>/dev/null || true
+                find "$_croot" -mindepth 1 -type d -exec chmod 770 {} + 2>/dev/null || true
+                find "$_croot" -mindepth 1 -type f -exec chmod 660 {} + 2>/dev/null || true
             fi
         elif [[ $_in_match -eq 1 && "$_line" =~ ^[^[:space:]] && -n "${_line//[[:space:]]/}" ]]; then
             _in_match=0; _sfuser=""
         fi
     done < "$_sshd"
-    _reapply_framework_hardening
+    _reapply_framework_hardening "$_only_domain"
 }
 
 remove_php_pool() {
@@ -5460,6 +5463,7 @@ manage_fail2ban() {
 
 fix_permissions() {
     print_section "FIX PERMISSIONS"
+    local _repair_scope="all" _repair_domain=""
     echo "  1) All sites + phpMyAdmin"
     echo "  2) Select a site"
     echo "  0) Cancel"
@@ -5507,6 +5511,7 @@ fix_permissions() {
             [[ "$_sel" == "0" || -z "$_sel" ]] && return
             local _picked="${_choices[$((${_sel}-1))]}"
             if [[ "$_picked" == "phpMyAdmin" ]]; then
+                _repair_scope="phpmyadmin"
                 if [[ -f "${CONFIG_DIR}/pma_user" ]]; then
                     local _pu; _pu=$(cat "${CONFIG_DIR}/pma_user")
                     _set_site_perms /var/www/phpmyadmin "$_pu"
@@ -5515,6 +5520,8 @@ fix_permissions() {
                     log_warn "phpMyAdmin user not found."
                 fi
             else
+                _repair_scope="site"
+                _repair_domain="$_picked"
                 local _usr; _usr=$(grep "^WEB_USER=" "${SITES_META_DIR}/${_picked}.conf" | cut -d= -f2)
                 local _dir; _dir="$(get_site_dir "$_picked")"
                 if [[ -n "$_usr" && -d "$_dir" ]]; then
@@ -5526,11 +5533,24 @@ fix_permissions() {
             fi
             ;;
         0) return ;;
-        *) log_warn "Invalid selection." ;;
+        *) log_warn "Invalid selection."; press_enter; return 1 ;;
     esac
-    _repair_sftp_perms
-    _repair_nginx_sockets
-    _ensure_php_fpm_running
+    case "$_repair_scope" in
+        all)
+            _repair_sftp_perms
+            _repair_nginx_sockets
+            _ensure_php_fpm_running
+            ;;
+        site)
+            # A single-site repair must not recursively rescan every SFTP
+            # chroot, framework site, Nginx vhost, or PHP-FPM version.
+            _repair_sftp_perms "$_repair_domain"
+            _repair_nginx_sockets "$_repair_domain"
+            ;;
+        phpmyadmin)
+            # phpMyAdmin has no per-site SFTP chroot or framework profile.
+            ;;
+    esac
     press_enter
 }
 
@@ -5554,8 +5574,8 @@ _apply_framework_permissions() {
 
     chown -R root:"$site_user" "$site_dir"
     chown root:root "$site_dir" && chmod 755 "$site_dir"
-    find "$site_dir" -mindepth 1 -type d -exec chmod 750 {} \;
-    find "$site_dir" -type f -exec chmod 640 {} \;
+    find "$site_dir" -mindepth 1 -type d -exec chmod 750 {} +
+    find "$site_dir" -type f -exec chmod 640 {} +
 
     local -a writable=()
     if [[ "$site_type" == "laravel" ]]; then
@@ -5577,11 +5597,11 @@ _apply_framework_permissions() {
         if [[ "$site_type" == "wordpress" && "$profile" == "framework_hardened" ]]; then
             # PHP-FPM is the owner and can write with 750/640. Do not grant
             # group write here because nginx is also a member of the site group.
-            find "$dir" -type d -exec chmod 750 {} \;
-            find "$dir" -type f -exec chmod 640 {} \;
+            find "$dir" -type d -exec chmod 750 {} +
+            find "$dir" -type f -exec chmod 640 {} +
         else
-            find "$dir" -type d -exec chmod 770 {} \;
-            find "$dir" -type f -exec chmod 660 {} \;
+            find "$dir" -type d -exec chmod 770 {} +
+            find "$dir" -type f -exec chmod 660 {} +
         fi
     done
     _site_meta_set "$domain" PERMISSION_PROFILE "$profile"
@@ -5593,11 +5613,13 @@ _apply_framework_permissions() {
 }
 
 _reapply_framework_hardening() {
-    local _mf
+    local _mf _only_domain="${1:-}" _dom
     for _mf in "${SITES_META_DIR}"/*.conf; do
         [[ -f "$_mf" ]] || continue
+        _dom=$(basename "$_mf" .conf)
+        [[ -n "$_only_domain" && "$_dom" != "$_only_domain" ]] && continue
         grep -qE '^PERMISSION_PROFILE=framework_(hardened|strict)$' "$_mf" 2>/dev/null || continue
-        _apply_framework_permissions "$(basename "$_mf" .conf)" 1 || true
+        _apply_framework_permissions "$_dom" 1 || true
     done
 }
 
