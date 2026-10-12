@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.13"
+readonly VERSION="2.7.14"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -2786,6 +2786,25 @@ setup_ssl_free() {
     local domain="$1" requested_email="${2:-}" noninteractive="${3:-0}"
     if ! command -v certbot &>/dev/null; then
         log_error "Certbot not installed. Go to System → Install extra service."
+        return 1
+    fi
+
+    # Do not start an ACME request against a missing or empty vhost. Older
+    # releases could leave an empty file behind; rebuild only that safe case
+    # from Liuer metadata, and never overwrite a non-empty/custom vhost.
+    validate_domain "$domain" || { log_error "Invalid domain: ${domain}"; return 1; }
+    local _site_nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ -f "$_site_nginx_conf" ]] || {
+        log_error "Nginx vhost is missing for ${domain}; refusing to request a certificate."; return 1;
+    }
+    if [[ ! -s "$_site_nginx_conf" ]]; then
+        log_warn "Nginx vhost for ${domain} is empty; attempting a safe metadata-based repair before SSL setup."
+        repair_empty_site_vhost "$domain" || {
+            log_error "Could not repair the empty Nginx vhost; SSL setup stopped before contacting Certbot."; return 1;
+        }
+    fi
+    if ! grep -Eq '^[[:space:]]*location[[:space:]]+\^~[[:space:]]+/\.well-known/acme-challenge/' "$_site_nginx_conf"; then
+        log_error "Nginx vhost for ${domain} has no Liuer ACME challenge location; review the custom config before requesting SSL."
         return 1
     fi
 
