@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.14"
+readonly VERSION="2.7.16"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -187,7 +187,7 @@ print_warning_box() {
     echo -e "╚══════════════════════════════════════════════════════╝${NC}"
 }
 
-press_enter() { echo ""; read -rp "  Press Enter to continue..."; }
+press_enter() { [[ "${LIUER_NONINTERACTIVE:-0}" == "1" ]] && return 0; echo ""; read -rp "  Press Enter to continue..."; }
 
 # =============================================================================
 # ROOT CHECK
@@ -829,7 +829,7 @@ _set_site_perms() {
         chown root:root "$_parent" 2>/dev/null || true
         chmod 755 "$_parent"
     fi
-    chown -R "${site_user}:${site_user}" "$site_dir"
+    chown -hR "${site_user}:${site_user}" "$site_dir"
     # Reset top-level dir to root:root 755 — required for SFTP ChrootDirectory
     chown root:root "$site_dir" 2>/dev/null || true
     chmod 755 "$site_dir"
@@ -871,16 +871,11 @@ _repair_sftp_perms() {
                     -exec stat -c '%G' {} \; 2>/dev/null | grep -v '^root$' | head -1 || true)
                 if [[ -n "$_grp" ]] && getent group "$_grp" &>/dev/null; then
                     # Fix group ownership so all files/dirs belong to web group
-                    find "$_croot" -mindepth 1 -exec chown :"$_grp" {} + 2>/dev/null || true
+                    find "$_croot" -mindepth 1 -exec chown -h :"$_grp" {} + 2>/dev/null || true
                     # Fix primary group for sftp_user (suppress "no changes" stdout)
                     usermod -g "$_grp" "$_sfuser" &>/dev/null || true
-                    # Fix PHP-FPM pool umask so PHP-created files are 660 not 644
-                    local _pver; _pver=$(grep "^PHP_VERSION=" "${SITES_META_DIR}/${_dom}.conf" \
-                        2>/dev/null | cut -d= -f2)
-                    if [[ -n "$_pver" ]]; then
-                        local _pool; _pool=$(get_php_pool_conf "$_pver" "$_dom")
-                        [[ -f "$_pool" ]] && [[ "${OS_FAMILY:-}" == "debian" && "$_pool" != *"remi"* ]] && _php_pool_set "$_pool" "umask" "0007" || true
-                    fi
+                    # umask is not a valid FPM pool directive. Never write it
+                    # here; generated pools use the service's process umask.
                 fi
                 find "$_croot" -mindepth 1 -type d -exec chmod 770 {} + 2>/dev/null || true
                 find "$_croot" -mindepth 1 -type f -exec chmod 660 {} + 2>/dev/null || true
@@ -977,21 +972,23 @@ get_php_bin() {
 
 # Returns the package list needed to install a given PHP version
 get_php_packages() {
-    local ver="$1"
+    local ver="$1" opcache=""
     case "$OS_FAMILY" in
         rhel)
             local vn="${ver//./}"
+            [[ "$ver" == 8.5 ]] || opcache="php${vn}-php-opcache"
             echo "php${vn}-php-fpm php${vn}-php-cli php${vn}-php-common \
                   php${vn}-php-mysqlnd php${vn}-php-mbstring php${vn}-php-xml \
                   php${vn}-php-gd php${vn}-php-curl php${vn}-php-zip \
-                  php${vn}-php-bcmath php${vn}-php-opcache php${vn}-php-intl \
+                  php${vn}-php-bcmath ${opcache} php${vn}-php-intl \
                   php${vn}-php-pdo php${vn}-php-soap"
             ;;
         debian)
+            [[ "$ver" == 8.5 ]] || opcache="php${ver}-opcache"
             echo "php${ver}-fpm php${ver}-cli php${ver}-common \
                   php${ver}-mysql php${ver}-mbstring php${ver}-xml \
                   php${ver}-gd php${ver}-curl php${ver}-zip \
-                  php${ver}-bcmath php${ver}-opcache php${ver}-intl"
+                  php${ver}-bcmath ${opcache} php${ver}-intl"
             ;;
     esac
 }
@@ -1228,7 +1225,7 @@ mysql_exec() {
 # INPUT VALIDATION & PROMPT HELPERS
 # =============================================================================
 validate_domain() {
-    [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$ ]]
+    [[ ${#1} -le 253 && "$1" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]
 }
 
 validate_port() {
@@ -2658,8 +2655,7 @@ _apply_managed_ssl_config() {
     chown root:root "$nginx_conf"
     chmod 644 "$nginx_conf"
     command -v restorecon &>/dev/null && restorecon "$nginx_conf" 2>/dev/null || true
-    if nginx -t &>/dev/null; then
-        nginx -s reload
+    if nginx -t &>/dev/null && nginx -s reload; then
         rm -f "$backup"
         return 0
     fi
@@ -2670,7 +2666,7 @@ _apply_managed_ssl_config() {
 }
 
 _disable_managed_ssl_config() {
-    local domain="$1" nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
+    local domain="$1" nginx_conf="${NGINX_CONF_DIR}/${1}.conf"
     [[ -f "$nginx_conf" ]] || { log_error "Active Nginx config not found for ${domain}."; return 1; }
     grep -q '# liuer-managed-ssl-start' "$nginx_conf" \
         || { log_error "SSL for ${domain} is not managed by this Liuer version; automatic removal was refused."; return 1; }
@@ -2682,12 +2678,11 @@ _disable_managed_ssl_config() {
         /# liuer-managed-ssl-start/ { skip=1; next }
         /# liuer-managed-ssl-end/   { skip=0; next }
         !skip { print }
-    ' "$nginx_conf" > "$tmp" && mv "$tmp" "$nginx_conf"
+    ' "$nginx_conf" > "$tmp" && mv "$tmp" "$nginx_conf" || { rm -f "$tmp"; return 1; }
     chown root:root "$nginx_conf"
     chmod 644 "$nginx_conf"
     command -v restorecon &>/dev/null && restorecon "$nginx_conf" 2>/dev/null || true
-    if nginx -t &>/dev/null; then
-        nginx -s reload
+    if nginx -t &>/dev/null && nginx -s reload; then
         rm -f "$backup"
         log_success "HTTPS listener disabled for ${domain}; certificate files were preserved."
         return 0
@@ -2727,6 +2722,17 @@ _remove_managed_ssl() {
             ;;
     esac
 
+    # Refuse deletion if another active/disabled vhost still uses this certificate.
+    local other_conf
+    if [[ -n "$cert_file" ]]; then
+        for other_conf in "${NGINX_CONF_DIR}/"*.conf "${NGINX_CONF_DIR}/"*.conf.disabled; do
+            [[ -f "$other_conf" && "$other_conf" != "$nginx_conf" ]] || continue
+            if grep -Fq -- "$cert_file" "$other_conf"; then
+                log_error "Certificate is also referenced by ${other_conf}; use Disable SSL to keep its files."
+                return 1
+            fi
+        done
+    fi
     _disable_managed_ssl_config "$domain" || return 1
 
     if [[ -n "$cert_name" ]]; then
@@ -4074,7 +4080,7 @@ manage_site_ssl() {
             fi
             ;;
         0) return ;;
-        *) log_warn "Invalid selection." ;;
+        *) log_warn "Invalid selection."; press_enter; return 1 ;;
     esac
     press_enter
 }
@@ -4090,59 +4096,10 @@ change_php_version() {
     SELECTED_PHP_VERSION=""
     select_php_version || return 1
     local new_php="$SELECTED_PHP_VERSION"
-    local new_socket
-    new_socket=$(get_php_pool_socket "$new_php" "$domain")
-
-    local old_socket
-    old_socket=$(grep -oP '(?<=fastcgi_pass unix:)[^;]+' "$nginx_conf" 2>/dev/null | head -1 | xargs || true)
-
-    [[ "$old_socket" == "$new_socket" ]] && { log_info "Website is already using PHP $new_php."; return 0; }
-
-    local meta="${SITES_META_DIR}/${domain}.conf"
-    local old_php; old_php=$(grep "^PHP_VERSION=" "$meta" 2>/dev/null | cut -d= -f2)
-    local site_user; site_user=$(grep "^WEB_USER=" "$meta" 2>/dev/null | cut -d= -f2)
-    local site_path; site_path=$(grep "^SITE_DIR=" "$meta" 2>/dev/null | cut -d= -f2)
-    local old_pool; old_pool=$(get_php_pool_conf "$old_php" "$domain")
-
-    # Remove old PHP-FPM pool before creating new one
-    [[ -n "$old_php" ]] && remove_php_pool "$old_php" "$domain" 2>/dev/null || true
-
-    # Create new PHP-FPM pool for the new version
-    create_php_pool "$new_php" "$domain" "$site_user" 0 "$site_path"
-
-    # Copy custom upload/timeout settings from old pool to new pool
-    if [[ -n "$old_php" && -f "$old_pool" ]]; then
-        local new_pool; new_pool=$(get_php_pool_conf "$new_php" "$domain")
-        for _k in "php_admin_value[upload_max_filesize]" "php_admin_value[post_max_size]" \
-                  "php_value[memory_limit]" "php_admin_value[max_execution_time]" \
-                  "php_admin_value[max_input_time]"; do
-            local _v; _v=$(grep "^${_k} = " "$old_pool" 2>/dev/null | cut -d= -f2- | xargs)
-            [[ -n "$_v" ]] && _php_pool_set "$new_pool" "$_k" "$_v" || true
-        done
-    fi
-
-    sed -i "s|fastcgi_pass unix:${old_socket}|fastcgi_pass unix:${new_socket}|g" "$nginx_conf"
-    [[ -f "$meta" ]] && sed -i "s|^PHP_VERSION=.*|PHP_VERSION=${new_php}|" "$meta"
-
-    if ! nginx -t &>/dev/null; then
-        log_error "Nginx config error — rolling back."
-        sed -i "s|fastcgi_pass unix:${new_socket}|fastcgi_pass unix:${old_socket}|g" "$nginx_conf"
-        return 1
-    fi
-
-    # Start PHP-FPM first so the socket exists before nginx tries to connect
-    local new_svc; new_svc=$(get_php_service "$new_php")
-    systemctl restart "$new_svc" 2>/dev/null || true
-    # Wait up to 5s for the socket to appear
-    local _waited=0
-    while [[ ! -S "$new_socket" && $_waited -lt 5 ]]; do
-        sleep 1; ((_waited++))
-    done
-
-    nginx -s reload
-    lcp_notify "site_updated" "\"domain\":\"${domain}\",\"php_version\":\"${new_php}\""
-    log_success "Switched ${domain} to PHP $new_php. Upload/timeout settings carried over."
+    local result=0
+    _api_set_php_version "$domain" "$new_php" || result=$?
     press_enter
+    return "$result"
 }
 
 # =============================================================================
@@ -4299,7 +4256,12 @@ _change_site_type_cleanup_pool() {
 
 change_site_type() {
     print_section "CHANGE SITE TYPE"
-    _select_domain "Select site to change" || { press_enter; return 1; }
+    if [[ "${LIUER_NONINTERACTIVE:-0}" == "1" ]]; then
+        validate_domain "${1:-}" || { log_error "Invalid site domain."; return 1; }
+        SELECTED_DOMAIN="$1"
+    else
+        _select_domain "Select site to change" || { press_enter; return 1; }
+    fi
 
     local domain="$SELECTED_DOMAIN"
     local meta="${SITES_META_DIR}/${domain}.conf"
@@ -4336,7 +4298,15 @@ change_site_type() {
     echo "  3) WordPress"
     echo "  4) Static (HTML)"
     echo "  0) Cancel"
-    echo -ne "  Select: "; read -r _type_choice
+    if [[ "${LIUER_NONINTERACTIVE:-0}" == "1" ]]; then
+        case "${2:-}" in
+            php) _type_choice=1 ;; laravel) _type_choice=2 ;;
+            wordpress) _type_choice=3 ;; static) _type_choice=4 ;;
+            *) log_error "Invalid target type."; return 1 ;;
+        esac
+    else
+        echo -ne "  Select: "; read -r _type_choice
+    fi
     case "$_type_choice" in
         1) target_type="php"; target_name="PHP" ;;
         2) target_type="laravel"; target_name="Laravel" ;;
@@ -4379,7 +4349,7 @@ change_site_type() {
     echo "  Only Nginx routing and Liuer site metadata will change."
     echo "  No site files, database data/credentials, or Linux users will be moved, deleted, or rewritten."
     log_warn "If the application files are not already in the new document root, the site may show an error until you deploy them there."
-    confirm_danger "Change ${domain} from ${old_type} to ${target_type}" || {
+    { [[ "${LIUER_NONINTERACTIVE:-0}" == "1" ]] || confirm_danger "Change ${domain} from ${old_type} to ${target_type}"; } || {
         log_info "Cancelled; no changes made."; press_enter; return 0;
     }
 
@@ -4415,9 +4385,14 @@ change_site_type() {
 
     if [[ "$target_type" != "static" ]]; then
         if [[ -z "$php_ver" ]]; then
-            SELECTED_PHP_VERSION=""
-            select_php_version || { log_info "Cancelled; no changes made."; press_enter; return 1; }
-            php_ver="$SELECTED_PHP_VERSION"
+            if [[ "${LIUER_NONINTERACTIVE:-0}" == "1" ]]; then
+                php_ver="${3:-}"
+                [[ " $(_installed_php_versions_on_disk) " == *" ${php_ver} "* && -n "$php_ver" ]] || { log_error "Select an installed PHP version."; return 1; }
+            else
+                SELECTED_PHP_VERSION=""
+                select_php_version || { log_info "Cancelled; no changes made."; press_enter; return 1; }
+                php_ver="$SELECTED_PHP_VERSION"
+            fi
         fi
         if [[ ! "$php_ver" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]; then
             log_error "Invalid PHP version in site metadata; no changes made."
@@ -4690,8 +4665,13 @@ _read_cache_memory_limit() {
 
 setup_isolated_cache() {
     local cache_type="$1"
-    SELECTED_DOMAIN=""
-    _select_domain "Select website" || { press_enter; return; }
+    if [[ "${LIUER_NONINTERACTIVE:-0}" == "1" ]]; then
+        _api_require_active_site "${2:-}" || return 1
+        SELECTED_DOMAIN="$2"
+    else
+        SELECTED_DOMAIN=""
+        _select_domain "Select website" || { press_enter; return; }
+    fi
     local domain="$SELECTED_DOMAIN" site_user assigned_user cache_memory_mb
     assigned_user=$(grep '^WEB_USER=' "${SITES_META_DIR}/${domain}.conf" 2>/dev/null | cut -d= -f2)
     [[ -z "$assigned_user" ]] && {
@@ -4702,7 +4682,10 @@ setup_isolated_cache() {
         || { log_error "Website user not found."; press_enter; return 1; }
 
     local current_memory=""
-    if [[ "$cache_type" == "redis" ]]; then
+    if [[ "${LIUER_NONINTERACTIVE:-0}" == "1" ]]; then
+        cache_memory_mb="${3:-}"
+        [[ "$cache_memory_mb" =~ ^[1-9][0-9]{1,3}$ ]] && (( cache_memory_mb >= 16 && cache_memory_mb <= 8192 )) || { log_error "Invalid cache memory limit."; return 1; }
+    elif [[ "$cache_type" == "redis" ]]; then
         current_memory=$(grep '^CACHE_REDIS_MAXMEM_MB=' "${SITES_META_DIR}/${domain}.conf" 2>/dev/null | cut -d= -f2-)
         cache_memory_mb=$(_read_cache_memory_limit redis "${current_memory:-128}") || { press_enter; return 1; }
     else
@@ -4723,8 +4706,8 @@ setup_isolated_cache() {
     case "$cache_type" in
         redis)
             if ! command -v redis-server &>/dev/null; then
-                confirm_action "Redis is not installed. Install it now?" || { press_enter; return 1; }
-                [[ "$OS_FAMILY" == "rhel" ]] && pkg_install redis || pkg_install redis-server
+                { [[ "${LIUER_NONINTERACTIVE:-0}" == "1" ]] || confirm_action "Redis is not installed. Install it now?"; } || { press_enter; return 1; }
+                if [[ "$OS_FAMILY" == "rhel" ]]; then pkg_install redis; else pkg_install redis-server; fi || return 1
             fi
             local redis_bin; redis_bin=$(command -v redis-server)
             local data_dir="/var/lib/liuer-panel/cache/${domain}/redis"
@@ -4781,8 +4764,8 @@ EOF
             ;;
         memcached)
             if ! command -v memcached &>/dev/null; then
-                confirm_action "Memcached is not installed. Install it now?" || { press_enter; return 1; }
-                pkg_install memcached libmemcached-tools
+                { [[ "${LIUER_NONINTERACTIVE:-0}" == "1" ]] || confirm_action "Memcached is not installed. Install it now?"; } || { press_enter; return 1; }
+                pkg_install memcached || return 1
             fi
             local memcached_bin; memcached_bin=$(command -v memcached)
             cat > "$service_file" <<EOF
@@ -4830,6 +4813,7 @@ EOF
     else
         log_error "Failed to start ${service}."
         systemctl status "$service" --no-pager 2>/dev/null | tail -20 || true
+        return 1
     fi
     press_enter
 }
@@ -5591,11 +5575,6 @@ _apply_framework_permissions() {
     [[ -z "$profile" ]] && profile=$(grep '^PERMISSION_PROFILE=' "$meta" 2>/dev/null | cut -d= -f2)
     [[ ! "$profile" =~ ^framework_(hardened|strict)$ ]] && profile="framework_hardened"
 
-    chown -R root:"$site_user" "$site_dir"
-    chown root:root "$site_dir" && chmod 755 "$site_dir"
-    find "$site_dir" -mindepth 1 -type d -exec chmod 750 {} +
-    find "$site_dir" -type f -exec chmod 640 {} +
-
     local -a writable=()
     if [[ "$site_type" == "laravel" ]]; then
         writable+=("${site_dir}/storage" "${site_dir}/bootstrap/cache")
@@ -5611,8 +5590,17 @@ _apply_framework_permissions() {
     fi
     local dir
     for dir in "${writable[@]}"; do
+        _realpath_within_site "$site_dir" "$dir" 0 >/dev/null || {
+            log_error "Framework writable directory escapes this website: ${dir}"; return 1;
+        }
+    done
+    chown -hR root:"$site_user" "$site_dir"
+    chown root:root "$site_dir" && chmod 755 "$site_dir"
+    find "$site_dir" -mindepth 1 -type d -exec chmod 750 {} +
+    find "$site_dir" -type f -exec chmod 640 {} +
+    for dir in "${writable[@]}"; do
         mkdir -p "$dir"
-        chown -R "$site_user":"$site_user" "$dir"
+        chown -hR "$site_user":"$site_user" "$dir"
         if [[ "$site_type" == "wordpress" && "$profile" == "framework_hardened" ]]; then
             # PHP-FPM is the owner and can write with 750/640. Do not grant
             # group write here because nginx is also a member of the site group.
@@ -5983,7 +5971,9 @@ manage_php() {
 }
 
 install_php_version() {
-    local -a avail_vers=("5.6" "7.4" "8.0" "8.1" "8.2" "8.3")
+    local -a avail_vers=("5.6" "7.4" "8.0" "8.1" "8.2" "8.3" "8.4" "8.5")
+    local ver="${1:-}"
+    if [[ -z "$ver" ]]; then
     echo -e "\n${BOLD}Select PHP version to install:${NC}"
     local i=1
     for v in "${avail_vers[@]}"; do
@@ -6001,7 +5991,9 @@ install_php_version() {
     if [[ ! "$_ch" =~ ^[0-9]+$ ]] || [[ "$_ch" -lt 1 ]] || [[ "$_ch" -gt ${#avail_vers[@]} ]]; then
         log_warn "Invalid selection."; return 1
     fi
-    local ver="${avail_vers[$((${_ch}-1))]}"
+    ver="${avail_vers[$((${_ch}-1))]}"
+    fi
+    case "$ver" in 5.6|7.4|8.0|8.1|8.2|8.3|8.4|8.5) ;; *) log_error "Unsupported PHP version."; return 1 ;; esac
     [[ "$ver" == "5.6" ]] && log_warn "PHP 5.6 is EOL since 2018. Installing anyway..."
 
     case "$OS_FAMILY" in
@@ -6026,7 +6018,7 @@ install_php_version() {
     pkg_install $pkgs || { log_error "PHP $ver installation failed."; return 1; }
 
     local svc; svc=$(get_php_service "$ver")
-    systemctl enable "$svc" && systemctl start "$svc"
+    systemctl enable "$svc" && systemctl start "$svc" || { log_error "PHP $ver failed to start."; return 1; }
     _fix_fpm_socket_perms "$ver"
     log_success "PHP $ver installed and running."
     press_enter
@@ -6558,10 +6550,375 @@ update_system_packages() {
     press_enter
 }
 
+# Runtime maintenance is opt-in. Updating the panel never invokes these functions.
+_php_maint_minimum() {
+    case "$1" in 8.2) echo 8.2.35 ;; 8.3) echo 8.3.36 ;; 8.4) echo 8.4.27 ;; 8.5) echo 8.5.12 ;; *) return 1 ;; esac
+}
+
+_php_maint_fpm() {
+    case "$OS_FAMILY" in
+        debian) printf '/usr/sbin/php-fpm%s\n' "$1" ;;
+        rhel) printf '/opt/remi/php%s/root/usr/sbin/php-fpm\n' "${1//./}" ;;
+    esac
+}
+
+_php_maint_version() {
+    local output
+    [[ -x "$1" ]] || { echo unknown; return 0; }
+    output=$("$1" -v 2>/dev/null) || { echo unknown; return 0; }
+    printf '%s\n' "$output" | sed -nE 's/^PHP ([0-9]+\.[0-9]+\.[0-9]+)([[:space:]].*|$)/\1/p' | head -n 1
+}
+
+_php_maint_at_least() {
+    local actual="$1" minimum="$2"
+    [[ "$actual" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    [[ "${actual%.*}" == "${minimum%.*}" ]] || return 1
+    [[ "$(printf '%s\n%s\n' "$minimum" "$actual" | sort -V | head -n 1)" == "$minimum" ]]
+}
+
+_php_maint_verified() {
+    local minimum cli fpm
+    minimum=$(_php_maint_minimum "$1") || return 1
+    cli=$(_php_maint_version "$(get_php_bin "$1")")
+    fpm=$(_php_maint_version "$(_php_maint_fpm "$1")")
+    _php_maint_at_least "$cli" "$minimum" && _php_maint_at_least "$fpm" "$minimum"
+}
+
+_php_maint_packages() {
+    local branch="$1" compact="${1//./}"
+    case "$OS_FAMILY" in
+        debian)
+            dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n' 2>/dev/null \
+                | awk -F '\t' -v prefix="php${branch}-" '$2=="installed" && index($1,prefix)==1 {print $1}' ;;
+        rhel)
+            rpm -qa --qf '%{NAME}\n' | awk -v prefix="php${compact}-php-" 'index($0,prefix)==1 {print}' ;;
+    esac
+}
+
+_php_maint_candidate() {
+    local branch="$1" output
+    case "$OS_FAMILY" in
+        debian)
+            output=$(LC_ALL=C apt-cache policy "php${branch}-fpm") || return 1
+            output=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*Candidate: //p') ;;
+        rhel)
+            output=$(dnf --refresh -q repoquery --latest-limit=1 --qf '%{version}' "php${branch//./}-php-fpm") || return 1 ;;
+    esac
+    printf '%s\n' "$output" | sed -nE 's/^([0-9]+:)?([0-9]+\.[0-9]+\.[0-9]+)([-+].*|$)/\2/p' | sort -V | tail -n 1
+}
+
+_php_maint_fingerprint() {
+    local domain="$1" version meta conf pool
+    validate_domain "$domain" || return 1
+    meta="${SITES_META_DIR}/${domain}.conf"; conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ -f "$meta" && ! -L "$meta" && -s "$conf" && ! -L "$conf" ]] || return 1
+    version=$(sed -n 's/^PHP_VERSION=//p' "$meta")
+    [[ "$version" == 8.0 || "$version" == 8.1 ]] || return 1
+    pool=$(get_php_pool_conf "$version" "$domain")
+    [[ -f "$pool" && ! -L "$pool" ]] || return 1
+    sha256sum "$meta" "$conf" "$pool" | sha256sum | cut -d' ' -f1
+}
+
+# Tab-separated, non-secret records, also consumed by the Web worker on request.
+php_maintenance_audit() {
+    local branch cli fpm state minimum packages meta domain fingerprint version
+    printf 'policy\tCVE-2026-109618,CVE-2026-109619\tupstream-floor-only\n'
+    for branch in $(_installed_php_versions_on_disk); do
+        cli=$(_php_maint_version "$(get_php_bin "$branch")"); fpm=$(_php_maint_version "$(_php_maint_fpm "$branch")")
+        minimum=$(_php_maint_minimum "$branch" || echo none)
+        case "$branch" in
+            5.6|7.4) state=legacy-unchanged ;;
+            8.0|8.1) state=migration-required ;;
+            *) state=unverified; _php_maint_verified "$branch" && state=patched-version ;;
+        esac
+        packages=$(_php_maint_packages "$branch" | paste -sd, -)
+        printf 'runtime\t%s\t%s\t%s\t%s\t%s\t%s\n' "$branch" "${cli:-unknown}" "${fpm:-unknown}" "$state" "$minimum" "${packages:-unknown}"
+    done
+    for meta in "${SITES_META_DIR}"/*.conf; do
+        [[ -f "$meta" && ! -L "$meta" ]] || continue
+        domain=$(basename "$meta" .conf); validate_domain "$domain" || continue
+        version=$(sed -n 's/^PHP_VERSION=//p' "$meta")
+        [[ "$version" == 8.0 || "$version" == 8.1 ]] || continue
+        fingerprint=$(_php_maint_fingerprint "$domain" 2>/dev/null || true)
+        printf 'site\t%s\t%s\t%s\t%s\n' "$domain" "$version" "$(sed -n 's/^STATUS=//p' "$meta")" "${fingerprint:-unavailable}"
+    done
+    # File paths only: cron/queue commands can contain passwords. Never print contents.
+    local path
+    while IFS= read -r path; do printf 'review\t%s\n' "$path"; done < <(
+        grep -rlE 'php(8[.]?[01]|80|81)|/usr/bin/php([[:space:]]|$)' \
+            /etc/crontab /etc/cron.d /var/spool/cron /etc/systemd/system /etc/supervisor /etc/supervisord.d 2>/dev/null || true
+    )
+    printf 'note\tBackported fixes below upstream floors are unverified, not automatically declared vulnerable or safe.\n'
+    printf 'note\tCustom paths/containers and application compatibility require separate review.\n'
+}
+
+_php_maint_test_fpm() {
+    local binary; binary=$(_php_maint_fpm "$1")
+    [[ -x "$binary" ]] && "$binary" -t
+}
+
+_php_maint_upgrade_branch() {
+    local branch="$1" report="$2" package svc candidate active=0 enabled=0 failed=0 boot_state
+    _php_maint_minimum "$branch" >/dev/null || return 1
+    candidate=$(_php_maint_candidate "$branch")
+    _php_maint_at_least "$candidate" "$(_php_maint_minimum "$branch")" || {
+        log_error "PHP $branch repository candidate is missing/below the upstream floor. No package changes for this branch; vendor backports require separate verification."; return 1;
+    }
+    local -a packages=()
+    while IFS= read -r package; do [[ -z "$package" ]] || packages+=("$package"); done < <(_php_maint_packages "$branch")
+    [[ ${#packages[@]} -gt 0 ]] || { log_error "No installed packages for PHP $branch; unsupported/custom runtime."; return 1; }
+    svc=$(get_php_service "$branch")
+    boot_state=$(systemctl is-enabled "$svc" 2>/dev/null || true)
+    [[ "$boot_state" != masked && "$boot_state" != masked-runtime ]] || { log_error "PHP $branch service is masked; manual review required."; return 1; }
+    systemctl is-active --quiet "$svc" && active=1
+    systemctl is-enabled --quiet "$svc" && enabled=1
+    _php_maint_test_fpm "$branch" >"${report}/fpm-${branch}-before.log" 2>&1 || { log_error "PHP $branch already has invalid FPM config; left unchanged."; return 1; }
+    case "$OS_FAMILY" in
+        debian)
+            DEBIAN_FRONTEND=noninteractive apt-get --simulate --no-remove install --only-upgrade "${packages[@]}" >"${report}/packages-${branch}-plan.log" 2>&1 || return 1
+            # Refuse dependency changes to legacy runtimes, removals and downgrades.
+            if grep -Eq '^(Remv |Inst php(5\.|7\.|8\.[01])|.*will be DOWNGRADED)' "${report}/packages-${branch}-plan.log"; then
+                log_error "Package plan would change protected runtimes/remove/downgrade packages."; return 1
+            fi
+            NEEDRESTART_MODE=l DEBIAN_FRONTEND=noninteractive apt-get --no-remove -o Dpkg::Options::=--force-confold install --only-upgrade -y "${packages[@]}" >"${report}/packages-${branch}.log" 2>&1 || failed=1 ;;
+        rhel)
+            dnf --refresh upgrade -y --exclude='php5*' --exclude='php7*' --exclude='php80*' --exclude='php81*' \
+                "${packages[@]}" >"${report}/packages-${branch}.log" 2>&1 || failed=1 ;;
+    esac
+    # Package maintainer scripts may restart services; restore inactive/boot state.
+    if _php_maint_test_fpm "$branch" >"${report}/fpm-${branch}-after.log" 2>&1; then
+        if [[ "$active" == 1 ]]; then systemctl restart "$svc" && systemctl is-active --quiet "$svc" || failed=1
+        else systemctl stop "$svc" || failed=1; fi
+    else failed=1; log_error "Invalid FPM config after PHP $branch upgrade. See protected logs; package downgrade is NOT automatic."; fi
+    if [[ "$enabled" == 0 ]]; then systemctl disable "$svc" >/dev/null 2>&1 || failed=1
+    else systemctl enable "$svc" >/dev/null 2>&1 || failed=1; fi
+    [[ "$failed" == 0 ]] && _php_maint_verified "$branch" || {
+        log_error "PHP $branch update not verified. Package/service failure, missing patch or vendor backport needing verification. Logs: $report"; return 1;
+    }
+    log_success "PHP $branch CLI and FPM meet the required upstream patch version."
+}
+
+_php_maint_install_target() {
+    local report="$1" package old prefix target cli_before cli_after token candidate failed=0
+    shift
+    candidate=$(_php_maint_candidate 8.2)
+    _php_maint_at_least "$candidate" "$(_php_maint_minimum 8.2)" || {
+        log_error "Repository has no verified PHP 8.2 candidate. Target not installed; no sites migrated."; return 1;
+    }
+    local target_state
+    target_state=$(systemctl is-enabled "$(get_php_service 8.2)" 2>/dev/null || true)
+    [[ "$target_state" != masked && "$target_state" != masked-runtime ]] || { log_error "PHP 8.2 is masked; no target changes."; return 1; }
+    local -a packages=()
+    # Use existing trusted repositories only. Never add/swap repo or reset modules.
+    for token in "$@"; do
+        old=$(sed -n 's/^PHP_VERSION=//p' "${SITES_META_DIR}/${token%%:*}.conf")
+        [[ "$old" == 8.0 || "$old" == 8.1 ]] || return 1
+        for package in $(_php_maint_packages "$old"); do
+            case "$OS_FAMILY" in
+                debian) target="php8.2-${package#php${old}-}" ;;
+                rhel) prefix="php${old//./}-"; target="php82-${package#"$prefix"}" ;;
+            esac
+            packages+=("$target")
+        done
+    done
+    for package in $(get_php_packages 8.2); do packages+=("$package"); done
+    cli_before=$(readlink -f /usr/bin/php 2>/dev/null || true)
+    case "$OS_FAMILY" in
+        debian)
+            DEBIAN_FRONTEND=noninteractive apt-get --simulate --no-remove install "${packages[@]}" >"${report}/target-plan.log" 2>&1 || return 1
+            if grep -Eq '^(Remv |Inst php(5\.|7\.|8\.[01])|.*will be DOWNGRADED)' "${report}/target-plan.log"; then
+                log_error "Target dependency plan changes protected runtimes; refused."; return 1
+            fi
+            NEEDRESTART_MODE=l DEBIAN_FRONTEND=noninteractive apt-get --no-remove -o Dpkg::Options::=--force-confold install -y "${packages[@]}" >"${report}/target-install.log" 2>&1 || failed=1
+            cli_after=$(readlink -f /usr/bin/php 2>/dev/null || true)
+            if [[ -n "$cli_before" && "$cli_before" != "$cli_after" && -x "$cli_before" ]]; then
+                update-alternatives --set php "$cli_before" >>"${report}/target-install.log" 2>&1 || failed=1
+                log_warn "Restored default CLI PHP to $cli_before (alternatives now manual); review cron/queue separately."
+            fi ;;
+        rhel)
+            dnf --refresh install -y --exclude='php5*' --exclude='php7*' --exclude='php80*' --exclude='php81*' \
+                "${packages[@]}" >"${report}/target-install.log" 2>&1 || failed=1 ;;
+    esac
+    [[ "$failed" == 0 ]] && _php_maint_verified 8.2 && _php_maint_test_fpm 8.2 || {
+        log_error "Cannot prepare verified PHP 8.2 with matching extension packages. No sites migrated. Logs: $report"; return 1;
+    }
+    systemctl enable "$(get_php_service 8.2)" && systemctl start "$(get_php_service 8.2)" && systemctl is-active --quiet "$(get_php_service 8.2)"
+}
+
+_php_maint_modules() {
+    local binary; binary=$(_php_maint_fpm "$1")
+    "$binary" -m 2>/dev/null | sort -u | sed '/^$/d; /^\[/d'
+}
+
+_php_maint_http() {
+    local domain="$1" conf="${NGINX_CONF_DIR}/$1.conf" scheme=http port=80 code
+    if grep -Eq '^[[:space:]]*listen[[:space:]].*443.*ssl' "$conf"; then scheme=https; port=443; fi
+    code=$(curl --noproxy '*' --silent --show-error --max-time 20 --connect-timeout 5 \
+        --proto '=http,https' --resolve "${domain}:${port}:127.0.0.1" \
+        --output /dev/null --write-out '%{http_code}' "${scheme}://${domain}/") || return 1
+    # Smoke test only; redirects are not followed to a different server.
+    [[ "$code" =~ ^[23][0-9][0-9]$ ]]
+}
+
+_php_maint_publish() {
+    local source="$1" target="$2" mode="$3" temporary
+    temporary=$(mktemp "${target}.liuer.XXXXXXXX") || return 1
+    if install -m "$mode" "$source" "$temporary" && mv -f "$temporary" "$target"; then return 0; fi
+    [[ ! -f "$temporary" ]] || rm -f "$temporary"
+    return 1
+}
+
+_php_maint_restore_site() {
+    local saved="$1" domain="$2" old="$3" old_pool new_pool
+    old_pool=$(get_php_pool_conf "$old" "$domain"); new_pool=$(get_php_pool_conf 8.2 "$domain")
+    _php_maint_publish "${saved}/nginx.conf" "${NGINX_CONF_DIR}/${domain}.conf" 644 \
+        && _php_maint_publish "${saved}/site.conf" "${SITES_META_DIR}/${domain}.conf" 600 \
+        && _php_maint_publish "${saved}/old-pool.conf" "$old_pool" 600 || return 1
+    if [[ -f "${saved}/target-pool.conf" ]]; then _php_maint_publish "${saved}/target-pool.conf" "$new_pool" 600 || return 1
+    else [[ ! -f "$new_pool" ]] || mv "$new_pool" "${saved}/rejected-pool.conf" || return 1; fi
+    _php_maint_test_fpm "$old" && _php_maint_test_fpm 8.2 \
+        && systemctl reload "$(get_php_service "$old")" && systemctl reload "$(get_php_service 8.2)" \
+        && nginx -t && systemctl reload nginx
+}
+
+_php_maint_migrate_site() {
+    local domain="$1" fingerprint="$2" report="$3" old meta conf old_pool new_pool socket tmp missing saved old_socket old_modules new_modules
+    [[ "$(_php_maint_fingerprint "$domain")" == "$fingerprint" ]] || { log_error "$domain config changed since confirmation; rescan."; return 1; }
+    _api_require_active_site "$domain" || return 1
+    meta="${SITES_META_DIR}/${domain}.conf"; conf="${NGINX_CONF_DIR}/${domain}.conf"
+    grep -qx 'STATUS=active' "$meta" && ! grep -qx 'TYPE=static' "$meta" || { log_error "$domain is not an active PHP site."; return 1; }
+    [[ ! -e "${conf}.premaint" ]] || { log_error "$domain is in maintenance; skipped."; return 1; }
+    old=$(sed -n 's/^PHP_VERSION=//p' "$meta")
+    old_pool=$(get_php_pool_conf "$old" "$domain"); new_pool=$(get_php_pool_conf 8.2 "$domain")
+    [[ ! -L "$new_pool" && ! -e "$new_pool" ]] || { log_error "$domain already has a target pool; manual review required."; return 1; }
+    # Full pool cloning preserves tuning, users, isolation, per-pool INI and extension settings.
+    [[ $(grep -cE '^[[:space:]]*\[[^]]+\]' "$old_pool") == 1 \
+        && $(grep -cE '^[[:space:]]*listen[[:space:]]*=' "$old_pool") == 1 \
+        && $(grep -cE '^[[:space:]]*fastcgi_pass[[:space:]]+unix:' "$conf") == 1 ]] || { log_error "$domain custom pool/vhost layout; skipped."; return 1; }
+    grep -Eq '^[[:space:]]*include[[:space:]]*=' "$old_pool" && { log_error "$domain pool includes require manual review."; return 1; }
+    old_socket=$(awk '/^[[:space:]]*listen[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/, ""); sub(/[[:space:]]*$/, ""); print}' "$old_pool")
+    grep -Eq '^[[:space:]]*fastcgi_pass[[:space:]]+unix:' "$conf" \
+        && [[ "$(awk '/^[[:space:]]*fastcgi_pass[[:space:]]+unix:/ {sub(/^.*unix:/, ""); sub(/;.*/, ""); print}' "$conf")" == "$old_socket" ]] \
+        || { log_error "$domain vhost does not use the expected old pool; skipped."; return 1; }
+    old_modules=$(_php_maint_modules "$old") && new_modules=$(_php_maint_modules 8.2) \
+        && [[ -n "$old_modules" && -n "$new_modules" ]] || { log_error "$domain cannot inspect FPM modules; skipped."; return 1; }
+    missing=$(comm -23 <(printf '%s\n' "$old_modules") <(printf '%s\n' "$new_modules"))
+    [[ -z "$missing" ]] || { log_error "$domain missing PHP 8.2 modules: $missing"; return 1; }
+    _php_maint_verified 8.2 && _php_maint_http "$domain" || { log_error "$domain preflight HTTP/runtime check failed; unchanged."; return 1; }
+    saved="${report}/${domain}"; mkdir -m 700 "$saved" || return 1
+    cp -a "$meta" "${saved}/site.conf" && cp -a "$conf" "${saved}/nginx.conf" \
+        && cp -a "$old_pool" "${saved}/old-pool.conf" || return 1
+    socket=$(get_php_pool_socket 8.2 "$domain")
+    # Stage all outputs before activation. Any failure below restores the saved configs.
+    if awk -v socket="$socket" '/^[[:space:]]*listen[[:space:]]*=/ {$0="listen = " socket} {print}' "$old_pool" > "${saved}/new-pool" \
+        && awk -v socket="$socket" '/^[[:space:]]*fastcgi_pass[[:space:]]+unix:/ {$0="        fastcgi_pass unix:" socket ";"} {print}' "$conf" > "${saved}/new-nginx" \
+        && awk '/^PHP_VERSION=/ {$0="PHP_VERSION=8.2"} {print}' "$meta" > "${saved}/new-meta" \
+        && _php_maint_publish "${saved}/new-pool" "$new_pool" 600 \
+        && _php_maint_test_fpm 8.2 && systemctl reload "$(get_php_service 8.2)" \
+        && _php_maint_publish "${saved}/new-nginx" "$conf" 644 && _php_maint_publish "${saved}/new-meta" "$meta" 600 \
+        && nginx -t && systemctl reload nginx && _php_maint_http "$domain" \
+        && sha256sum "$conf" "$meta" "$new_pool" > "${saved}/applied.sha256"; then
+        log_success "$domain switched $old -> 8.2; HTTP smoke check passed (not a full application test)."
+        return 0
+    fi
+    log_error "$domain switch failed; restoring saved config."
+    _php_maint_restore_site "$saved" "$domain" "$old" || { log_error "ROLLBACK FAILED for $domain; recover using $saved immediately."; return 1; }
+    log_warn "$domain restored to $old; that old runtime is NOT confirmed patched."
+    return 1
+}
+
+php_maintenance_apply() {
+    (
+    umask 077
+    [[ "${1:-}" == --confirm ]] || { log_error "Explicit --confirm is required. Run php-maintenance audit first."; return 1; }; shift
+    command -v flock >/dev/null && command -v curl >/dev/null || { log_error "flock and curl are required."; return 1; }
+    exec 9>/run/liuer-php-maintenance.lock; flock -n 9 || { log_error "Runtime maintenance already running."; return 1; }
+    local token domain fingerprint meta version report failed=0 branch needs_target=0 seen=' '
+    [[ $# -le 200 ]] || { log_error "Select at most 200 sites per run."; return 1; }
+    local -a selected=("$@") branches=()
+    # Validate ALL selections before any package change. No shell evaluation of metadata.
+    for token in ${selected[@]+"${selected[@]}"}; do
+        domain="${token%%:*}"; fingerprint="${token#*:}"
+        [[ "$seen" != *" $domain "* ]] || { log_error "Duplicate selected site."; return 1; }; seen+="$domain "
+        validate_domain "$domain" && [[ "$fingerprint" =~ ^[a-f0-9]{64}$ ]] \
+            && [[ "$(_php_maint_fingerprint "$domain")" == "$fingerprint" ]] \
+            && _api_require_active_site "$domain" || { log_error "Invalid/stale selected site: $domain"; return 1; }
+        needs_target=1
+    done
+    nginx -t || return 1
+    install -d -m 700 /var/backups/liuer-panel/runtime
+    report=$(mktemp -d /var/backups/liuer-panel/runtime/run.XXXXXXXX) || return 1
+    log_info "Protected backup/report: $report"
+    php_maintenance_audit > "${report}/before.tsv"
+    case "$OS_FAMILY" in
+        debian) dpkg-query -W > "${report}/packages-before.txt"; tar -cpf "${report}/config.tar" /etc/php "$SITES_META_DIR" "$NGINX_CONF_DIR" 2>"${report}/backup.log" || return 1
+                apt-get update > "${report}/repository.log" 2>&1 || { log_error "Repository refresh failed; see $report"; return 1; } ;;
+        rhel) rpm -qa > "${report}/packages-before.txt"; tar -cpf "${report}/config.tar" /etc/opt/remi "$SITES_META_DIR" "$NGINX_CONF_DIR" 2>"${report}/backup.log" || return 1 ;;
+    esac
+    for branch in $(_installed_php_versions_on_disk); do
+        case "$branch" in 8.2|8.3|8.4|8.5) branches+=("$branch") ;; *) log_warn "PHP $branch left unchanged." ;; esac
+    done
+    for branch in ${branches[@]+"${branches[@]}"}; do
+        if _php_maint_upgrade_branch "$branch" "$report"; then
+            printf 'runtime\t%s\tverified-after-update\n' "$branch" | tee -a "${report}/results.tsv"
+        else printf 'runtime\t%s\tfailed-or-unverified\n' "$branch" | tee -a "${report}/results.tsv"; failed=1; fi
+    done
+    if [[ "$needs_target" == 1 ]]; then
+        if _php_maint_install_target "$report" "${selected[@]}"; then
+            for token in ${selected[@]+"${selected[@]}"}; do
+                domain="${token%%:*}"; fingerprint="${token#*:}"
+                if _php_maint_migrate_site "$domain" "$fingerprint" "$report" >"${report}/${domain}.log" 2>&1; then
+                    printf 'site\t%s\tmigrated-http-smoke-ok\n' "$domain" | tee -a "${report}/results.tsv"
+                else printf 'site\t%s\tfailed-or-rolled-back\n' "$domain" | tee -a "${report}/results.tsv"; failed=1; fi
+            done
+        else failed=1; fi
+    fi
+    php_maintenance_audit > "${report}/after.tsv"
+    printf 'result\t%s\t%s\n' "$([[ "$failed" == 0 ]] && echo completed || echo incomplete)" "$report" | tee -a "${report}/results.tsv"
+    log_warn "Review cron/queue, inactive/locked/custom pools, application behavior and unselected 8.0/8.1 sites. Old runtimes are retained, not declared safe."
+    log_warn "Package upgrades are NOT automatically downgraded. Config recovery does not undo database writes by HTTP requests."
+    [[ "$failed" == 0 ]]
+    )
+}
+
+php_maintenance_rollback() {
+    (
+    local run="$1" domain="$2" saved old
+    [[ "$run" =~ ^run\.[A-Za-z0-9]{8}$ ]] && validate_domain "$domain" || return 1
+    saved="/var/backups/liuer-panel/runtime/${run}/${domain}"
+    [[ -d "$saved" && ! -L "$saved" && -f "${saved}/applied.sha256" ]] || return 1
+    exec 9>/run/liuer-php-maintenance.lock; flock -n 9 || return 1
+    sha256sum -c "${saved}/applied.sha256" || { log_error "Config changed since migration; manual recovery required."; return 1; }
+    old=$(sed -n 's/^PHP_VERSION=//p' "${saved}/site.conf")
+    [[ "$old" == 8.0 || "$old" == 8.1 ]] || return 1
+    log_warn "Restoring $domain to $old; this does NOT restore security or undo application/database changes."
+    _php_maint_restore_site "$saved" "$domain" "$old"
+    )
+}
+
+php_maintenance_menu() {
+    php_maintenance_audit
+    echo 'PHP <8: untouched. 8.2–8.5: in-branch package updates. Select 8.0/8.1 sites individually.'
+    echo 'Expect brief FPM interruption. Back up application/database separately; HTTP smoke tests are not compatibility tests.'
+    local meta domain version fingerprint
+    local -a selected=()
+    for meta in "${SITES_META_DIR}"/*.conf; do
+        [[ -f "$meta" && ! -L "$meta" ]] || continue
+        domain=$(basename "$meta" .conf); validate_domain "$domain" || continue
+        version=$(sed -n 's/^PHP_VERSION=//p' "$meta")
+        [[ "$version" == 8.0 || "$version" == 8.1 ]] || continue
+        grep -qx 'STATUS=active' "$meta" || continue
+        fingerprint=$(_php_maint_fingerprint "$domain") || continue
+        if confirm_action "Migrate $domain from $version to patched 8.2?"; then selected+=("${domain}:${fingerprint}"); fi
+    done
+    confirm_action 'Apply runtime maintenance now?' || return 0
+    php_maintenance_apply --confirm ${selected[@]+"${selected[@]}"}
+}
+
 update_service() {
     print_section "UPDATE SERVICE"
     echo "  1) Nginx"
-    echo "  2) PHP (all installed versions)"
+    echo "  2) PHP runtime maintenance (8.x + confirmed site migrations)"
     echo "  3) MySQL / MariaDB"
     echo "  4) Redis"
     echo "  5) Memcached"
@@ -6573,18 +6930,7 @@ update_service() {
         1) pkg_update_single nginx
            nginx -t &>/dev/null && systemctl reload nginx
            log_success "Nginx updated." ;;
-        2) local vers_str; vers_str=$(get_php_versions)
-           [[ -z "$vers_str" ]] && { log_warn "No PHP versions found."; press_enter; return; }
-           local -a vers; read -ra vers <<< "$vers_str"
-           for v in "${vers[@]}"; do
-               [[ -z "$v" ]] && continue
-               case "$OS_FAMILY" in
-                   rhel)   local vn="${v//./}"; dnf update -y "php${vn}-*" 2>/dev/null || true ;;
-                   debian) apt-get install --only-upgrade -y "php${v}-*" 2>/dev/null || true ;;
-               esac
-               systemctl restart "$(get_php_service "$v")"
-               log_success "PHP $v updated."
-           done ;;
+        2) php_maintenance_menu ;;
         3) case "$OS_FAMILY" in
                rhel)   dnf update -y mariadb-server mysql-server 2>/dev/null || true ;;
                debian) apt-get install --only-upgrade -y mariadb-server mysql-server 2>/dev/null || true ;;
@@ -6837,7 +7183,7 @@ PHP
     rm -f /etc/nginx/conf.d/default.conf
     rm -f /etc/nginx/sites-enabled/default
 
-    # Public-IP access preserves the original Liuer behavior. The random path
+    # Public IP access preserves the original Liuer behavior. The random path
     # is an extra layer, not a substitute for strong database credentials.
     local pma_conf="${NGINX_CONF_DIR}/phpmyadmin.conf" pma_conf_backup=""
     if [[ -f "$pma_conf" ]]; then
@@ -6875,22 +7221,22 @@ EOF
         log_error "Nginx rejected the phpMyAdmin configuration; the previous configuration was restored. Check nginx -t."
         return 1
     fi
-    if ! systemctl reload nginx 2>/dev/null && ! nginx -s reload; then
+    systemctl reload nginx 2>/dev/null || nginx -s reload || {
         [[ -n "$pma_conf_backup" ]] && cp -a "$pma_conf_backup" "$pma_conf"
         rm -f "$pma_conf_backup"
         return 1
-    fi
+    }
     rm -f "$pma_conf_backup"
+    echo "public" > "${CONFIG_DIR}/pma_access_mode"
+    chmod 600 "${CONFIG_DIR}/pma_access_mode"
 
     log_success "phpMyAdmin installed."
-    local pma_ip pma_public_url
+    local pma_ip
     pma_ip=$(_phpmyadmin_server_ip)
-    pma_public_url="http://${pma_ip}/${pma_token}/"
-    printf '%s\n' "$pma_public_url" > "${CONFIG_DIR}/pma_url"
-    printf '%s\n' "public" > "${CONFIG_DIR}/pma_access_mode"
-    chmod 600 "${CONFIG_DIR}/pma_url" "${CONFIG_DIR}/pma_access_mode"
+    local pma_public_url="http://${pma_ip}/${pma_token}/"
+    echo "$pma_public_url" > "${CONFIG_DIR}/pma_url"
+    chmod 600 "${CONFIG_DIR}/pma_url"
     echo -e "  URL    : ${BOLD}${pma_public_url}${NC}"
-    echo -e "${YELLOW}Warning: this public URL uses HTTP; database credentials are not encrypted in transit.${NC}"
     echo -e "${DIM}Path saved to: ${CONFIG_DIR}/pma_path${NC}"
 }
 
@@ -7114,7 +7460,15 @@ _create_web_panel_database() {
 }
 
 _apply_web_panel_db_grants() {
-    mysql_exec "REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT (id,email,display_name,role,parent_id,package_id,active,last_login_at,created_at,updated_at) ON liuer_panel.users TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.jobs TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_sites TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.settings TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.hosting_packages TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_databases TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_sftp_users TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_crons TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_backups TO 'liuer_panel_web'@'127.0.0.1'; FLUSH PRIVILEGES;"
+    # Prime the connection cache: mysql_exec suppresses the first query output.
+    mysql_exec "DO 1;" || return 1
+    local user_columns="id,email,display_name,role,parent_id,package_id,active,last_login_at,created_at,updated_at"
+    if mysql_exec "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='liuer_panel' AND TABLE_NAME='users' AND COLUMN_NAME='username';" | grep -Fxq username; then
+        user_columns="${user_columns},username"
+    fi
+    mysql_exec "REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'liuer_panel_web'@'127.0.0.1';
+GRANT SELECT (${user_columns}) ON liuer_panel.users TO 'liuer_panel_web'@'127.0.0.1';
+GRANT SELECT ON liuer_panel.jobs TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_sites TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.settings TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.hosting_packages TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_databases TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_sftp_users TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_crons TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_backups TO 'liuer_panel_web'@'127.0.0.1'; FLUSH PRIVILEGES;"
 }
 
 _ensure_web_panel_app_key() {
@@ -7816,7 +8170,7 @@ do_install() {
     echo -e "${DIM}Enter numbers separated by spaces, or press Enter to skip.${NC}"
     echo -e "${DIM}Tip: you can also install more PHP versions later via: liuer → PHP Manager${NC}\n"
 
-    local -a _all_php_vers=("5.6" "7.4" "8.0" "8.2" "8.3")
+    local -a _all_php_vers=("5.6" "7.4" "8.0" "8.1" "8.2" "8.3" "8.4" "8.5")
     local -a _avail_vers=()
     local _idx=1
     for _v in "${_all_php_vers[@]}"; do
@@ -8262,7 +8616,7 @@ _active_backup_schedule_lines() {
 # new entry has been verified.
 _replace_backup_schedule_entry() {
     local _scope="$1" _entry="$2"
-    _validate_cron_entry "$_entry" || {
+    { [[ -z "$_entry" ]] || _validate_cron_entry "$_entry"; } || {
         log_error "Invalid backup cron entry."
         return 1
     }
@@ -8284,21 +8638,24 @@ _replace_backup_schedule_entry() {
             if (!remove) print
         }
     ' "$_old" > "$_new"
-    printf '%s\n' "$_entry" >> "$_new"
+    [[ -z "$_entry" ]] || printf '%s\n' "$_entry" >> "$_new"
 
     if ! crontab -u root "$_new"; then
         rm -f "$_old" "$_new"
         log_error "Failed to install the root crontab."
         return 1
     fi
-    if ! crontab -l -u root 2>/dev/null | grep -Fqx -- "$_entry"; then
+    local _installed
+    _installed=$(mktemp) || { crontab -u root "$_old"; rm -f "$_old" "$_new"; return 1; }
+    crontab -l -u root > "$_installed" 2>/dev/null || true
+    if ! cmp -s "$_new" "$_installed"; then
         crontab -u root "$_old" 2>/dev/null || true
-        rm -f "$_old" "$_new"
+        rm -f "$_old" "$_new" "$_installed"
         log_error "Cron reported success, but the backup schedule could not be verified; the previous crontab was restored."
         return 1
     fi
 
-    rm -f "$_old" "$_new"
+    rm -f "$_old" "$_new" "$_installed"
 }
 
 _remove_backup_schedule_entry() {
@@ -9125,7 +9482,7 @@ show_pma_url() {
 
     echo ""
     echo -e "  ${BOLD}phpMyAdmin URL:${NC}"
-    echo -e "  ${YELLOW}Public HTTP URL (database credentials are not encrypted in transit):${NC}"
+    echo -e "  ${YELLOW}Public HTTP URL (use a strong database password):${NC}"
     echo ""
     echo "$_url" > "${CONFIG_DIR}/pma_url"
     echo -e "  ${DIM}Saved: cat ${CONFIG_DIR}/pma_url${NC}"
@@ -9213,6 +9570,190 @@ main_menu() {
 # NON-INTERACTIVE API (called by the Liuer Web worker and legacy liuercp)
 # =============================================================================
 
+_installed_php_versions_on_disk() {
+    local ver compact
+    for ver in 5.6 7.4 8.0 8.1 8.2 8.3 8.4 8.5; do
+        compact="${ver//./}"
+        [[ -d "/etc/php/${ver}/fpm" || -d "/etc/opt/remi/php${compact}/php-fpm.d" ]] && printf '%s ' "$ver"
+    done
+    return 0
+}
+
+_api_require_active_site() {
+    local domain="$1"
+    validate_domain "$domain" || { log_error "Invalid domain."; return 1; }
+    local meta="${SITES_META_DIR}/${domain}.conf" conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ -f "$meta" && -f "$conf" && ! -L "$meta" && ! -L "$conf" ]] || { log_error "Active site metadata/config is missing."; return 1; }
+    [[ ! -f "${conf}.disabled" ]] && ! grep -q '^STATUS=locked$' "$meta" || { log_error "Unlock this site first."; return 1; }
+}
+
+_api_download_laravel() {
+    local site_dir="$1" site_user="$2" php_ver="$3" mode="$4" framework_version="$5"
+    local php_bin composer_bin composer_tmp
+    php_bin=$(get_php_bin "$php_ver")
+    [[ -x "$php_bin" ]] || { log_error "Selected PHP CLI is not installed."; return 1; }
+    [[ "$("$php_bin" -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')" == "$php_ver" ]] \
+        || { log_error "The selected PHP CLI does not match PHP ${php_ver}. Install its CLI package first."; return 1; }
+    composer_bin=$(command -v composer || true)
+    if [[ -z "$composer_bin" ]]; then
+        composer_tmp=$(mktemp) || return 1
+        if ! curl -fsSL --max-time 120 https://getcomposer.org/download/latest-stable/composer.phar -o "$composer_tmp" \
+            || ! "$php_bin" "$composer_tmp" --version >/dev/null 2>&1 \
+            || ! install -m 755 -o root -g root "$composer_tmp" /usr/local/bin/composer; then
+            rm -f "$composer_tmp"; log_error "Could not install Composer."; return 1
+        fi
+        rm -f "$composer_tmp"
+        composer_bin=/usr/local/bin/composer
+    fi
+    [[ ! -e "$site_dir" ]] || { log_error "Laravel target already exists."; return 1; }
+    install -d -o "$site_user" -g "$site_user" -m 750 "$site_dir" || return 1
+    _prepare_php_runtime_dirs "$SELECTED_DOMAIN" "$site_user" >/dev/null || return 1
+    local -a composer_args=(create-project laravel/laravel "$site_dir" --prefer-dist --no-interaction)
+    [[ "$mode" == "version" ]] && composer_args+=("^${framework_version}")
+    # Composer and application scripts execute with this site's Linux identity.
+    _run_as_site_user "$site_user" env COMPOSER_HOME="${PHP_RUNTIME_BASE}/${SELECTED_DOMAIN}/composer" \
+        "$php_bin" "$composer_bin" "${composer_args[@]}"
+}
+
+_api_web_site_action() {
+    local action="$1" domain="$2" value="${3:-}" extra="${4:-}"
+    local LIUER_NONINTERACTIVE=1
+    _api_require_active_site "$domain" || return 1
+    local meta="${SITES_META_DIR}/${domain}.conf" conf="${NGINX_CONF_DIR}/${domain}.conf"
+    # Restore maintenance first; otherwise an old saved vhost could undo changes.
+    [[ "$action" == "settings" && "$value" == "maintenance" ]] || \
+        [[ ! -e "${conf}.premaint" ]] || { log_error "Disable maintenance before changing this site."; return 1; }
+    case "$action" in
+        type) change_site_type "$domain" "$value" "$extra" ;;
+        php) _api_set_php_version "$domain" "$value" ;;
+        reload) _api_restart_php "$domain" ;;
+        repair)
+            [[ -s "$conf" ]] && { log_info "Vhost is non-empty; preserved unchanged."; return 0; }
+            repair_empty_site_vhost "$domain" ;;
+        permissions)
+            local site_user site_dir
+            site_user=$(grep '^WEB_USER=' "$meta" | cut -d= -f2-)
+            site_dir=$(grep '^SITE_DIR=' "$meta" | cut -d= -f2-)
+            [[ "$site_user" =~ ^[a-zA-Z0-9_-]+$ && "$site_user" != root ]] && id "$site_user" >/dev/null 2>&1 \
+                || { log_error "Invalid site user."; return 1; }
+            [[ "$site_dir" == "/home/web/${site_user}/${domain}" || "$site_dir" == "/var/www/${domain}" ]] \
+                && [[ -d "$site_dir" && ! -L "$site_dir" ]] || { log_error "Invalid site directory."; return 1; }
+            if grep -qE '^PERMISSION_PROFILE=framework_(hardened|strict)$' "$meta"; then
+                local candidate
+                for candidate in "${site_dir}/storage" "${site_dir}/bootstrap/cache" "${site_dir}/public_html/wp-content"; do
+                    _realpath_within_site "$site_dir" "$candidate" 0 >/dev/null || { log_error "A framework directory escapes this site; permission repair refused."; return 1; }
+                done
+            fi
+            _set_site_perms "$site_dir" "$site_user" || return 1
+            _repair_sftp_perms "$domain" || return 1
+            _repair_nginx_sockets "$domain" || return 1
+            log_success "Permissions repaired only for ${domain}." ;;
+        profile)
+            case "$value" in editable|framework_hardened|framework_strict) ;; *) log_error "Invalid permission profile."; return 1 ;; esac
+            grep -qE '^TYPE=(wordpress|laravel)$' "$meta" || { log_error "Permission profiles require WordPress or Laravel."; return 1; }
+            local profile_backup
+            profile_backup=$(mktemp "${CONFIG_DIR}/permission-profile.XXXXXX") || return 1
+            cp -a "$meta" "$profile_backup" || return 1
+            if [[ "$value" == editable ]]; then
+                if ! _site_meta_set "$domain" PERMISSION_PROFILE editable || ! _api_web_site_action permissions "$domain"; then
+                    cp -a "$profile_backup" "$meta"; return 1
+                fi
+            else
+                _apply_framework_permissions "$domain" 0 "$value" || { cp -a "$profile_backup" "$meta"; return 1; }
+            fi
+            log_success "Permission profile updated for ${domain}." ;;
+        settings)
+            case "$value:$extra" in gzip:0|gzip:1|static_cache:0|static_cache:1|routing:enable|routing:disable|maintenance:enable|maintenance:disable) ;; *) log_error "Invalid site setting."; return 1 ;; esac
+            [[ -s "$conf" ]] || { log_error "Repair the empty vhost first."; return 1; }
+            local backup had_maintenance=0
+            backup=$(mktemp -d "${CONFIG_DIR}/site-settings.XXXXXX") || return 1
+            chmod 700 "$backup"
+            cp -a "$conf" "${backup}/nginx.conf" || return 1
+            [[ -e "${conf}.premaint" ]] && { cp -a "${conf}.premaint" "${backup}/premaint" || return 1; had_maintenance=1; }
+            if ! (case "$value" in
+                gzip) _api_set_gzip "$domain" "$extra" ;;
+                static_cache) _api_set_static_cache "$domain" "$extra" ;;
+                routing) _api_set_routing "$domain" "$extra" ;;
+                maintenance) _api_set_maintenance "$domain" "$extra" ;;
+            esac) || ! nginx -t || ! nginx -s reload; then
+                cp -a "${backup}/nginx.conf" "$conf"
+                if [[ "$had_maintenance" == 1 ]]; then cp -a "${backup}/premaint" "${conf}.premaint"; else rm -f "${conf}.premaint"; fi
+                nginx -t >/dev/null 2>&1 && nginx -s reload >/dev/null 2>&1 || true
+                log_error "Site settings failed; original vhost restored. Backup: ${backup}"; return 1
+            fi
+            log_success "Site setting updated; previous config: ${backup}" ;;
+        *) log_error "Unknown site operation."; return 1 ;;
+    esac
+}
+
+_api_web_cache() {
+    local action="$1" cache_type="$2" domain="${3:-}" value="${4:-}"
+    local LIUER_NONINTERACTIVE=1
+    case "$cache_type" in redis|memcached) ;; *) log_error "Invalid cache type."; return 1 ;; esac
+    if [[ "$action" == "global" ]]; then
+        local service; service=$(_global_cache_service "$cache_type") || { log_error "Shared cache is not installed."; return 1; }
+        case "$domain" in enable) systemctl enable --now "$service" ;; disable) systemctl disable --now "$service" ;; *) return 1 ;; esac
+        return $?
+    fi
+    _api_require_active_site "$domain" || return 1
+    local service="liuer-${cache_type}-${domain}.service" socket="/run/liuer-${cache_type}-${domain}/${cache_type}.sock"
+    case "$action" in
+        configure)
+            local backup service_file="/etc/systemd/system/${service}" conf="${ISOLATED_CACHE_DIR}/${domain}.${cache_type}.conf"
+            local was_active=0 was_enabled=0
+            backup=$(mktemp -d "${CONFIG_DIR}/cache-change.XXXXXX") || return 1
+            chmod 700 "$backup"
+            cp -a "${SITES_META_DIR}/${domain}.conf" "${backup}/site.conf" || return 1
+            [[ ! -f "$service_file" ]] || cp -a "$service_file" "${backup}/service" || return 1
+            [[ ! -f "$conf" ]] || cp -a "$conf" "${backup}/cache.conf" || return 1
+            systemctl is-active --quiet "$service" && was_active=1
+            systemctl is-enabled --quiet "$service" && was_enabled=1
+            if ! setup_isolated_cache "$cache_type" "$domain" "$value"; then
+                systemctl stop "$service" >/dev/null 2>&1 || true
+                if [[ -f "${backup}/service" ]]; then cp -a "${backup}/service" "$service_file"; else rm -f "$service_file"; fi
+                if [[ -f "${backup}/cache.conf" ]]; then cp -a "${backup}/cache.conf" "$conf"; else rm -f "$conf"; fi
+                cp -a "${backup}/site.conf" "${SITES_META_DIR}/${domain}.conf"
+                systemctl daemon-reload
+                if [[ "$was_enabled" == 1 ]]; then systemctl enable "$service" >/dev/null 2>&1 || true; else systemctl disable "$service" >/dev/null 2>&1 || true; fi
+                [[ "$was_active" != 1 ]] || systemctl start "$service" >/dev/null 2>&1 || true
+                log_error "Cache configuration failed; previous config and metadata restored. Backup: ${backup}"; return 1
+            fi ;;
+        remove)
+            systemctl disable --now "$service" || return 1
+            rm -f "/etc/systemd/system/${service}" "${ISOLATED_CACHE_DIR}/${domain}.${cache_type}.conf"
+            # Keep cache data so disabling is recoverable. A later enable may reuse it.
+            local prefix="${cache_type^^}"
+            sed -i "/^CACHE_${prefix}_SOCKET=/d; /^CACHE_${prefix}_MAXMEM_MB=/d" "${SITES_META_DIR}/${domain}.conf"
+            systemctl daemon-reload ;;
+        flush)
+            [[ -S "$socket" ]] || { log_error "Isolated cache socket is unavailable."; return 1; }
+            if [[ "$cache_type" == redis ]]; then redis-cli -s "$socket" FLUSHDB; else
+                python3 - "$socket" <<'PY'
+import socket, sys
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+    client.settimeout(3)
+    client.connect(sys.argv[1])
+    client.sendall(b'flush_all\r\n')
+    if not client.recv(64).startswith(b'OK'):
+        raise SystemExit(1)
+PY
+            fi ;;
+        *) return 1 ;;
+    esac
+}
+
+_api_web_backup_schedule() {
+    local domain="$1" frequency="$2" hour="$3" minute="$4" weekday="$5" keep="$6" type="$7"
+    _api_require_active_site "$domain" || return 1
+    case "$frequency" in off|daily|weekly) ;; *) log_error "Invalid frequency."; return 1 ;; esac
+    [[ "$hour" =~ ^[0-9]{1,2}$ && "$minute" =~ ^[0-9]{1,2}$ && "$weekday" =~ ^[0-6]$ && "$keep" =~ ^[1-9][0-9]{0,2}$ && "$type" =~ ^[1-3]$ ]] \
+        && (( 10#$hour < 24 && 10#$minute < 60 && keep <= 365 )) || { log_error "Invalid backup schedule."; return 1; }
+    local entry="" day="*"
+    [[ "$frequency" == weekly ]] && day="$weekday"
+    [[ "$frequency" != off ]] && entry="$((10#$minute)) $((10#$hour)) * * ${day} /usr/local/bin/liuer _cron_backup ${domain} ${keep} ${type} >> /var/log/liuer-panel.log 2>&1"
+    _replace_backup_schedule_entry "$domain" "$entry"
+}
+
 _api_rollback_new_site() {
     local domain="$1" site_user="$2" site_dir="$3" php_ver="${4:-}"
     rm -f "${NGINX_CONF_DIR}/${domain}.conf" "${NGINX_CONF_DIR}/${domain}.conf.disabled"
@@ -9228,10 +9769,15 @@ _api_rollback_new_site() {
 
 _api_create_site() {
     local domain="$1" type="${2:-php}" php_ver="${3:-8.2}"
-    local source_mode="${4:-empty}" with_db="${5:-0}"
+    local source_mode="${4:-empty}" with_db="${5:-0}" framework_version="${6:-}"
     [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
     validate_domain "$domain" || { log_error "Invalid domain: $domain"; exit 1; }
-    [[ -f "${NGINX_CONF_DIR}/${domain}.conf" ]] && { log_error "Domain already exists: $domain"; exit 1; }
+    [[ -e "${SITES_META_DIR}/${domain}.conf" || -e "${NGINX_CONF_DIR}/${domain}.conf" || -e "${NGINX_CONF_DIR}/${domain}.conf.disabled" ]] && { log_error "Domain already exists: $domain"; exit 1; }
+    case "$type:$source_mode" in php:empty|php:demo|wordpress:empty|wordpress:latest|laravel:empty|laravel:latest|laravel:version|static:empty) ;; *) log_error "Unsupported site type or source mode."; return 1 ;; esac
+    if [[ "$type" != "static" ]]; then
+        [[ " $(_installed_php_versions_on_disk) " == *" ${php_ver} "* && -n "$php_ver" ]] || { log_error "PHP-FPM version is not installed."; return 1; }
+    fi
+    [[ "$source_mode" != "version" || "$framework_version" =~ ^[0-9]{1,2}(\.[0-9]{1,3}){0,2}$ ]] || { log_error "Invalid Laravel version."; return 1; }
 
     SELECTED_WEB_USER=""
     SELECTED_DOMAIN="$domain"
@@ -9242,6 +9788,13 @@ _api_create_site() {
     local site_dir="/home/web/${site_user}/${domain}"
     local web_root
     [[ "$type" == "laravel" ]] && web_root="${site_dir}/public" || web_root="${site_dir}/public_html"
+    if [[ "$type" == "laravel" && "$source_mode" != "empty" ]]; then
+        if ! _api_download_laravel "$site_dir" "$site_user" "$php_ver" "$source_mode" "$framework_version"; then
+            _api_rollback_new_site "$domain" "$site_user" "$site_dir" "$php_ver"
+            log_error "Laravel source installation failed. Review PHP compatibility and Composer output."
+            return 1
+        fi
+    fi
     mkdir -p "$web_root"
     mkdir -p "${web_root}/.well-known/acme-challenge"
 
@@ -9255,7 +9808,7 @@ _api_create_site() {
             socket=$(get_php_pool_socket "$php_ver" "$domain")
             nginx_tpl_php "$domain" "$web_root" "$socket" > "$nginx_conf"
             create_php_pool "$php_ver" "$domain" "$site_user" 0 "$site_dir"
-            printf '<?php echo "<h1>Site is ready!</h1>";\n' > "${web_root}/index.php"
+            [[ "$source_mode" == "demo" ]] && printf '<?php echo "<h1>Site is ready!</h1>";\n' > "${web_root}/index.php"
             ;;
         laravel)
             socket=$(get_php_pool_socket "$php_ver" "$domain")
@@ -9325,7 +9878,8 @@ _api_create_site() {
         echo "SITE_DIR=${site_dir}"
         echo "WEB_ROOT=${web_root}"
         echo "INDEX_FILE=index.php"
-        [[ "$type" == "wordpress" ]] && echo "SOURCE_MODE=${source_mode}"
+        echo "SOURCE_MODE=${source_mode}"
+        [[ "$type" == "laravel" ]] && echo "LARAVEL_VERSION=${framework_version:-$source_mode}"
         echo "STATUS=active"
     } > "$meta"
     chmod 600 "$meta"
@@ -9334,7 +9888,7 @@ _api_create_site() {
         local _php_svc; _php_svc=$(get_php_service "$php_ver")
         systemctl reload "$_php_svc" 2>/dev/null || systemctl restart "$_php_svc" 2>/dev/null || true
     fi
-    if ! nginx -t &>/dev/null; then
+    if [[ ! -s "$nginx_conf" ]] || ! nginx -t &>/dev/null; then
         _api_rollback_new_site "$domain" "$site_user" "$site_dir" "$php_ver"
         rm -f "$meta"
         log_error "Nginx rejected the generated website configuration. Changes were rolled back."
@@ -10184,7 +10738,8 @@ HTML
             printf '    error_page 503 @maintenance;\n'
             printf '    location @maintenance { root %s; rewrite ^ /index.html break; }\n' "$_mdir"
             echo "}"
-        } > "$nginx_conf"
+        } > "${nginx_conf}.maintenance-new"
+        mv -f "${nginx_conf}.maintenance-new" "$nginx_conf" || return 1
         log_success "Maintenance ON: $domain"
     else
         [[ ! -f "${nginx_conf}.premaint" ]] && { log_info "Not in maintenance: $domain"; exit 0; }
@@ -10196,41 +10751,62 @@ HTML
 
 _api_set_php_version() {
     local domain="$1" new_php="$2"
-    [[ -z "$domain" || -z "$new_php" ]] && { log_error "Domain and PHP version required"; exit 1; }
-
+    _api_require_active_site "$domain" || return 1
+    [[ " $(_installed_php_versions_on_disk) " == *" ${new_php} "* && -n "$new_php" ]] || { log_error "PHP-FPM version is not installed."; return 1; }
     local nginx_conf="${NGINX_CONF_DIR}/${domain}.conf"
-    [[ ! -f "$nginx_conf" ]] && { log_error "Site not found: $domain"; exit 1; }
-
     local meta="${SITES_META_DIR}/${domain}.conf"
+    grep -q '^TYPE=static$' "$meta" && { log_error "Change the static site type before assigning PHP."; return 1; }
+    [[ ! -e "${nginx_conf}.premaint" ]] || { log_error "Disable maintenance first."; return 1; }
     local old_php; old_php=$(grep "^PHP_VERSION=" "$meta" 2>/dev/null | cut -d= -f2)
     local site_user; site_user=$(grep "^WEB_USER=" "$meta" 2>/dev/null | cut -d= -f2)
     local site_path; site_path=$(grep "^SITE_DIR=" "$meta" 2>/dev/null | cut -d= -f2)
 
     local new_socket; new_socket=$(get_php_pool_socket "$new_php" "$domain")
-    local old_socket; old_socket=$(grep -oP '(?<=fastcgi_pass unix:)[^;]+' "$nginx_conf" 2>/dev/null | head -1 | tr -d ' ' || true)
+    local old_socket; old_socket=$(awk '/^[[:space:]]*fastcgi_pass[[:space:]]+unix:/ {sub(/^.*unix:/, ""); sub(/;.*/, ""); gsub(/[[:space:]]/, ""); print; exit}' "$nginx_conf")
 
-    [[ "$old_socket" == "$new_socket" ]] && { log_info "Already on PHP $new_php for $domain"; exit 0; }
-
-    local old_pool=""
+    [[ -n "$old_socket" && $(grep -cE '^[[:space:]]*fastcgi_pass[[:space:]]+unix:' "$nginx_conf") == 1 ]] || { log_error "Unsupported or empty PHP vhost; no changes made."; return 1; }
+    [[ "$old_socket" == "$new_socket" ]] && { log_info "Already on PHP $new_php for $domain"; return 0; }
+    [[ "$site_user" =~ ^[a-zA-Z0-9_-]+$ && "$site_user" != root && -d "$site_path" ]] && id "$site_user" >/dev/null 2>&1 \
+        || { log_error "Invalid site user or directory."; return 1; }
+    local backup old_pool="" new_pool had_new_pool=0
+    backup=$(mktemp -d "${CONFIG_DIR}/php-switch.XXXXXX") || return 1
+    chmod 700 "$backup"
+    cp -a "$nginx_conf" "${backup}/nginx.conf" && cp -a "$meta" "${backup}/site.conf" || return 1
+    new_pool=$(get_php_pool_conf "$new_php" "$domain")
+    if [[ -e "$new_pool" ]]; then cp -a "$new_pool" "${backup}/new-pool.conf" || return 1; had_new_pool=1; fi
+    local tmp_conf tmp_meta failed=0
+    tmp_conf=$(mktemp "${NGINX_CONF_DIR}/.${domain}.php.XXXXXX") || return 1
+    tmp_meta=$(mktemp "${SITES_META_DIR}/.${domain}.php.XXXXXX") || { rm -f "$tmp_conf"; return 1; }
+    if ! awk -v socket="$new_socket" '/^[[:space:]]*fastcgi_pass[[:space:]]+unix:/ {$0="        fastcgi_pass unix:" socket ";"} {print}' "$nginx_conf" > "$tmp_conf" \
+        || ! awk -v version="$new_php" '/^PHP_VERSION=/ {if (!found++) print "PHP_VERSION=" version; next} {print} END {if (!found) print "PHP_VERSION=" version}' "$meta" > "$tmp_meta" \
+        || ! chmod 644 "$tmp_conf" || ! chmod 600 "$tmp_meta"; then
+        rm -f "$tmp_conf" "$tmp_meta"; return 1
+    fi
     [[ -n "$old_php" ]] && old_pool=$(get_php_pool_conf "$old_php" "$domain" 2>/dev/null || true)
-    create_php_pool "$new_php" "$domain" "$site_user" 0 "$site_path"
+    create_php_pool "$new_php" "$domain" "$site_user" 0 "$site_path" || failed=1
 
     if [[ -n "$old_pool" && -f "$old_pool" ]]; then
-        local new_pool; new_pool=$(get_php_pool_conf "$new_php" "$domain")
         for _k in "php_admin_value[upload_max_filesize]" "php_admin_value[post_max_size]" \
-                  "php_value[memory_limit]" "php_admin_value[max_execution_time]"; do
-            local _v; _v=$(grep "^${_k} = " "$old_pool" 2>/dev/null | cut -d= -f2- | xargs)
-            [[ -n "$_v" ]] && _php_pool_set "$new_pool" "$_k" "$_v" || true
+                  "php_value[memory_limit]" "php_admin_value[memory_limit]" "php_admin_value[max_execution_time]" \
+                  "php_admin_value[max_input_time]" "php_admin_value[disable_functions]"; do
+            local _v; _v=$(grep -F "${_k} = " "$old_pool" 2>/dev/null | head -1 | cut -d= -f2- | xargs || true)
+            if [[ -n "$_v" ]]; then _php_pool_set "$new_pool" "$_k" "$_v" || failed=1; fi
         done
     fi
 
-    sed -i "s|fastcgi_pass unix:${old_socket}|fastcgi_pass unix:${new_socket}|g" "$nginx_conf"
-    sed -i "s|^PHP_VERSION=.*|PHP_VERSION=${new_php}|" "$meta"
-    grep -q "^PHP_VERSION=" "$meta" || echo "PHP_VERSION=${new_php}" >> "$meta"
-
-    nginx -t &>/dev/null && nginx -s reload
     local svc; svc=$(get_php_service "$new_php")
-    systemctl restart "$svc" 2>/dev/null || true
+    if [[ "$failed" == 1 || ! -s "$new_pool" ]] || ! mv -f "$tmp_conf" "$nginx_conf" || ! mv -f "$tmp_meta" "$meta" \
+        || ! systemctl reload "$svc" || ! nginx -t || ! nginx -s reload; then
+        rm -f "$tmp_conf" "$tmp_meta"
+        cp -a "${backup}/nginx.conf" "$nginx_conf"
+        cp -a "${backup}/site.conf" "$meta"
+        if [[ "$had_new_pool" == 1 ]]; then cp -a "${backup}/new-pool.conf" "$new_pool"; else rm -f "$new_pool"; fi
+        systemctl reload "$svc" >/dev/null 2>&1 || true
+        nginx -t >/dev/null 2>&1 && nginx -s reload >/dev/null 2>&1 || true
+        log_error "PHP switch failed; original config, pool and metadata restored. Backup: ${backup}"; return 1
+    fi
+    [[ -z "$old_php" || "$old_php" == "$new_php" ]] || remove_php_pool "$old_php" "$domain"
+    lcp_notify "site_updated" "\"domain\":\"${domain}\",\"php_version\":\"${new_php}\""
     log_success "PHP version changed to $new_php for $domain"
 }
 
@@ -10416,6 +10992,17 @@ main() {
             repair_empty_site_vhost "${2:-}"
             ;;
 
+        php-maintenance)
+            check_root; detect_os
+            case "${2:-menu}" in
+                audit) php_maintenance_audit ;;
+                apply) shift 2; php_maintenance_apply "$@" ;;
+                rollback) [[ $# == 4 ]] || { log_error "Usage: liuer php-maintenance rollback RUN_ID DOMAIN"; return 1; }; php_maintenance_rollback "$3" "$4" ;;
+                menu) php_maintenance_menu ;;
+                *) log_error "Usage: liuer php-maintenance [audit|apply --confirm [DOMAIN:FINGERPRINT ...]|rollback RUN_ID DOMAIN]"; return 1 ;;
+            esac
+            ;;
+
         # ── Auto repair (called internally after update, no interaction) ──────
         _repair_auto)
             check_root
@@ -10470,6 +11057,7 @@ main() {
             echo "  check-update   Check if a new version is available"
             echo "  version        Show current version"
             echo "  web-panel      Install or manage the optional browser panel"
+            echo "  php-maintenance  Audit/update runtimes; migrate only confirmed 8.0/8.1 sites"
             echo "  help           Show this help"
             echo ""
             ;;
@@ -10494,7 +11082,22 @@ main() {
             ;;
 
         # ── Internal API (called non-interactively by liuercp) ────────────────
-        create_site)       check_root; detect_os; _api_create_site    "${2:-}" "${3:-php}" "${4:-8.2}" "${5:-empty}" "${6:-0}" ;;
+        create_site)       check_root; detect_os; _api_create_site    "${2:-}" "${3:-php}" "${4:-8.2}" "${5:-empty}" "${6:-0}" "${7:-}" ;;
+        web_site_action)   check_root; detect_os; _api_web_site_action "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+        web_panel_grants)  check_root; detect_os; _apply_web_panel_db_grants ;;
+        web_cache)         check_root; detect_os; _api_web_cache "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+        web_backup_schedule) check_root; detect_os; _api_web_backup_schedule "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" ;;
+        web_php)
+            check_root; detect_os
+            LIUER_NONINTERACTIVE=1
+            case "${2:-}" in
+                install) install_php_version "${3:-}" ;;
+                extension)
+                    [[ " $(_installed_php_versions_on_disk) " == *" ${3:-} "* && -n "${3:-}" ]] || { log_error "PHP is not installed."; return 1; }
+                    case "${4:-}" in redis|memcached|imagick|intl|zip|gd|mbstring|curl|bcmath|soap|xml|mysql|pgsql|sqlite3|opcache) ;; *) log_error "Unsupported extension."; return 1 ;; esac
+                    install_php_extension_for_version "$3" "$4" 0 ;;
+                *) log_error "Unknown PHP operation."; return 1 ;;
+            esac ;;
         delete_site)       check_root; detect_os; _api_delete_site    "${2:-}" ;;
         create_db)         check_root; detect_os; _api_create_db      "${2:-}" "${3:-mysql}" ;;
         delete_db)         check_root; detect_os; _api_delete_db      "${2:-}" ;;
@@ -10515,6 +11118,7 @@ main() {
         request_ssl)       check_root; detect_os; _api_request_ssl   "${2:-}" "${3:-}" ;;
         install_custom_ssl) check_root; detect_os; _api_install_custom_ssl "${2:-}" "${3:-}" "${4:-}" ;;
         disable_ssl)       check_root; detect_os; _api_disable_ssl   "${2:-}" ;;
+        remove_ssl)        check_root; detect_os; _api_require_active_site "${2:-}" && _remove_managed_ssl "$2" ;;
         test_ssl_renewal)  check_root; detect_os; _api_test_ssl_renewal ;;
 
         get_advanced_settings) detect_os; _api_get_advanced_settings "${2:-}" ;;
