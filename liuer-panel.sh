@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.17"
+readonly VERSION="2.7.18"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -6647,6 +6647,63 @@ _php_maint_system_audit() {
     printf 'note\tGlobal CLI changes require separate confirmation: liuer php-maintenance system-cli. Site/FPM maintenance does not opt into this.\n'
 }
 
+_php_maint_native_candidates() {
+    # DNF4 module provides prints a package NEVRA followed by its Module field.
+    # Unlike repoquery %{modularitylabel}, this works with EL8/EL9 DNF Package
+    # objects and includes inactive streams WITHOUT enabling/resetting them.
+    # Pair fields within each package block; never borrow a nearby module label
+    # or accept a source/foreign-architecture/pre-release artifact as a target.
+    LC_ALL=C awk -v arch="$1" '
+        /^[[:space:]]*$/ { version=""; next }
+        /^[[:space:]]*php-cli-/ {
+            version=""
+            line=$0; sub(/^[[:space:]]*/,"",line); sub(/[[:space:]]*$/,"",line)
+            if (line !~ /^php-cli-([0-9]+:)?[0-9]+\.[0-9]+\.[0-9]+-[A-Za-z0-9._+~^-]+\.[A-Za-z0-9_]+$/) next
+            package_arch=line; sub(/^.*\./,"",package_arch)
+            if (package_arch != arch || package_arch == "src" || package_arch == "nosrc") next
+            sub(/^php-cli-/,"",line); sub(/^[0-9]+:/,"",line); sub(/-.*/,"",line)
+            version=line; next
+        }
+        /^[[:space:]]*Module[[:space:]]*:/ {
+            line=$0; sub(/^[[:space:]]*Module[[:space:]]*:[[:space:]]*/,"",line)
+            sub(/[[:space:]]*$/,"",line)
+            if (version != "" && line ~ /^php:(8\.2|remi-8\.2):[A-Za-z0-9_.+-]+:[A-Za-z0-9_.+-]+:[A-Za-z0-9_]+$/) {
+                split(line,module_fields,":")
+                if (module_fields[5] == arch) print version "\t" module_fields[2]
+            }
+            version=""; next
+        }
+        { version="" }
+    ' "$2"
+}
+
+_php_maint_native_plan_safe() {
+    local versions version minimum
+    minimum=$(_php_maint_minimum "$2") || return 1
+    # In real DNF output, "php 8.2" under Enabling module streams is NOT the
+    # mod_php RPM. Inspect package sections, while rejecting destructive plans
+    # everywhere and requiring the actual planned CLI version to meet the floor.
+    versions=$(LC_ALL=C awk '
+        /^[[:space:]]*(Removing|Downgrading|Replacing|Obsoleting)/ { bad=1 }
+        /^Transaction Summary/ { summary=1 }
+        /^[^[:space:]]/ {
+            packages=($0 ~ /^(Installing|Upgrading|Reinstalling)[^:]*:/ && $0 !~ /module (streams|profiles):/)
+            next
+        }
+        packages {
+            if ($1 == "php" || $1 ~ /^php-fpm/ || $1 ~ /^php[57][0-9]-/ || $1 ~ /^php8[0-9]-/) bad=1
+            if ($1 == "php-cli") {
+                if (NF < 3) { bad=1; next }
+                version=$3; sub(/^[0-9]+:/,"",version); sub(/-.*/,"",version)
+                print version
+            }
+        }
+        END { if (bad || !summary) exit 1 }
+    ' "$1") || return 1
+    [[ -n "$versions" ]] || return 1
+    while IFS= read -r version; do _php_maint_at_least "$version" "$minimum" || return 1; done <<< "$versions"
+}
+
 # Separate confirmation: the default CLI affects every /usr/bin/php consumer.
 # Never overwrite a package-owned binary with a symlink, remove packages or
 # change user/group/queue commands as a side effect of site maintenance.
@@ -6655,7 +6712,7 @@ php_maintenance_system_cli() {
     umask 077
     local confirmed=0
     case "$#:${1:-}" in 0:) ;; 1:--confirm-system-cli) confirmed=1 ;; *) log_error 'Use system-cli [--confirm-system-cli]'; return 1 ;; esac
-    local current branch owner target target_version missing old_modules new_modules report resolved after candidate stream line label
+    local current branch owner target target_version missing old_modules new_modules report resolved after candidate stream line native_arch
     [[ -x /usr/bin/php ]] || { log_error '/usr/bin/php is missing; install a supported CLI first.'; return 1; }
     current=$(_php_maint_version /usr/bin/php); branch="${current%.*}"
     case "$branch" in 5.*|7.*) log_warn 'System PHP below 8 is left unchanged.'; return 0 ;; 8.0|8.1|8.2|8.3|8.4|8.5) ;; *) log_error 'Unknown/custom system CLI; no changes.'; return 1 ;; esac
@@ -6718,34 +6775,51 @@ php_maintenance_system_cli() {
             if rpm -q php-fpm >/dev/null 2>&1 || rpm -q php >/dev/null 2>&1; then
                 log_error 'Native FPM/mod_php is installed. System CLI shares these packages; manual review required, not a CLI-only change.'; return 1
             fi
-            rpm -qa > "${report}/packages-before.txt"
+            rpm -qa > "${report}/packages-before.txt" || { log_error "Cannot save package inventory; no package changes. Report: $report"; return 1; }
             local -a config_paths=()
             [[ ! -e /etc/php.ini ]] || config_paths+=(/etc/php.ini)
             [[ ! -e /etc/php.d ]] || config_paths+=(/etc/php.d)
-            [[ -z "${config_paths[*]:-}" ]] || tar -cpf "${report}/config.tar" "${config_paths[@]}" || return 1
+            [[ -z "${config_paths[*]:-}" ]] || tar -cpf "${report}/config.tar" "${config_paths[@]}" || { log_error "Cannot back up native PHP config; no package changes. Report: $report"; return 1; }
             while IFS= read -r package; do [[ -z "$package" ]] || packages+=("$package"); done < <(rpm -qa --qf '%{NAME}\n' | awk '/^php(-|$)/ {print}')
-            [[ -n "${packages[*]:-}" ]] || return 1
+            [[ -n "${packages[*]:-}" ]] || { log_error "No native PHP packages found; no package changes. Report: $report"; return 1; }
             local -a operation=()
             local target_branch="$branch"
             if [[ "$branch" == 8.0 || "$branch" == 8.1 ]]; then
                 target_branch=8.2
                 [[ "$OS_VERSION_ID" == 8 || "$OS_VERSION_ID" == 9 ]] || { log_error 'Native stream migration supported only on modular EL8/EL9; refused.'; return 1; }
-                # Inspect enabled/trusted repos without enabling any new repo.
-                # Filter by the precise module stream as well as PHP version.
-                dnf --refresh -q repoquery --available --disable-modular-filtering \
-                    --qf '%{version}|%{modularitylabel}' php-cli > "${report}/candidates.txt" 2>"${report}/candidate-error.log" || return 1
+                native_arch=$(rpm -q --qf '%{ARCH}\n' php-cli) || { log_error 'Cannot determine native CLI architecture; no package changes.'; return 1; }
+                [[ "$native_arch" =~ ^[A-Za-z0-9_]+$ && "$native_arch" != src && "$native_arch" != nosrc ]] || { log_error 'Unrecognized native CLI architecture; refused.'; return 1; }
+                log_info 'Checking native PHP module candidates in existing repositories (DNF)...'
+                if ! LC_ALL=C dnf --refresh --color=never -q module provides php-cli > "${report}/module-candidates.txt" 2>"${report}/candidate-error.log"; then
+                    log_error "DNF module candidate query failed; no package changes. Details: $report/candidate-error.log"
+                    tail -n 25 "${report}/candidate-error.log" >&2
+                    return 1
+                fi
+                _php_maint_native_candidates "$native_arch" "${report}/module-candidates.txt" > "${report}/candidates.txt" || { log_error "Cannot parse module candidates; no package changes. Report: $report"; return 1; }
                 stream=''
-                while IFS='|' read -r candidate label; do
-                    [[ "$label" == php:8.2:* || "$label" == php:remi-8.2:* ]] || continue
+                while IFS=$'\t' read -r candidate line; do
                     _php_maint_at_least "$candidate" "$(_php_maint_minimum 8.2)" || continue
-                    stream="${label#php:}"; stream="${stream%%:*}"
+                    stream="$line"
                     [[ "$stream" != 8.2 ]] || break
                 done < "${report}/candidates.txt"
-                [[ "$stream" == 8.2 || "$stream" == remi-8.2 ]] || { log_error 'No verified native PHP 8.2 stream in enabled repositories. No repo/module reset performed.'; return 1; }
-                dnf -q module list php --enabled > "${report}/modules-before.txt" 2>&1 || return 1
+                [[ "$stream" == 8.2 || "$stream" == remi-8.2 ]] || { log_error "No verified native PHP 8.2 stream in enabled repositories. No repo/module reset performed. Details: $report/module-candidates.txt"; return 1; }
+                # EL9's native PHP 8.0 can be non-modular, with no enabled PHP
+                # stream. Without a module-name filter, DNF correctly returns
+                # success for an empty inventory instead of "No matching Modules".
+                if ! LC_ALL=C dnf --color=never -q module list --enabled > "${report}/modules-before.txt" 2>&1; then
+                    log_error "DNF module inventory failed; no package changes. Details: $report/modules-before.txt"
+                    tail -n 25 "${report}/modules-before.txt" >&2
+                    return 1
+                fi
                 operation=(module switch-to "php:$stream")
             else
-                candidate=$(dnf --refresh -q repoquery --latest-limit=1 --qf '%{version}' php-cli | sort -V | tail -n 1)
+                log_info 'Checking same-branch system CLI candidates (DNF)...'
+                if ! LC_ALL=C dnf --refresh --color=never -q repoquery --latest-limit=1 --qf '%{version}' php-cli > "${report}/candidates.txt" 2>"${report}/candidate-error.log"; then
+                    log_error "DNF CLI candidate query failed; no package changes. Details: $report/candidate-error.log"
+                    tail -n 25 "${report}/candidate-error.log" >&2
+                    return 1
+                fi
+                candidate=$(sort -V "${report}/candidates.txt" | tail -n 1)
                 _php_maint_at_least "$candidate" "$(_php_maint_minimum "$branch")" || { log_error 'No verified same-branch system CLI candidate; refused.'; return 1; }
                 operation=(upgrade "${packages[@]}")
             fi
@@ -6754,11 +6828,11 @@ php_maintenance_system_cli() {
             local plan_code=0
             LC_ALL=C dnf --refresh --color=never --assumeno --setopt=install_weak_deps=False \
                 --exclude='php5*' --exclude='php7*' --exclude='php8*-*' "${operation[@]}" > "${report}/plan.log" 2>&1 || plan_code=$?
-            [[ "$plan_code" == 0 || "$plan_code" == 1 ]] && grep -q '^Transaction Summary' "${report}/plan.log" \
-                && ! grep -Eiq '^[[:space:]]*(Removing|Downgrading|Replacing|Obsoleting)|^[[:space:]]+(php[[:space:]]|php-fpm|php[57][0-9]-|php8[0-9]-)' "${report}/plan.log" \
-                || { log_error "Unsupported dependency/module plan. No changes; review $report/plan.log"; return 1; }
+            [[ "$plan_code" == 0 || "$plan_code" == 1 ]] && _php_maint_native_plan_safe "${report}/plan.log" "$target_branch" \
+                || { log_error "Unsupported dependency/module plan or unverified planned CLI version. No changes; review $report/plan.log"; return 1; }
             log_warn 'Native CLI stream/package changes may affect every global PHP script. No queues will be restarted.'
             [[ "$confirmed" == 1 ]] || { command cat "${report}/plan.log"; confirm_action 'Apply this exact native runtime operation?' || return 0; }
+            log_info "Applying verified native CLI package operation; details: $report/change.log"
             LC_ALL=C dnf --refresh --color=never -y --setopt=install_weak_deps=False \
                 --exclude='php5*' --exclude='php7*' --exclude='php8*-*' "${operation[@]}" > "${report}/change.log" 2>&1 \
                 || { log_error "System CLI package operation failed. No automatic package/module downgrade; inspect $report"; return 1; }
