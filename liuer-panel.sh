@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.18"
+readonly VERSION="2.7.19"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -516,6 +516,55 @@ get_php_versions() {
             ;;
     esac
     echo "${versions[*]:-}"
+}
+
+# Fixed distro paths only: never substitute the global CLI for a site's FPM.
+# Probe the installed binary, not a long-running worker's loaded executable.
+get_php_runtime_version() {
+    local branch="$1" kind="${2:-fpm}" binary output version
+    case "$branch" in 5.6|7.4|8.0|8.1|8.2|8.3|8.4|8.5) ;; *) echo unknown; return 0 ;; esac
+    case "$OS_FAMILY:$kind" in
+        debian:fpm) binary="/usr/sbin/php-fpm${branch}" ;;
+        debian:cli) binary="/usr/bin/php${branch}" ;;
+        rhel:fpm) binary="/opt/remi/php${branch//./}/root/usr/sbin/php-fpm" ;;
+        rhel:cli) binary="/opt/remi/php${branch//./}/root/usr/bin/php" ;;
+        *) echo unknown; return 0 ;;
+    esac
+    [[ -x "$binary" ]] && command -v timeout >/dev/null 2>&1 || { echo unknown; return 0; }
+    # -n avoids loading application/extension ini settings during inventory.
+    output=$(PHP_INI_SCAN_DIR= timeout -k 1s 3s "$binary" -n -v 2>/dev/null) || { echo unknown; return 0; }
+    version=$(printf '%s\n' "$output" | sed -nE 's/^PHP ([0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+~-]*)([[:space:]].*|$)/\1/p' | head -n 1)
+    [[ -n "$version" && "$version" == "$branch".* ]] || version=unknown
+    printf '%s\n' "$version"
+}
+
+get_php_runtime_label() {
+    local version
+    version=$(get_php_runtime_version "$1" fpm)
+    printf 'PHP %s — FPM %s' "$1" "$version"
+}
+
+# Public read-only inventory. TSV fields: php, branch, installed FPM, installed CLI.
+# Keep branch identifiers unchanged in metadata and all operation arguments.
+show_php_versions() {
+    local format="${1:-table}" branch fpm cli
+    case "$format" in table|--tsv) ;; *) log_error 'Usage: liuer php-versions [--tsv]'; return 1 ;; esac
+    if [[ "$format" == table ]]; then
+        printf '\n  %-10s %-18s %s\n' 'BRANCH' 'INSTALLED FPM' 'INSTALLED CLI'
+    fi
+    for branch in $(_installed_php_versions_on_disk); do
+        fpm=$(get_php_runtime_version "$branch" fpm)
+        cli=$(get_php_runtime_version "$branch" cli)
+        if [[ "$format" == --tsv ]]; then
+            printf 'php\t%s\t%s\t%s\n' "$branch" "$fpm" "$cli"
+        else
+            printf '  %-10s %-18s %s\n' "$branch" "$fpm" "$cli"
+        fi
+    done
+    if [[ "$format" == table ]]; then
+        printf '\n  Installed binaries only; existing workers may need a separate restart.\n'
+        printf '  Version numbers alone do not verify vendor backports.\n'
+    fi
 }
 
 get_php_socket() {
@@ -1573,7 +1622,7 @@ select_php_version() {
     echo -e "\n${BOLD}Installed PHP versions:${NC}"
     local i=1
     for v in "${php_versions[@]}"; do
-        echo "  $i) PHP $v"
+        echo "  $i) $(get_php_runtime_label "$v")"
         ((i++)) || true
     done
     echo "  0) Cancel"
@@ -3054,7 +3103,9 @@ delete_website() {
 _list_websites_inline() {
     echo -e "\n${BOLD}Website list:${NC}"
     separator
-    local count=0
+    local count=0 runtime_inventory installed_fpm php_label
+    # Query each branch once, not once per site on a shared PHP runtime.
+    runtime_inventory=$(show_php_versions --tsv)
     # Check both active (.conf) and locked (.conf.disabled) nginx configs
     for conf in "${NGINX_CONF_DIR}"/*.conf "${NGINX_CONF_DIR}"/*.conf.disabled; do
         [[ -f "$conf" ]] || continue
@@ -3070,7 +3121,12 @@ _list_websites_inline() {
         local _st; _st=$(grep "^STATUS=" "$meta" 2>/dev/null | cut -d= -f2)
         [[ "$_st" == "locked" ]] && status_str=" ${RED}[LOCKED]${NC}"
 
-        printf "  %-35s PHP: %-6s SSL: %b%b\n" "$dom" "$php_ver" "$ssl_str" "$status_str"
+        php_label="$php_ver"
+        if [[ "$php_ver" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            installed_fpm=$(printf '%s\n' "$runtime_inventory" | awk -F '\t' -v branch="$php_ver" '$1 == "php" && $2 == branch {print $3; exit}')
+            php_label="$php_ver (FPM ${installed_fpm:-unknown})"
+        fi
+        printf "  %-35s PHP: %-24s SSL: %b%b\n" "$dom" "$php_label" "$ssl_str" "$status_str"
         ((count++)) || true
     done
     separator
@@ -3187,7 +3243,11 @@ show_website_detail() {
         _laravel_ver=$(grep -oP '(?<=LARAVEL_VERSION=)[^\n]*' "$meta" 2>/dev/null || true)
         _laravel_source=$(grep -oP '(?<=LARAVEL_SOURCE_MODE=)[^\n]*' "$meta" 2>/dev/null || true)
         echo -e "${BOLD}Type        :${NC} $_type"
-        echo -e "${BOLD}PHP version :${NC} $_php"
+        if [[ "$_type" != static && -n "$_php" && "$_php" != N/A ]]; then
+            echo -e "${BOLD}PHP version :${NC} $(get_php_runtime_label "$_php")"
+        else
+            echo -e "${BOLD}PHP version :${NC} N/A"
+        fi
         [[ -n "$_idx" ]] && echo -e "${BOLD}Index file  :${NC} $_idx"
         echo -e "${BOLD}Web root    :${NC} $_root"
         [[ -n "$_laravel_source" ]] && echo -e "${BOLD}Laravel src :${NC} ${_laravel_ver:-$_laravel_source}"
@@ -5920,7 +5980,7 @@ manage_php() {
                 local color="$NC"
                 [[ "$st" == "active" ]] && color="$GREEN"
                 [[ "$st" != "active" ]] && color="$YELLOW"
-                echo -e "  PHP $v — ${color}${st}${NC}"
+                echo -e "  $(get_php_runtime_label "$v") — ${color}${st}${NC}"
             done
         fi
         echo ""
@@ -5956,6 +6016,8 @@ manage_php() {
                        local svc; svc=$(get_php_service "$v")
                        local st; st=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
                        echo -e "\n  ${BOLD}PHP $v${NC}"
+                       echo -e "    FPM ver : $(get_php_runtime_version "$v" fpm)"
+                       echo -e "    CLI ver : $(get_php_runtime_version "$v" cli)"
                        echo -e "    Service : $svc ($st)"
                        echo -e "    Binary  : $(get_php_bin "$v")"
                        echo -e "    Socket  : $(get_php_socket "$v")"
@@ -6031,7 +6093,7 @@ remove_php_version() {
     local -a vers; read -ra vers <<< "$vers_str"
     echo -e "${BOLD}Installed PHP versions:${NC}"
     local i=1
-    for v in "${vers[@]}"; do echo "  $i) PHP $v"; ((i++)) || true; done
+    for v in "${vers[@]}"; do echo "  $i) $(get_php_runtime_label "$v")"; ((i++)) || true; done
 
     echo -e "${YELLOW}Select [1-${#vers[@]}]:${NC} \c"
     read -r _ch
@@ -11239,6 +11301,12 @@ main() {
             repair_empty_site_vhost "${2:-}"
             ;;
 
+        php-versions)
+            [[ $# -le 2 ]] || { log_error 'Usage: liuer php-versions [--tsv]'; return 1; }
+            detect_os
+            show_php_versions "${2:-table}"
+            ;;
+
         php-maintenance)
             check_root; detect_os
             case "${2:-menu}" in
@@ -11306,6 +11374,7 @@ main() {
             echo "  version        Show current version"
             echo "  web-panel      Install or manage the optional browser panel"
             echo "  php-maintenance  Audit/update runtimes; migrate only confirmed 8.0/8.1 sites"
+            echo "  php-versions     Show installed FPM/CLI patch versions (--tsv for inventory)"
             echo "  help           Show this help"
             echo ""
             ;;
