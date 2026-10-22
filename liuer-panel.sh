@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.16"
+readonly VERSION="2.7.17"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -6607,6 +6607,174 @@ _php_maint_candidate() {
     printf '%s\n' "$output" | sed -nE 's/^([0-9]+:)?([0-9]+\.[0-9]+\.[0-9]+)([-+].*|$)/\2/p' | sort -V | tail -n 1
 }
 
+_php_maint_system_owner() {
+    local resolved
+    resolved=$(readlink -f /usr/bin/php 2>/dev/null) || return 1
+    case "$OS_FAMILY" in
+        rhel) rpm -qf --qf '%{NAME}\n' "$resolved" 2>/dev/null ;;
+        debian) dpkg-query -S "$resolved" 2>/dev/null | sed -nE 's/^([^:]+)(:[^: ]+)?: .*/\1/p' ;;
+    esac
+}
+
+_php_maint_system_audit() {
+    local resolved current owner state minimum branch fpm
+    if [[ -x /usr/bin/php ]]; then
+        resolved=$(readlink -f /usr/bin/php 2>/dev/null || echo unknown)
+        current=$(_php_maint_version /usr/bin/php); branch="${current%.*}"
+        owner=$(_php_maint_system_owner | paste -sd, -)
+        minimum=$(_php_maint_minimum "$branch" || echo none)
+        state=unverified
+        case "$branch" in
+            5.*|7.*) state=legacy-unchanged ;;
+            8.0|8.1) state=system-cli-migration-required; minimum=8.2.35 ;;
+            8.2|8.3|8.4|8.5) _php_maint_at_least "$current" "$minimum" && state=system-cli-patched-version ;;
+        esac
+        printf 'runtime\tsystem-cli\t%s\tn/a\t%s\t%s\t%s\n' "${current:-unknown}" "$state" "$minimum" "${owner:-unmanaged}"
+        printf 'cli-path\t/usr/bin/php\t%s\n' "$resolved"
+    else printf 'note\tSystem CLI /usr/bin/php is missing; FPM inventory does not cover it.\n'; fi
+    # A native RPM FPM is separate from the parallel Remi collections as well.
+    if [[ "$OS_FAMILY" == rhel && -x /usr/sbin/php-fpm ]]; then
+        fpm=$(_php_maint_version /usr/sbin/php-fpm)
+        printf 'runtime\tsystem-fpm\tn/a\t%s\tunverified\tmanual-review\tphp-fpm\n' "${fpm:-unknown}"
+    fi
+    local pid user command executable
+    while read -r pid user command; do
+        [[ "$pid" =~ ^[0-9]+$ && "$command" =~ ^php([0-9.]+)?$ ]] || continue
+        executable=$(readlink "/proc/${pid}/exe" 2>/dev/null || true)
+        [[ -z "$executable" ]] || printf 'cli-process\t%s\t%s\t%s\n' "$pid" "$user" "$executable"
+    done < <(ps -eo pid=,user=,comm=)
+    printf 'note\tExisting CLI workers keep running their loaded runtime until gracefully restarted; FPM restarts do not restart Supervisor/cron workers.\n'
+    printf 'note\tGlobal CLI changes require separate confirmation: liuer php-maintenance system-cli. Site/FPM maintenance does not opt into this.\n'
+}
+
+# Separate confirmation: the default CLI affects every /usr/bin/php consumer.
+# Never overwrite a package-owned binary with a symlink, remove packages or
+# change user/group/queue commands as a side effect of site maintenance.
+php_maintenance_system_cli() {
+    (
+    umask 077
+    local confirmed=0
+    case "$#:${1:-}" in 0:) ;; 1:--confirm-system-cli) confirmed=1 ;; *) log_error 'Use system-cli [--confirm-system-cli]'; return 1 ;; esac
+    local current branch owner target target_version missing old_modules new_modules report resolved after candidate stream line label
+    [[ -x /usr/bin/php ]] || { log_error '/usr/bin/php is missing; install a supported CLI first.'; return 1; }
+    current=$(_php_maint_version /usr/bin/php); branch="${current%.*}"
+    case "$branch" in 5.*|7.*) log_warn 'System PHP below 8 is left unchanged.'; return 0 ;; 8.0|8.1|8.2|8.3|8.4|8.5) ;; *) log_error 'Unknown/custom system CLI; no changes.'; return 1 ;; esac
+    _php_maint_system_audit
+    if [[ "$branch" != 8.0 && "$branch" != 8.1 ]] && _php_maint_at_least "$current" "$(_php_maint_minimum "$branch")"; then
+        log_success 'System CLI binary already meets the checked patch floor; no default/stream changes.'
+        log_warn 'Existing CLI workers still need separate version/restart review.'
+        return 0
+    fi
+    log_warn 'This changes the default CLI for ALL /usr/bin/php consumers, not only selected sites. Review compatibility first.'
+    log_warn 'Running workers are NOT restarted; existing queue work is never interrupted automatically.'
+    [[ "$confirmed" == 1 ]] || confirm_action 'Maintain system CLI now (8.0/8.1 -> 8.2; 8.2+ stays in its branch)?' || return 0
+    command -v flock >/dev/null || return 1
+    exec 9>/run/liuer-php-maintenance.lock; flock -n 9 || { log_error 'Runtime maintenance already running.'; return 1; }
+    [[ "$(_php_maint_version /usr/bin/php)" == "$current" ]] || { log_error 'System CLI changed after inventory; inspect and confirm again.'; return 1; }
+    owner=$(_php_maint_system_owner)
+    [[ -n "$owner" && "$owner" != *$'\n'* ]] || { log_error 'Cannot determine one owning CLI package; refused.'; return 1; }
+    resolved=$(readlink -f /usr/bin/php) || return 1
+    old_modules=$(/usr/bin/php -m 2>/dev/null | sort -u | sed '/^$/d; /^\[/d') || return 1
+    [[ -n "$old_modules" ]] || return 1
+    install -d -m 700 /var/backups/liuer-panel/runtime || return 1
+    report=$(mktemp -d /var/backups/liuer-panel/runtime/cli.XXXXXXXX) || return 1
+    log_info "System CLI backup/report: $report"
+    printf '%s\n%s\n%s\n' "$current" "$resolved" "$owner" > "${report}/before.txt"
+    local -a packages=()
+    local package
+    case "$OS_FAMILY" in
+        debian)
+            # Only use the distro's existing alternatives mechanism. The binary
+            # is installed separately by ordinary runtime maintenance/install.
+            target="$resolved"
+            if [[ "$branch" == 8.0 || "$branch" == 8.1 ]]; then target=/usr/bin/php8.2; fi
+            [[ "$owner" =~ ^php[0-9]+\.[0-9]+-cli$ && -x "$target" && "$target" != /usr/bin/php ]] \
+                || { log_error 'Unsupported system CLI package/layout; refused.'; return 1; }
+            target_version=$(_php_maint_version "$target")
+            _php_maint_at_least "$target_version" "$(_php_maint_minimum "${target_version%.*}")" \
+                || { log_error 'Target CLI is not verified. Update/install the target branch first.'; return 1; }
+            update-alternatives --query php > "${report}/alternatives-before.txt" || return 1
+            update-alternatives --list php | grep -Fxq -- "$target" || { log_error 'Target is not registered with alternatives; refused.'; return 1; }
+            new_modules=$("$target" -m 2>/dev/null | sort -u | sed '/^$/d; /^\[/d') || return 1
+            missing=$(comm -23 <(printf '%s\n' "$old_modules") <(printf '%s\n' "$new_modules"))
+            [[ -n "$new_modules" && -z "$missing" ]] || { log_error "Target CLI missing modules: $missing"; return 1; }
+            update-alternatives --set php "$target" > "${report}/change.log" 2>&1 || return 1
+            if ! _php_maint_at_least "$(_php_maint_version /usr/bin/php)" "$(_php_maint_minimum "${target_version%.*}")"; then
+                update-alternatives --set php "$resolved" >> "${report}/change.log" 2>&1 || true
+                log_error 'CLI verification failed; attempted to restore previous alternative.'; return 1
+            fi
+            log_warn "Default CLI now uses $target (manual alternatives mode). Old versioned binaries remain installed." ;;
+        rhel)
+            # A parallel Remi CLI already owns the default path: the in-branch
+            # maintainer handles its packages; no need to swap native streams.
+            case "$owner" in
+                php[0-9][0-9]-php-cli)
+                    log_error 'Default CLI is managed by a parallel collection. Maintain its packages; review syspaths/default selection separately. No automatic package swaps.'; return 1 ;;
+                php-cli) ;;
+                *) log_error 'Unrecognized RPM CLI owner; no package changes.'; return 1 ;;
+            esac
+            # A stream switch would also affect native FPM/mod_php consumers,
+            # which are outside selected Liuer site confirmations.
+            if rpm -q php-fpm >/dev/null 2>&1 || rpm -q php >/dev/null 2>&1; then
+                log_error 'Native FPM/mod_php is installed. System CLI shares these packages; manual review required, not a CLI-only change.'; return 1
+            fi
+            rpm -qa > "${report}/packages-before.txt"
+            local -a config_paths=()
+            [[ ! -e /etc/php.ini ]] || config_paths+=(/etc/php.ini)
+            [[ ! -e /etc/php.d ]] || config_paths+=(/etc/php.d)
+            [[ -z "${config_paths[*]:-}" ]] || tar -cpf "${report}/config.tar" "${config_paths[@]}" || return 1
+            while IFS= read -r package; do [[ -z "$package" ]] || packages+=("$package"); done < <(rpm -qa --qf '%{NAME}\n' | awk '/^php(-|$)/ {print}')
+            [[ -n "${packages[*]:-}" ]] || return 1
+            local -a operation=()
+            local target_branch="$branch"
+            if [[ "$branch" == 8.0 || "$branch" == 8.1 ]]; then
+                target_branch=8.2
+                [[ "$OS_VERSION_ID" == 8 || "$OS_VERSION_ID" == 9 ]] || { log_error 'Native stream migration supported only on modular EL8/EL9; refused.'; return 1; }
+                # Inspect enabled/trusted repos without enabling any new repo.
+                # Filter by the precise module stream as well as PHP version.
+                dnf --refresh -q repoquery --available --disable-modular-filtering \
+                    --qf '%{version}|%{modularitylabel}' php-cli > "${report}/candidates.txt" 2>"${report}/candidate-error.log" || return 1
+                stream=''
+                while IFS='|' read -r candidate label; do
+                    [[ "$label" == php:8.2:* || "$label" == php:remi-8.2:* ]] || continue
+                    _php_maint_at_least "$candidate" "$(_php_maint_minimum 8.2)" || continue
+                    stream="${label#php:}"; stream="${stream%%:*}"
+                    [[ "$stream" != 8.2 ]] || break
+                done < "${report}/candidates.txt"
+                [[ "$stream" == 8.2 || "$stream" == remi-8.2 ]] || { log_error 'No verified native PHP 8.2 stream in enabled repositories. No repo/module reset performed.'; return 1; }
+                dnf -q module list php --enabled > "${report}/modules-before.txt" 2>&1 || return 1
+                operation=(module switch-to "php:$stream")
+            else
+                candidate=$(dnf --refresh -q repoquery --latest-limit=1 --qf '%{version}' php-cli | sort -V | tail -n 1)
+                _php_maint_at_least "$candidate" "$(_php_maint_minimum "$branch")" || { log_error 'No verified same-branch system CLI candidate; refused.'; return 1; }
+                operation=(upgrade "${packages[@]}")
+            fi
+            # --assumeno exits 1 after a valid plan too. Require the English
+            # transaction summary, reject removals/downgrades and protected SCLs.
+            local plan_code=0
+            LC_ALL=C dnf --refresh --color=never --assumeno --setopt=install_weak_deps=False \
+                --exclude='php5*' --exclude='php7*' --exclude='php8*-*' "${operation[@]}" > "${report}/plan.log" 2>&1 || plan_code=$?
+            [[ "$plan_code" == 0 || "$plan_code" == 1 ]] && grep -q '^Transaction Summary' "${report}/plan.log" \
+                && ! grep -Eiq '^[[:space:]]*(Removing|Downgrading|Replacing|Obsoleting)|^[[:space:]]+(php[[:space:]]|php-fpm|php[57][0-9]-|php8[0-9]-)' "${report}/plan.log" \
+                || { log_error "Unsupported dependency/module plan. No changes; review $report/plan.log"; return 1; }
+            log_warn 'Native CLI stream/package changes may affect every global PHP script. No queues will be restarted.'
+            [[ "$confirmed" == 1 ]] || { command cat "${report}/plan.log"; confirm_action 'Apply this exact native runtime operation?' || return 0; }
+            LC_ALL=C dnf --refresh --color=never -y --setopt=install_weak_deps=False \
+                --exclude='php5*' --exclude='php7*' --exclude='php8*-*' "${operation[@]}" > "${report}/change.log" 2>&1 \
+                || { log_error "System CLI package operation failed. No automatic package/module downgrade; inspect $report"; return 1; }
+            after=$(_php_maint_version /usr/bin/php)
+            new_modules=$(/usr/bin/php -m 2>/dev/null | sort -u | sed '/^$/d; /^\[/d') || return 1
+            missing=$(comm -23 <(printf '%s\n' "$old_modules") <(printf '%s\n' "$new_modules"))
+            _php_maint_at_least "$after" "$(_php_maint_minimum "$target_branch")" && [[ -n "$new_modules" && -z "$missing" ]] \
+                || { log_error "System CLI post-check failed (version/modules: $missing). Package/module rollback is manual; report: $report"; return 1; } ;;
+        *) log_error 'Unsupported OS family; no system CLI changes.'; return 1 ;;
+    esac
+    _php_maint_system_audit > "${report}/after.tsv"
+    log_success "System CLI verified. Report: $report"
+    log_warn 'Gracefully restart each queue only after current jobs finish. PHP workers already running are not changed by replacing a binary.'
+    )
+}
+
 _php_maint_fingerprint() {
     local domain="$1" version meta conf pool
     validate_domain "$domain" || return 1
@@ -6623,6 +6791,7 @@ _php_maint_fingerprint() {
 php_maintenance_audit() {
     local branch cli fpm state minimum packages meta domain fingerprint version
     printf 'policy\tCVE-2026-109618,CVE-2026-109619\tupstream-floor-only\n'
+    _php_maint_system_audit
     for branch in $(_installed_php_versions_on_disk); do
         cli=$(_php_maint_version "$(get_php_bin "$branch")"); fpm=$(_php_maint_version "$(_php_maint_fpm "$branch")")
         minimum=$(_php_maint_minimum "$branch" || echo none)
@@ -6912,7 +7081,11 @@ php_maintenance_menu() {
         if confirm_action "Migrate $domain from $version to patched 8.2?"; then selected+=("${domain}:${fingerprint}"); fi
     done
     confirm_action 'Apply runtime maintenance now?' || return 0
-    php_maintenance_apply --confirm ${selected[@]+"${selected[@]}"}
+    php_maintenance_apply --confirm ${selected[@]+"${selected[@]}"} || return 1
+    if [[ -x /usr/bin/php ]]; then
+        log_warn 'Site/FPM maintenance does not change the global CLI automatically.'
+        if confirm_action 'Review/maintain the system CLI separately now?'; then php_maintenance_system_cli; fi
+    fi
 }
 
 update_service() {
@@ -10996,10 +11169,11 @@ main() {
             check_root; detect_os
             case "${2:-menu}" in
                 audit) php_maintenance_audit ;;
+                system-cli) shift 2; php_maintenance_system_cli "$@" ;;
                 apply) shift 2; php_maintenance_apply "$@" ;;
                 rollback) [[ $# == 4 ]] || { log_error "Usage: liuer php-maintenance rollback RUN_ID DOMAIN"; return 1; }; php_maintenance_rollback "$3" "$4" ;;
                 menu) php_maintenance_menu ;;
-                *) log_error "Usage: liuer php-maintenance [audit|apply --confirm [DOMAIN:FINGERPRINT ...]|rollback RUN_ID DOMAIN]"; return 1 ;;
+                *) log_error "Usage: liuer php-maintenance [audit|system-cli|apply --confirm [DOMAIN:FINGERPRINT ...]|rollback RUN_ID DOMAIN]"; return 1 ;;
             esac
             ;;
 
