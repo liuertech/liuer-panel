@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.20"
+readonly VERSION="2.7.21"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -10036,9 +10036,12 @@ def open_sql(name, expected=None):
         os.close(parent)
     try:
         info = os.fstat(fd)
-        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == 0
-                and info.st_mode & 0o077 == 0 and 0 < info.st_size <= MAX_INPUT,
-                'SQL must be a regular root-owned mode-600 file, no hardlinks, at most 2 GiB.')
+        require(stat.S_ISREG(info.st_mode), 'Not a regular SQL file (directories/devices are not accepted).')
+        require(info.st_nlink == 1, 'Hardlinked SQL files are not accepted.')
+        require(info.st_uid == 0, 'SQL file must be owned by root; check its owner via root SFTP.')
+        require(info.st_mode & 0o077 == 0, 'SQL permissions allow group/other access; set this file to mode 600 via root SFTP.')
+        require(info.st_size > 0, 'SQL file is empty (0 bytes).')
+        require(info.st_size <= MAX_INPUT, 'SQL file exceeds the 2 GiB upload limit.')
         require(expected is None or expected == fingerprint(info), 'SQL file changed since selection; refresh the list.')
         return fd, info
     except BaseException:
@@ -10047,7 +10050,13 @@ def open_sql(name, expected=None):
 
 
 def inventory():
-    result = {'directory': SQL, 'files': [], 'profiles': [], 'rejected': 0, 'bytes': 0}
+    result = {'directory': SQL, 'files': [], 'profiles': [], 'rejected': 0, 'rejected_files': [], 'bytes': 0}
+    def rejected(name, reason):
+        result['rejected'] += 1
+        # Keep diagnostics bounded; CLI escapes every untrusted name/reason
+        # before terminal output (including control characters in filenames).
+        if len(result['rejected_files']) < 100:
+            result['rejected_files'].append({'name': name, 'reason': reason})
     if not os.path.lexists(BASE):
         return result
     fd = directory(BASE, private=True)
@@ -10057,15 +10066,17 @@ def inventory():
         try:
             for name in sorted(os.listdir(fd)):
                 if not FILE_RE.fullmatch(name):
-                    result['rejected'] += 1
+                    rejected(name, 'Use an ASCII basename ending in .sql or .sql.gz (letters, numbers, dot, underscore, hyphen; no spaces).')
                     continue
                 try:
                     source, info = open_sql(name)
                     os.close(source)
                     result['files'].append({'name': name, 'size': info.st_size, 'modified': int(info.st_mtime), 'fingerprint': fingerprint(info)})
                     result['bytes'] += info.st_size
-                except (OSError, Refused):
-                    result['rejected'] += 1
+                except Refused as error:
+                    rejected(name, str(error))
+                except OSError:
+                    rejected(name, 'Cannot open this entry safely; it may be a symlink, missing, or inaccessible.')
         finally:
             os.close(fd)
     if os.path.lexists(PROFILES):
@@ -10681,13 +10692,53 @@ _import_warning() {
 }
 
 _import_select_sql() {
-    local listing choice row
-    listing=$(_liuer_import_api inventory) || return 1
-    python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); [print("  %s) %s (%s bytes)"%(i+1,f["name"],f["size"])) for i,f in enumerate(d["files"])]; print("  0) Back")' "$listing"
-    read -r -p 'Select SQL file: ' choice
-    [[ "$choice" =~ ^[1-9][0-9]*$ && ${#choice} -lt 5 ]] || return 1
-    row=$(python3 -I -c 'import json,sys; a=json.loads(sys.argv[1])["files"]; i=int(sys.argv[2])-1; print(a[i]["name"]+"|"+a[i]["fingerprint"]) if 0<=i<len(a) else sys.exit(1)' "$listing" "$choice") || return 1
-    IFS='|' read -r IMPORT_SQL_NAME IMPORT_SQL_FINGERPRINT <<< "$row"
+    local listing choice row count
+    IMPORT_SQL_NAME=''; IMPORT_SQL_FINGERPRINT=''
+    while true; do
+        listing=$(_liuer_import_api inventory) || return 1
+        count=$(python3 -I -c 'import json,sys; print(len(json.loads(sys.argv[1])["files"]))' "$listing") || return 1
+        python3 -I -c '
+import json,sys
+d=json.loads(sys.argv[1])
+safe=lambda value: json.dumps(str(value),ensure_ascii=True)[1:-1]
+def size(value):
+    value=int(value)
+    if value>=1024**3: return "%.2f GiB"%(value/1024**3)
+    if value>=1024**2: return "%.2f MiB"%(value/1024**2)
+    if value>=1024: return "%.1f KiB"%(value/1024)
+    return "%s bytes"%value
+print("\nTHU MUC SQL: "+safe(d["directory"]))
+print("NHAP SO THU TU DE CHON FILE (khong nhap ten file):")
+for i,f in enumerate(d["files"],1):
+    print("  %3d) %s  [%s]"%(i,safe(f["name"]),size(f["size"])))
+if not d["files"]:
+    print("  Chua co file SQL hop le de chon trong thu muc nay.")
+    print("  Upload .sql / .sql.gz bang root SFTP; file root:root, quyen 600.")
+if d.get("rejected",0):
+    print("\n  FILE KHONG DU DIEU KIEN (khong the chon; khong tu sua/xoa):")
+    for f in d.get("rejected_files",[]):
+        print("    - %s: %s"%(safe(f["name"]),safe(f["reason"])))
+    hidden=int(d["rejected"])-len(d.get("rejected_files",[]))
+    if hidden: print("    Con %s muc bi loai khac; kiem tra qua root SFTP."%hidden)
+print("\n    R) Quet lai thu muc sau khi upload / sua quyen")
+print("    0) Quay lai")
+' "$listing" || return 1
+        if [[ "$count" == 0 ]]; then
+            read -r -p 'Chon R de quet lai, 0 de quay lai: ' choice || return 1
+        else
+            read -r -p "Chon so thu tu [1-${count}], R hoac 0: " choice || return 1
+        fi
+        case "$choice" in 0|'') return 1 ;; r|R) continue ;; esac
+        if [[ "$choice" =~ ^[1-9][0-9]*$ && ${#choice} -lt 5 ]]; then
+            row=$(python3 -I -c 'import json,sys; a=json.loads(sys.argv[1])["files"]; i=int(sys.argv[2])-1; print(a[i]["name"]+"|"+a[i]["fingerprint"]) if 0<=i<len(a) else sys.exit(1)' "$listing" "$choice") || row=''
+            if [[ -n "$row" ]]; then
+                IFS='|' read -r IMPORT_SQL_NAME IMPORT_SQL_FINGERPRINT <<< "$row"
+                printf 'Da chon: %s\n' "$IMPORT_SQL_NAME"
+                return 0
+            fi
+        fi
+        log_warn 'Lua chon khong hop le. Chi nhap so thu tu trong danh sach; R=quet lai, 0=quay lai.'
+    done
 }
 
 _import_sql_menu() {
