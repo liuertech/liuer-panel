@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.29"
+readonly VERSION="2.7.30"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -3158,7 +3158,7 @@ _select_domain() {
             grep -q "fastcgi_pass" "$conf" 2>/dev/null || continue
         fi
         # avoid duplicates
-        [[ " ${_domains[*]} " == *" ${dom} "* ]] && continue
+        [[ " ${_domains[*]:-} " == *" ${dom} "* ]] && continue
         _domains+=("$dom")
     done
 
@@ -3177,7 +3177,7 @@ _select_domain() {
     done
     echo -e "   0) ${cancel_label}"
     echo -ne "\n  ${prompt} [1-$((i-1))]: "
-    read -r _sel
+    read -r _sel || return 1
 
     if [[ "$_sel" == "0" || -z "$_sel" ]]; then return 1; fi
     if [[ ! "$_sel" =~ ^[0-9]+$ ]] || [[ "$_sel" -lt 1 ]] || [[ "$_sel" -gt ${#_domains[@]} ]]; then
@@ -11096,20 +11096,20 @@ def size(value):
     if value>=1024: return "%.1f KiB"%(value/1024)
     return "%s bytes"%value
 print("\nTHU MUC SQL: "+safe(d["directory"]))
-print("NHAP SO THU TU DE CHON FILE (khong nhap ten file):")
+print("Chon file bang so thu tu:")
 for i,f in enumerate(d["files"],1):
     print("  %3d) %s  [%s]"%(i,safe(f["name"]),size(f["size"])))
 if not d["files"]:
     print("  Chua co file SQL hop le de chon trong thu muc nay.")
     print("  Upload .sql / .sql.gz bang root SFTP; file root:root, quyen 600.")
 if d.get("rejected",0):
-    print("\n  FILE KHONG DU DIEU KIEN (khong the chon; khong tu sua/xoa):")
+    print("\n  FILE KHONG DU DIEU KIEN (bo qua):")
     for f in d.get("rejected_files",[]):
         print("    - %s: %s"%(safe(f["name"]),safe(f["reason"])))
     hidden=int(d["rejected"])-len(d.get("rejected_files",[]))
     if hidden: print("    Con %s muc bi loai khac; kiem tra qua root SFTP."%hidden)
-print("\n    F) Fix permission toan thu muc SQL (co xac nhan)")
-print("    R) Quet lai thu muc sau khi upload / sua quyen")
+print("\n    F) Sua quyen thu muc SQL")
+print("    R) Quet lai")
 print("    0) Quay lai")
 ' "$listing" || return 1
         if [[ "$count" == 0 ]]; then
@@ -11130,38 +11130,56 @@ print("    0) Quay lai")
     done
 }
 
+_import_domain_loop() {
+    local action="$1" title="$2" domain
+    while true; do
+        SELECTED_DOMAIN=''
+        _select_domain "$title" 'Quay lai' || return 0
+        domain="$SELECTED_DOMAIN"
+        [[ -n "$domain" ]] || return 0
+        # Return to domain selection after success, cancellation or failure.
+        # Never repeat the last write automatically; each site needs review.
+        "$action" "$domain" || true
+    done
+}
+
 _import_sql_menu() {
-    local domain="${1:-}" preflight kind result db_name choice
-    if [[ -z "$domain" ]]; then SELECTED_DOMAIN=''; _select_domain 'Import SQL into existing EMPTY database' || return; domain="$SELECTED_DOMAIN"; fi
+    if [[ -n "${1:-}" ]]; then _import_sql_once "$1"; return; fi
+    _import_domain_loop _import_sql_once 'Import DB - chon domain'
+}
+
+_import_sql_once() {
+    local domain="$1" preflight kind result db_name choice
+    IMPORT_SQL_NAME=''; IMPORT_SQL_FINGERPRINT=''
     if ! preflight=$(_liuer_import_api check "$domain"); then
-        log_error 'CHUA IMPORT: khong qua kiem tra DB dich. DB phai ton tai va trong; DB co du lieu phai tu don tay.'
+        log_error 'CHUA IMPORT: DB phai ton tai va trong. DB co du lieu: tu don tay.'
         press_enter; return 1
     fi
     kind=$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1]).get("type",""))' "$preflight") || { log_error 'CHUA IMPORT: khong doc duoc thong tin site.'; press_enter; return 1; }
     db_name=$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1])["database"])' "$preflight") || { log_error 'CHUA IMPORT: khong doc duoc DB dich.'; press_enter; return 1; }
-    log_warn 'DB must exist and contain NO tables/views/routines/events. Non-empty DB must be cleaned MANUALLY. No force/automatic deletion.'
-    log_warn 'Khong bat buoc Lock site. Neu web/cron/queue dang ghi DB dich, can can nhac tam dung de tranh ghi dong thoi; cong cu khong tu khoa/tat bat ky dich vu nao.'
-    log_warn 'Chi import SQL tu nguon tin cay. Import loi co the de lai du lieu do dang; khong tu xoa de thu lai.'
+    log_warn 'DB phai trong (ke ca view/routine/event); khong tu xoa du lieu.'
+    log_warn 'Chi dung SQL tin cay. Neu dang ghi DB, nen tam dung web/cron/queue; khong bat buoc Lock.'
+    log_warn 'Import loi co the de lai DB do dang; can don tay truoc khi thu lai.'
     _import_select_sql || return
     printf 'Website: %s\nDB dich: %s\nSQL: %s\n' "$domain" "$db_name" "$IMPORT_SQL_NAME"
-    confirm_action 'Import into this EMPTY managed DB (source SQL is kept)?' || return
+    confirm_action 'Import vao DB trong nay? Giu file SQL goc.' || return
     if ! result=$(_liuer_import_api sql "$domain" "$IMPORT_SQL_NAME" "$IMPORT_SQL_FINGERPRINT" --confirm); then
-        log_error 'IMPORT THAT BAI / CHUA HOAN TAT. Khong tu chay lai hoac sua config. DB co the co du lieu do dang; kiem tra va tu don tay truoc khi import lai.'
+        log_error 'IMPORT THAT BAI: DB co the do dang. Kiem tra/don tay truoc khi thu lai; chua sua config.'
         press_enter; return 1
     fi
     if ! python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert d.get("domain")==sys.argv[2] and d.get("imported")==sys.argv[3] and d.get("source_kept") is True' "$result" "$domain" "$IMPORT_SQL_NAME"; then
-        log_error 'CHUA XAC NHAN DUOC KET QUA IMPORT. Kiem tra DB truoc; khong import lai hoac sua config tu dong.'
+        log_error 'CHUA XAC NHAN DUOC IMPORT. Kiem tra DB; khong tu import lai hay sua config.'
         press_enter; return 1
     fi
     log_success "IMPORT THANH CONG: ${domain} -> ${db_name}"
-    log_info 'File SQL van duoc giu; chua thay doi config, trang thai site hoac cron/queue.'
+    log_info 'Giu file SQL; config/site/cron/queue khong thay doi.'
     if [[ "$kind" == wordpress || "$kind" == laravel ]]; then
-        echo '  1) Cap nhat ket noi DB cho WordPress / Laravel ngay (xac nhan rieng)'
-        echo '  0) Bo qua, giu nguyen config hien tai'
+        echo '  1) Cap nhat ket noi DB (WP / Laravel)'
+        echo '  0) Bo qua, giu config'
         while true; do
             read -r -p 'Buoc ket noi DB [0]: ' choice || choice=0
             case "$choice" in
-                1) _import_config_menu "$domain" || log_warn 'DB da import thanh cong, nhung buoc sua ket noi chua hoan tat. Khong import lai DB; vao muc 4 de sua ket noi.'; return ;;
+                1) _import_config_menu "$domain" || log_warn 'DB da import; ket noi chua xong. Sua tai muc 4, khong import lai.'; return ;;
                 0|'') log_info 'Da import DB; config khong thay doi.'; break ;;
                 *) log_warn 'Chi chon 1 de sua ket noi, hoac 0 de bo qua.' ;;
             esac
@@ -11173,12 +11191,16 @@ _import_sql_menu() {
 }
 
 _import_config_menu() {
-    local domain="${1:-}" result
-    if [[ -z "$domain" ]]; then SELECTED_DOMAIN=''; _select_domain 'Update WP/Laravel database connection only' || return; domain="$SELECTED_DOMAIN"; fi
-    log_warn 'Only the managed DB connection changes. WP prefix/salts and Laravel APP_KEY are preserved. Khong bat buoc Lock site; site dang chay se dung ket noi moi.'
-    confirm_action "Update DB connection for $domain (separate from SQL import)?" || return
+    if [[ -n "${1:-}" ]]; then _import_config_once "$1"; return; fi
+    _import_domain_loop _import_config_once 'Ket noi DB - chon domain'
+}
+
+_import_config_once() {
+    local domain="$1" result
+    log_warn 'Chi sua ket noi DB; giu WP prefix/salts, Laravel APP_KEY. Site se dung ket noi moi; khong can Lock.'
+    confirm_action "Cap nhat ket noi DB: $domain?" || return
     if ! result=$(_liuer_import_api config "$domain" --confirm); then
-        log_error 'SUA KET NOI DB THAT BAI / CHUA XAC NHAN DUOC. Buoc nay khong import lai hay xoa du lieu DB.'
+        log_error 'SUA KET NOI DB THAT BAI. Khong import lai hay xoa DB.'
         press_enter; return 1
     fi
     if ! python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert d.get("domain")==sys.argv[2] and d.get("config_updated") is True; print("Backup: "+str(d.get("backup",""))); print(d.get("note",""))' "$result" "$domain"; then
@@ -11192,7 +11214,7 @@ _import_config_menu() {
 _import_permissions_menu() {
     local listing selection result
     print_section 'FIX SQL IMPORT PERMISSIONS'
-    listing=$(_liuer_import_api permissions-inventory) || { log_error 'Khong lap duoc danh sach. Can thu muc import root-owned; neu chua co, vao Prepare private SQL directory truoc.'; press_enter; return 1; }
+    listing=$(_liuer_import_api permissions-inventory) || { log_error 'Khong doc duoc thu muc SQL. Kiem tra owner root; chua co thi tao tai muc 1.'; press_enter; return 1; }
     python3 -I -c '
 import json,sys
 d=json.loads(sys.argv[1]); safe=lambda s: json.dumps(str(s),ensure_ascii=True)[1:-1]
@@ -11277,9 +11299,9 @@ _import_profile_select() {
     while true; do
         listing=$(_liuer_import_api inventory) || return 1
         python3 -I -c 'import json,sys; [print("  %s) %s@%s:%s [%s]"%(i+1,p["user"],p["host"],p["port"],p["id"])) for i,p in enumerate(json.loads(sys.argv[1])["profiles"])]' "$listing"
-        echo '  N) Set up SSH connection (one-time password + verify source host fingerprint)'
-        echo '  R) Retry key installation for an existing connection'
-        echo '  D) Xoa ket noi SSH cu / Delete saved connection (local key only)'
+        echo '  N) Them ket noi SSH (xac minh host key)'
+        echo '  R) Cai lai key cho ket noi cu'
+        echo '  D) Xoa ket noi SSH (chi tren VPS nay)'
         echo '  0) Back'
         read -r -p 'Connection: ' choice || return 1
         case "$choice" in
@@ -11530,18 +11552,18 @@ _import_menu() {
     local choice
     while true; do
         print_section 'IMPORT / MIGRATION'
-        echo '  1) Prepare private SQL directory (root SFTP upload)'
-        echo '  2) Copy / overwrite code: select many / all domains (same SSH key)'
-        echo '  3) Import SQL into existing EMPTY database'
-        echo '  4) Update WordPress / Laravel DB connection only'
-        echo '  5) List / clean uploaded SQL (confirmation required)'
-        echo '  6) Create empty locked website for migration'
-        echo '  7) Fix permission TOAN BO file trong thu muc SQL (co xac nhan)'
-        echo '  0) Back'
-        read -r -p 'Select: ' choice
+        echo '  1) Tao thu muc SQL'
+        echo '  2) Copy code (nhieu domain)'
+        echo '  3) Import DB'
+        echo '  4) Sua ket noi DB (WP / Laravel)'
+        echo '  5) Xem / don file SQL'
+        echo '  6) Tao site rong de chuyen web'
+        echo '  7) Sua quyen thu muc SQL'
+        echo '  0) Quay lai'
+        read -r -p 'Chon: ' choice || return 0
         case "$choice" in
             1) confirm_action 'Create private root-owned import directories?' && _liuer_import_api init
-               echo 'Upload via ROOT SFTP to /var/lib/liuer-panel/imports/sql/; files root:root 600, directory 700. Never upload SQL under public_html/public.'; press_enter ;;
+               echo 'Root SFTP: /var/lib/liuer-panel/imports/sql/ (file 600, thu muc 700). Khong de SQL trong public_html/public.'; press_enter ;;
             2) _import_sync_menu ;;
             3) _import_sql_menu ;;
             4) _import_config_menu ;;
