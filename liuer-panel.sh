@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.30"
+readonly VERSION="2.7.31"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -45,6 +45,7 @@ readonly WEB_PANEL_SERVICE="liuer-web-worker.service"
 readonly WEB_PANEL_CONTROL_SERVICE="liuer-web-control.service"
 readonly WEB_PANEL_NGINX_CONF="${NGINX_CONF_DIR}/liuer-web-panel.conf"
 readonly WEB_PANEL_DEFAULT_PORT="8443"
+readonly WEB_PANEL_RELEASE_URL="https://tool.liuer.net/liuerpanel"
 readonly DANGEROUS_FUNCTIONS="exec,shell_exec,system,passthru,popen,proc_open,pcntl_exec,pcntl_fork,pcntl_signal,pcntl_waitpid,pcntl_wexitstatus,pcntl_wifexited,pcntl_wifsignaled,dl,putenv,show_source,highlight_file"
 
 # Fire-and-forget notification to liuercp so both sides stay in sync.
@@ -7679,7 +7680,7 @@ _ensure_web_panel_stack() {
     systemctl enable --now "$maria_svc" || { log_error "MariaDB could not be started."; return 1; }
 
     local php_bin; php_bin=$(_web_panel_php_bin)
-    if [[ ! -x "$php_bin" ]] || ! php_extension_loaded "8.2" mysql || ! php_extension_loaded "8.2" mbstring; then
+    if [[ ! -x "$php_bin" ]] || ! php_extension_loaded "8.2" mysql || ! php_extension_loaded "8.2" mbstring || ! php_extension_loaded "8.2" zip; then
         if [[ "$OS_FAMILY" == "debian" ]] && ! apt-cache show "php8.2-fpm" &>/dev/null; then
             setup_php_repo || { log_error "PHP 8.2 repository setup failed."; return 1; }
         fi
@@ -7691,6 +7692,8 @@ _ensure_web_panel_stack() {
     [[ -x "$php_bin" ]] || { log_error "PHP 8.2 CLI binary is not available."; return 1; }
     "$php_bin" -m 2>/dev/null | grep -ixq openssl \
         || { log_error "PHP 8.2 OpenSSL extension is required by the Web Panel."; return 1; }
+    "$php_bin" -m 2>/dev/null | grep -ixq zip \
+        || { log_error "PHP 8.2 ZIP extension is required by the Web Panel."; return 1; }
     _web_panel_fpm_details
     systemctl enable --now "$WEB_PANEL_FPM_SERVICE" || return 1
 
@@ -7699,45 +7702,124 @@ _ensure_web_panel_stack() {
     log_success "Required Web Panel stack is ready."
 }
 
+# Public verification key only. Never fetch the trust key from the download API.
+_web_panel_release_key() {
+    cat <<'PEM'
+-----BEGIN PUBLIC KEY-----
+MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAx0PsOwMsSidowMlvaBj3
+5yAJPVjQMFrR2ZI92s4V1SArqCbXlqH82gMi0JwriDQsZhsnFWxzhLEWD3nm/jF6
+WBbLPT1LCuB3m2k60YorKB8k++bQWK/ouSfoHsOdo2+g8D2h9A+naYsXyvHOq+oU
+xpoi1/KQz+41TOY3IO1pFrOZ/0sHKM0sewIY4FEwPLeeFW+AMQy1B5QChUtlt2tZ
+RPLQUuVLDDNEJGE/HjpMmhcwhwi9ml0WUyNPN1Zdv3SjuHuFBlQwyYayPnimXFdw
+L3DudAEeVXFos6TJ5Gf2/lZFchBX/ZH4RmX1sGIMI2+JITT3TcJaaDOyZnaT5e2H
+auXxOFO81Zx3DafKCAZnbHBYYPtdf2CrTSF64jodEOzA6qD8lm1u6l/kWKlvWD1F
+IJrEOjM6PWNXg+zRI8HTQTYMd4x/FqWbXXpX+CRsN9Ncwe4eN+YQxsT0jTsq6rhZ
+gCyu++fK2aAOMS9O3iq4uvGtGNwwtqfmxY3QoTPkHGOVAgMBAAE=
+-----END PUBLIC KEY-----
+PEM
+}
+
+_download_web_panel_file() {
+    local url="$1" destination="$2" maximum="$3" status rc=0
+    # Ignore curlrc, refuse redirects / plaintext protocols, keep TLS validation.
+    status=$(curl --disable --silent --show-error --fail --proto '=https' \
+        --noproxy '*' --connect-timeout 15 --max-time 180 --max-filesize "$maximum" \
+        --header 'Cache-Control: no-cache' --user-agent 'LiuerPanel-Installer/1' \
+        --output "$destination" --write-out '%{http_code}' "$url") || rc=$?
+    if [[ "$status" =~ ^[1-5][0-9][0-9]$ && "$status" != "200" ]]; then
+        log_error "Đây là gói trả phí, vui lòng liên hệ website liuer.net (HTTP ${status})."
+    elif [[ "$rc" != 0 || "$status" != "200" ]]; then
+        log_error "Không tải được Web Panel. Kiểm tra kết nối mạng/TLS, dung lượng và quyền ghi (HTTP ${status:-000}, cURL ${rc})."
+    else
+        return 0
+    fi
+    rm -f "$destination"
+    return 1
+}
+
+_verify_web_panel_release() {
+    local directory="$1" extract="${2:-0}" php_bin
+    php_bin=$(_web_panel_php_bin)
+    [[ -n "$php_bin" && -x "$php_bin" ]] || { log_error "PHP 8.2 CLI is required to verify the Web Panel release."; return 1; }
+    "$php_bin" -d display_errors=stderr /dev/stdin "$directory" "$extract" <<'PHP'
+<?php
+// Bootstrap trust before loading ANY code from the downloaded archive.
+try {
+    $dir = $argv[1]; $extract = $argv[2] === '1';
+    $json = file_get_contents($dir . '/release.json');
+    $signature = file_get_contents($dir . '/release.sig');
+    $public = file_get_contents($dir . '/public.pem');
+    if ($json === false || $signature === false || $public === false
+        || strlen($json) > 16384 || strlen($signature) > 4096) throw new RuntimeException('Invalid release metadata size.');
+    $signature = base64_decode(trim($signature), true);
+    if ($signature === false || openssl_verify($json, $signature, $public, OPENSSL_ALGO_SHA256) !== 1) throw new RuntimeException('Invalid release signature.');
+    $release = json_decode($json, true, 8, JSON_THROW_ON_ERROR);
+    $version = static fn($value) => is_string($value) && preg_match('/^(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})$/D', $value) === 1;
+    $now = time();
+    if (!is_array($release) || ($release['schema'] ?? null) !== 1
+        || !$version($release['version'] ?? null) || !$version($release['engine_version'] ?? null)
+        || ($release['filename'] ?? null) !== 'web-panel-upload.zip'
+        || !is_string($release['sha256'] ?? null) || preg_match('/^[a-f0-9]{64}$/D', $release['sha256']) !== 1
+        || !is_int($release['size'] ?? null) || $release['size'] < 100 || $release['size'] > 33554432
+        || !is_int($release['published_at'] ?? null) || !is_int($release['expires_at'] ?? null)
+        || $release['published_at'] > $now + 300 || $release['expires_at'] <= $now
+        || $release['expires_at'] <= $release['published_at']
+        || $release['expires_at'] - $release['published_at'] > 90 * 86400) throw new RuntimeException('Invalid/expired release metadata. Check the VPS clock.');
+    if (!$extract) { echo $release['version']; exit(0); }
+    $archive = $dir . '/source.zip';
+    if (!is_file($archive) || is_link($archive) || filesize($archive) !== $release['size']
+        || !hash_equals($release['sha256'], hash_file('sha256', $archive))) throw new RuntimeException('ZIP size / SHA256 mismatch.');
+    if (!class_exists(ZipArchive::class)) throw new RuntimeException('PHP 8.2 ZIP extension is required.');
+    $zip = new ZipArchive();
+    if ($zip->open($archive, ZipArchive::CHECKCONS) !== true) throw new RuntimeException('Invalid ZIP.');
+    // This helper is loaded only AFTER signature, expiry, size and checksum pass.
+    $helper = $zip->getFromName('web-panel/src/Release.php', 131073);
+    $zip->close();
+    if (!is_string($helper) || $helper === '' || strlen($helper) > 131072) throw new RuntimeException('Release verifier missing / oversized.');
+    $trusted = $dir . '/verified-release.php';
+    if (file_put_contents($trusted, $helper, LOCK_EX) !== strlen($helper)) throw new RuntimeException('Cannot stage verified helper.');
+    chmod($trusted, 0600);
+    require $trusted;
+    $release = \LiuerPanel\Release::verify($json, base64_encode($signature), $public);
+    \LiuerPanel\Release::extract($archive, $dir . '/verified', $release);
+    if (file_get_contents($dir . '/verified/web-panel/config/update-public.pem') !== $public) throw new RuntimeException('Bundled trust key mismatch.');
+} catch (Throwable $error) {
+    fwrite(STDERR, 'Web Panel verification failed: ' . $error->getMessage() . "\n");
+    exit(1);
+    }
+PHP
+}
+
 _stage_web_panel_source() {
     local destination="$1" force_remote="${2:-0}"
     local local_source="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/web-panel"
 
-    mkdir -p "$destination"
     if [[ "$force_remote" != "1" && -f "${local_source}/public/index.php" ]]; then
+        mkdir -p "$destination" || return 1
         cp -a "${local_source}/." "$destination/"
         return $?
     fi
 
-    local archive tmpdir sha url
+    local tmpdir release_version cache_key
     tmpdir=$(mktemp -d /tmp/liuer-web-panel.XXXXXX) || return 1
-    archive="${tmpdir}/source.tar.gz"
-    sha=$(_get_github_sha)
-    if [[ -n "$sha" ]]; then
-        url="https://codeload.github.com/${REPO_SLUG}/tar.gz/${sha}"
-    else
-        url="https://codeload.github.com/${REPO_SLUG}/tar.gz/refs/heads/main"
-    fi
-    log_info "Downloading Liuer Web Panel source..."
-    if ! curl -fsSL --max-time 120 "$url" -o "$archive"; then
+    cache_key="$(date +%s)-${RANDOM}"
+    _web_panel_release_key > "${tmpdir}/public.pem"
+    log_info "Downloading signed Liuer Web Panel release..."
+    if ! _download_web_panel_file "${WEB_PANEL_RELEASE_URL}/release.json?ver=${cache_key}" "${tmpdir}/release.json" 16384 \
+        || ! _download_web_panel_file "${WEB_PANEL_RELEASE_URL}/release.sig?ver=${cache_key}" "${tmpdir}/release.sig" 4096; then
         rm -rf "$tmpdir"
         return 1
     fi
-    if ! tar -tzf "$archive" > "${tmpdir}/archive.list" \
-        || grep -qE '(^/|(^|/)\.\.(/|$))' "${tmpdir}/archive.list"; then
+    if ! release_version=$(_verify_web_panel_release "$tmpdir"); then
         rm -rf "$tmpdir"
-        log_error "Downloaded Web Panel archive is invalid or contains an unsafe path."
         return 1
     fi
-    tar -xzf "$archive" -C "$tmpdir" || { rm -rf "$tmpdir"; return 1; }
-    local extracted
-    extracted=$(find "$tmpdir" -mindepth 2 -maxdepth 2 -type d -name web-panel | head -1)
-    if [[ -z "$extracted" || ! -f "${extracted}/public/index.php" ]]; then
+    if ! _download_web_panel_file "${WEB_PANEL_RELEASE_URL}/web-panel-upload.zip?ver=${release_version}" "${tmpdir}/source.zip" 33554432 \
+        || ! _verify_web_panel_release "$tmpdir" 1; then
         rm -rf "$tmpdir"
-        log_error "Downloaded release does not contain web-panel/."
         return 1
     fi
-    cp -a "${extracted}/." "$destination/"
+    mkdir -p "$destination" && cp -a "${tmpdir}/verified/web-panel/." "$destination/"
     local rc=$?
     rm -rf "$tmpdir"
     return $rc
