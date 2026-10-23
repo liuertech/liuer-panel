@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.22"
+readonly VERSION="2.7.25"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -9990,6 +9990,41 @@ def site(domain):
     return data
 
 
+def site_snapshot(data):
+    target = data['SITE_DIR'] if data['TYPE'] == 'laravel' else data['WEB_ROOT']
+    fd = directory(target)
+    try:
+        info = os.fstat(fd)
+        values = {key: value for key, value in data.items() if key != '_account'}
+        values['_target_inode'] = [info.st_dev, info.st_ino]
+        values['_uid'] = data['_account'].pw_uid
+        return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
+    finally:
+        os.close(fd)
+
+
+def site_inventory():
+    result = {'sites': [], 'rejected': []}
+    if not os.path.lexists(META):
+        return result
+    parent = directory(META)
+    try:
+        for filename in sorted(os.listdir(parent)):
+            if not filename.endswith('.conf'):
+                continue
+            domain = filename[:-5]
+            try:
+                data = site(domain)
+                require(data.get('TYPE') in ['wordpress', 'laravel', 'php', 'static'], 'Unsupported site type.')
+                result['sites'].append({'domain': domain, 'type': data['TYPE'], 'status': data.get('STATUS', ''),
+                    'target': data['SITE_DIR'] if data['TYPE'] == 'laravel' else data['WEB_ROOT'], 'snapshot': site_snapshot(data)})
+            except (Refused, OSError, KeyError, ValueError):
+                result['rejected'].append({'name': filename, 'reason': 'Invalid/unsafe managed metadata, site user, type or destination directory; review manually.'})
+    finally:
+        os.close(parent)
+    return result
+
+
 def database(domain):
     require(DOMAIN_RE.fullmatch(domain), 'Invalid domain.')
     require(os.path.isfile(DB_LIST), 'Create a managed database for this domain first; import never creates one.')
@@ -10482,11 +10517,21 @@ def profile_install(identifier):
     path = PROFILES + '/' + identifier
     # Explicit CLI-only step: ssh-copy-id asks for host-key approval/password.
     # No password reaches the panel, command argv, disk or operation logs.
-    with open('/dev/tty', 'r+') as terminal:
-        result = subprocess.run(['/usr/bin/ssh-copy-id', '-i', path + '/key.pub', '-p', str(data['port']),
-                                 '-o', 'UserKnownHostsFile=' + path + '/known_hosts', '-o', 'StrictHostKeyChecking=ask',
-                                 data['user'] + '@' + data['host']], stdin=terminal, stdout=terminal, stderr=terminal,
-                                env={'PATH':'/usr/bin:/bin','HOME':'/root','LC_ALL':'C'})
+    # Buffered read/write mode requires seeking, which Linux terminals cannot
+    # do. Pass an unbuffered binary terminal FD to ssh-copy-id instead.
+    try:
+        terminal = open('/dev/tty', 'r+b', buffering=0)
+    except OSError:
+        raise Refused('SSH key setup needs an interactive terminal. Run liuer imports directly in an SSH terminal, not through a background job/pipe. No code copy or SQL import was started by this step.') from None
+    with terminal:
+        require(os.isatty(terminal.fileno()), 'SSH key setup requires a real interactive terminal.')
+        try:
+            result = subprocess.run(['/usr/bin/ssh-copy-id', '-i', path + '/key.pub', '-p', str(data['port']),
+                                     '-o', 'UserKnownHostsFile=' + path + '/known_hosts', '-o', 'StrictHostKeyChecking=ask',
+                                     data['user'] + '@' + data['host']], stdin=terminal, stdout=terminal, stderr=terminal,
+                                    env={'PATH':'/usr/bin:/bin','HOME':'/root','LC_ALL':'C'})
+        except OSError:
+            raise Refused('Cannot start ssh-copy-id. Check OpenSSH clients and the interactive terminal. Connection metadata was kept for retry; this step did not copy website code or import SQL.') from None
     require(result.returncode == 0, 'SSH key setup failed; connection metadata was kept for retry.')
     return {'connection': identifier, 'installed': True, 'note': 'Dedicated key remains authorized on the source until you revoke it there.'}
 
@@ -10565,18 +10610,6 @@ def probe(identifier, panel, domain, kind):
     return {'domain': domain, 'panel': panel, 'paths': paths, 'note': 'Review/override the concrete source path. Laravel copies its complete project, not only public/.'}
 
 
-def empty_target(path):
-    """Allow only the empty directories created by Liuer for a fresh site."""
-    for root, directories, files in os.walk(path, followlinks=False):
-        require(not files, 'Target already contains files. Sync never overwrites/deletes existing website code.')
-        for name in directories:
-            full = os.path.join(root, name)
-            require(not os.path.islink(full), 'Target contains a symlink; refused.')
-            relative = os.path.relpath(full, path)
-            require(relative in ['public', 'public_html', '.well-known', '.well-known/acme-challenge',
-                                 'public/.well-known', 'public/.well-known/acme-challenge'], 'Target is not a fresh empty website.')
-
-
 def copy_tree(source, destination, owner, depth=0):
     """FD-relative copy: an untrusted receiver can never redirect root writes."""
     require(depth <= 64, 'Source tree is too deeply nested; migrate manually.')
@@ -10617,14 +10650,165 @@ def copy_tree(source, destination, owner, depth=0):
                 os.close(src)
 
 
-def sync_code(identifier, panel, domain, source):
+def copy_bytes(source, destination, info):
+    """Bounded snapshot copy through pinned FDs, never application code."""
+    space = os.fstatvfs(destination)
+    require(space.f_bavail * space.f_frsize > info.st_size + 1024 ** 3, 'Insufficient disk reserve for code/overwrite backups.')
+    remaining = info.st_size
+    while remaining:
+        chunk = os.read(source, min(remaining, 1024 * 1024))
+        require(chunk, 'File changed while preparing code/backup; review before retrying.')
+        view = memoryview(chunk)
+        while view:
+            written = os.write(destination, view)
+            require(written > 0, 'Cannot write code/backup snapshot.')
+            view = view[written:]
+        remaining -= len(chunk)
+    require(fingerprint(os.fstat(source)) == fingerprint(info), 'File changed while preparing code/backup; review before retrying.')
+    os.fsync(destination)
+
+
+def overlay_plan(source, target, backup, owner, plan, prefix='', depth=0):
+    """Validate touched paths and back up EVERY overwritten file before writes.
+
+    Unmatched destination entries are not visited or deleted. Destination links,
+    hardlinks, special files and file/directory conflicts are never followed or
+    automatically removed. Backup directories/files remain root-only.
+    """
+    require(depth <= 64 and len(plan) < 200000, 'Code tree is too large/deep; migrate manually.')
+    for name in sorted(os.listdir(source)):
+        relative = prefix + name
+        incoming = os.stat(name, dir_fd=source, follow_symlinks=False)
+        current = None
+        if target is not None:
+            try:
+                current = os.stat(name, dir_fd=target, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+        if stat.S_ISDIR(incoming.st_mode):
+            require(current is None or stat.S_ISDIR(current.st_mode), 'Destination path conflicts with an incoming directory: ' + json.dumps(relative))
+            src = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=source)
+            dst = saved = None
+            try:
+                if current is not None:
+                    dst = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=target)
+                    require((os.fstat(dst).st_dev, os.fstat(dst).st_ino) == (current.st_dev, current.st_ino), 'Destination directory changed during preflight.')
+                os.mkdir(name, 0o700, dir_fd=backup)
+                saved = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=backup)
+                plan[relative] = {'kind': 'directory', 'expected': [current.st_dev, current.st_ino] if current else None}
+                overlay_plan(src, dst, saved, owner, plan, relative + '/', depth + 1)
+            finally:
+                os.close(src)
+                if dst is not None: os.close(dst)
+                if saved is not None: os.close(saved)
+        else:
+            require(stat.S_ISREG(incoming.st_mode) and incoming.st_nlink == 1, 'Incoming special file/hardlink refused.')
+            require(current is None or (stat.S_ISREG(current.st_mode) and current.st_nlink == 1
+                    and current.st_uid in [0, owner.pw_uid]), 'Unsafe destination file/link or file-directory conflict: ' + json.dumps(relative))
+            row = {'kind': 'file', 'expected': fingerprint(current) if current else None}
+            if current is not None:
+                row.update({'uid': current.st_uid, 'gid': current.st_gid, 'mode': stat.S_IMODE(current.st_mode)})
+                original = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=target)
+                saved = None
+                try:
+                    require(fingerprint(os.fstat(original)) == row['expected'], 'Destination file changed before backup.')
+                    saved = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=backup)
+                    os.fchmod(saved, 0o600)
+                    copy_bytes(original, saved, current)
+                finally:
+                    os.close(original)
+                    if saved is not None: os.close(saved)
+            plan[relative] = row
+
+
+def apply_overlay(source, target, owner, plan, counts, prefix=''):
+    """Per-file atomic replacements, not a whole-site transaction."""
+    for name in sorted(os.listdir(source)):
+        relative = prefix + name
+        row = plan[relative]
+        if row['kind'] == 'directory':
+            created = row['expected'] is None
+            if created:
+                os.mkdir(name, 0o700, dir_fd=target)
+                counts['directories_created'] += 1
+            dst = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=target)
+            src = None
+            try:
+                info = os.fstat(dst)
+                if not created:
+                    require([info.st_dev, info.st_ino] == row['expected'], 'Destination directory changed after backup; stopped.')
+                src = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=source)
+                apply_overlay(src, dst, owner, plan, counts, relative + '/')
+                if created:
+                    os.fchown(dst, owner.pw_uid, owner.pw_gid)
+                    os.fchmod(dst, 0o750)
+            finally:
+                os.close(dst)
+                if src is not None: os.close(src)
+        else:
+            temporary = '.liuer-copy-' + secrets.token_hex(12)
+            out = src = None
+            try:
+                src = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=source)
+                info = os.fstat(src)
+                require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, 'Staged code changed; refused.')
+                out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=target)
+                copy_bytes(src, out, info)
+                try:
+                    current = os.stat(name, dir_fd=target, follow_symlinks=False)
+                except FileNotFoundError:
+                    current = None
+                require((fingerprint(current) if current else None) == row['expected'], 'Destination file changed since backup: ' + json.dumps(relative) + '. Stopped; review running writers.')
+                if row['expected'] is None:
+                    # Atomic create without clobbering a file that appeared
+                    # after validation. Both names are on this same filesystem.
+                    os.link(temporary, name, src_dir_fd=target, dst_dir_fd=target, follow_symlinks=False)
+                    counts['files_created'] += 1
+                else:
+                    os.replace(temporary, name, src_dir_fd=target, dst_dir_fd=target)
+                    counts['files_overwritten'] += 1
+                os.fchown(out, owner.pw_uid, owner.pw_gid)
+                os.fchmod(out, 0o640)
+            finally:
+                if src is not None: os.close(src)
+                if out is not None: os.close(out)
+                try: os.unlink(temporary, dir_fd=target)
+                except FileNotFoundError: pass
+
+
+def merge_code(source, target, report, owner, target_path=None):
+    backup_path = report + '/code-before'
+    os.mkdir(backup_path, 0o700)
+    backup = directory(backup_path, private=True)
+    counts = {'files_created': 0, 'files_overwritten': 0, 'directories_created': 0}
+    plan = {}
+    try:
+        overlay_plan(source, target, backup, owner, plan)
+        with open(report + '/code-manifest.json', 'x') as manifest:
+            os.fchmod(manifest.fileno(), 0o600)
+            json.dump({'schema': 1, 'target': target_path, 'entries': plan, 'backup': backup_path}, manifest, ensure_ascii=True)
+            manifest.flush()
+            os.fsync(manifest.fileno())
+        apply_overlay(source, target, owner, plan, counts)
+        return dict(counts, backup=backup_path)
+    except (Refused, OSError) as error:
+        message = str(error) if isinstance(error, Refused) else type(error).__name__
+        raise Refused('Code copy stopped: ' + message + '. Applied so far: ' + json.dumps(counts) + '. Review destination before retrying; file-by-file copy is not transactional and no automatic rollback is performed. Original conflicting files backed up under ' + backup_path + ' (check code-manifest.json; backup preparation may be incomplete). No DB import or automatic site-state change.') from None
+    finally:
+        os.close(backup)
+
+
+def sync_code(identifier, panel, domain, source, expected_site=None):
     data = site(domain)
-    require(data.get('STATUS') == 'locked', 'Lock this destination website before receiving remote code. It must stay offline until DB/config are checked.')
+    if expected_site is not None:
+        require(isinstance(expected_site, str) and re.fullmatch(r'[a-f0-9]{64}', expected_site)
+                and site_snapshot(data) == expected_site, 'Destination site changed since batch review. No code copied for this site; select/review it again.')
     require(panel in ['cyberpanel', 'directadmin'], 'Invalid source panel.')
     source_path(source)
     kind = data.get('TYPE')
     target = data['SITE_DIR'] if kind == 'laravel' else data['WEB_ROOT']
-    empty_target(target)
+    target_fd = directory(target)
+    os.close(target_fd)
     with transport(identifier) as connection:
         peer, identity, scratch, options = connection
         quoted = shlex.quote(source)
@@ -10658,7 +10842,7 @@ def sync_code(identifier, panel, domain, source):
             started = time.monotonic()
             try:
                 while process.poll() is None:
-                    require(time.monotonic() - started < 7200, 'Copy exceeded two hours; destination is still locked.')
+                    require(time.monotonic() - started < 7200, 'Copy exceeded two hours; destination code has not been changed.')
                     require(shutil.disk_usage(scratch).free > 1024 ** 3, 'Copy stopped: less than 1 GiB disk reserve. No destination code was activated.')
                     time.sleep(0.25)
                 require(process.returncode == 0, 'Rsync failed. Website code was not activated. Private log: ' + report + '/rsync.log')
@@ -10675,51 +10859,44 @@ def sync_code(identifier, panel, domain, source):
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait()
         owner = data['_account']
-        parent = directory(os.path.dirname(target))
         source_fd = directory(receive)
-        stage = '.liuer-receive-' + secrets.token_hex(8)
-        old = '.liuer-empty-' + secrets.token_hex(8)
+        stage = report + '/code-stage'
+        os.mkdir(stage, 0o700)
+        stage_fd = directory(stage, private=True)
+        target_fd = None
         try:
-            # Stage on the target filesystem (not /run tmpfs). Root only writes
-            # through pinned FDs; never chmod/chown paths supplied by rsync.
-            os.mkdir(stage, 0o700, dir_fd=parent)
-            stage_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
-            try:
-                copy_tree(source_fd, stage_fd, owner)
-                os.fchown(stage_fd, 0 if kind == 'laravel' else owner.pw_uid, 0 if kind == 'laravel' else owner.pw_gid)
-                os.fchmod(stage_fd, 0o755 if kind == 'laravel' else 0o750)
-                staged = os.fstat(stage_fd)
-            finally:
-                os.close(stage_fd)
-            empty_target(target)
-            current_stage = os.stat(stage, dir_fd=parent, follow_symlinks=False)
-            require((current_stage.st_dev, current_stage.st_ino) == (staged.st_dev, staged.st_ino), 'Staging changed; promotion refused.')
-            os.rename(os.path.basename(target), old, src_dir_fd=parent, dst_dir_fd=parent)
-            try:
-                os.rename(stage, os.path.basename(target), src_dir_fd=parent, dst_dir_fd=parent)
-            except BaseException:
-                os.rename(old, os.path.basename(target), src_dir_fd=parent, dst_dir_fd=parent)
-                raise
+            copy_tree(source_fd, stage_fd, owner)
+            if expected_site is not None:
+                require(site_snapshot(site(domain)) == expected_site, 'Destination site changed during transfer. No destination code overwritten for this site; review again.')
+            target_fd = directory(target)
+            outcome = merge_code(stage_fd, target_fd, report, owner, target_path=target)
         finally:
             os.close(source_fd)
-            os.close(parent)
-        # Keep the old EMPTY directory as recoverable scaffolding, never rm -rf
-        # a website path. Site remains locked; user reviews it before unlock.
-        return {'domain': domain, 'copied': True, 'target': target, 'locked': True, 'database_imported': False,
-                'note': 'No --delete, no source changes. Symlinks/special files were not copied; recreate safe Laravel storage links manually. Import SQL/config and verify before unlocking. Site may require its normal permission repair for Nginx readability.'}
+            os.close(stage_fd)
+            if target_fd is not None: os.close(target_fd)
+            # Only this root-private, newly created staging tree, never the
+            # destination/source website or retained overwrite backups.
+            shutil.rmtree(stage)
+        return dict(outcome, domain=domain, copied=True, target=target, overwrite_confirmed=True,
+                    locked=data.get('STATUS') == 'locked', site_status=data.get('STATUS'), database_imported=False,
+                    note='Matching regular files overwritten after backup; destination-only files retained. No --delete, automatic DB import, DNS or site-state change. Source symlinks/special files omitted; conflicting destination links/type changes refused. Copied wp-config.php/.env still contain SOURCE credentials until updated separately. Review code/permissions/Laravel cache before use.')
 
 
 def main(arguments):
     require(os.geteuid() == 0, 'Migration operations require root/the privileged worker.')
     os.umask(0o077)
     def interrupted(signum, frame):
-        raise Refused('Operation interrupted. A database import may be partial; review it and clean manually before retrying. Source SQL is retained.')
+        if arguments[:1] == ['sql']:
+            raise Refused('SQL import interrupted; DB may be partial. Review and clean manually before retrying. Source SQL is retained.')
+        raise Refused('Operation interrupted. Code copy/config may be partial; inspect private job reports/backups before retrying. No automatic rollback or DB cleanup.')
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
     require(arguments, 'Missing import operation.')
     action, args = arguments[0], arguments[1:]
     if action == 'inventory' and not args:
         return inventory()
+    if action == 'sites' and not args:
+        return site_inventory()
     if action == 'permissions-inventory' and not args:
         return permission_inventory()
     if action == 'permissions' and len(args) == 2 and args[1] == '--confirm':
@@ -10748,7 +10925,10 @@ def main(arguments):
         if action == 'config' and len(args) == 2 and args[1] == '--confirm':
             password = os.read(3, 4096).decode('utf-8')
             return update_config(args[0], password)
-        if action == 'sync' and len(args) == 5 and args[4] == '--confirm':
+        if action == 'sync':
+            if len(args) == 8 and args[4] == '--site-snapshot' and args[6:] == ['--overwrite-confirmed', '--confirm']:
+                return sync_code(*args[:4], expected_site=args[5])
+            require(len(args) == 6 and args[4:] == ['--overwrite-confirmed', '--confirm'], 'Code overwrite requires explicit --overwrite-confirmed --confirm. Update the CLI/Web Panel and acknowledge the red overwrite warning; old copy jobs are not automatically upgraded.')
             return sync_code(*args[:4])
         raise Refused('Invalid operation/arguments or missing explicit --confirm.')
 
@@ -10758,12 +10938,15 @@ if __name__ == '__main__':
         print(json.dumps(main(sys.argv[1:]), ensure_ascii=True))
     except (Refused, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         # Never echo credentials, query text or raw application config.
-        message = str(error) if isinstance(error, Refused) else 'Operation failed safely (' + type(error).__name__ + '). Review prerequisites; partial database imports require manual cleanup.'
+        message = str(error) if isinstance(error, Refused) else 'Operation failed safely (' + type(error).__name__ + '). Review prerequisites.'
+        if not isinstance(error, Refused) and sys.argv[1:2] == ['sql']:
+            message += ' SQL imports may be partial; inspect the DB and clean manually before retrying.'
+        elif not isinstance(error, Refused) and sys.argv[1:2] == ['sync']:
+            message += ' Code copy may be partial; inspect private job reports/overwrite backups before retrying. No automatic rollback.'
         print(message, file=sys.stderr)
         sys.exit(1)
 LIUER_IMPORT_PY
 }
-
 # Canonical menu helpers embedded in liuer-panel.sh; not sourced by the panel.
 _liuer_import_api() {
     command -v python3 >/dev/null || { log_error 'Install python3 first (apt/dnf install python3).'; return 1; }
@@ -10974,29 +11157,186 @@ _import_profile_select() {
     done
 }
 
-_import_sync_menu() {
-    local domain="${1:-}" profile panel kind probe source choice
+_import_sync_single() {
+    local domain="${1:-}" profile panel kind probe source choice acknowledgment result
     _import_profile_select || return
     profile="$IMPORT_PROFILE"
     while true; do
         echo '  1) CyberPanel   2) DirectAdmin   0) Back / stop batch'
-        read -r -p 'Source panel: ' choice
+        read -r -p 'Source panel: ' choice || return 0
         case "$choice" in 1) panel=cyberpanel ;; 2) panel=directadmin ;; 0|'') return ;; *) continue ;; esac
-        if [[ -z "$domain" ]]; then SELECTED_DOMAIN=''; _select_domain 'Copy remote code into EMPTY locked site' || return; domain="$SELECTED_DOMAIN"; fi
+        if [[ -z "$domain" ]]; then SELECTED_DOMAIN=''; _select_domain 'Copy / overwrite remote website code' || return; domain="$SELECTED_DOMAIN"; fi
         kind=$(sed -n 's/^TYPE=//p' "${SITES_META_DIR}/${domain}.conf")
         probe=$(_liuer_import_api probe "$profile" "$panel" "$domain" "$kind") || { press_enter; domain=''; continue; }
         printf '%s\n' "$probe"
-        read -r -p 'Concrete source /home/... project path (0=back, S=skip this site): ' source
+        read -r -p 'Concrete source /home/... project path (0=back, S=skip this site): ' source || return 0
         case "$source" in 0) return ;; s|S|'') domain=''; continue ;; esac
-        log_warn 'Destination must be LOCKED and EMPTY. Laravel: select whole project containing artisan + public/index.php. No --delete/overwrite, symlinks omitted.'
         printf 'Source: %s\nDomain: %s\n' "$source" "$domain"
-        if confirm_action 'Copy code only? DB/config are independent; site stays locked.'; then
-            _liuer_import_api sync "$profile" "$panel" "$domain" "$source" --confirm
+        printf '\033[1;31m\nCANH BAO: LENH COPY SE COPY VA GHI DE FILE TRUNG TEN TREN WEBSITE DICH!\nKhong can Lock. Website dang chay co the loi/tam gian doan khi thay code.\nwp-config.php / .env cung bi ghi de neu nguon co; can sua ket noi DB rieng.\nFile cu bi ghi de duoc backup truoc; file chi co o dich duoc giu, KHONG --delete.\nCopy khong phai giao dich toan site: neu loi giua chung co the da thay mot so file.\033[0m\n'
+        log_warn 'Laravel: chon toan bo project co artisan + public/index.php. Khong tu import DB, doi DNS, Lock/Unlock hay dung cron/queue. Symlink/file dac biet tu nguon bi bo qua; xung dot symlink/file-thu muc o dich se bi tu choi.'
+        read -r -p "Go GHI DE ${domain} de tiep tuc, 0/Enter de huy: " acknowledgment || return
+        if [[ "$acknowledgment" == "GHI DE ${domain}" ]]; then
+            if result=$(_liuer_import_api sync "$profile" "$panel" "$domain" "$source" --overwrite-confirmed --confirm); then
+                if python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert d.get("copied") is True and d.get("overwrite_confirmed") is True and d.get("domain")==sys.argv[2]; print("Backup file cu: "+str(d.get("backup",""))); print("File moi: %s | Ghi de: %s"%(d.get("files_created",0),d.get("files_overwritten",0)))' "$result" "$domain"; then
+                    log_success 'COPY HOAN TAT. Khong import DB hoac doi trang thai site. Kiem tra ket noi DB va code truoc khi su dung.'
+                else
+                    log_error 'CHUA XAC NHAN DUOC KET QUA COPY. Kiem tra website/backup; khong tu chay lai.'
+                fi
+            else
+                log_error 'COPY THAT BAI / CHUA HOAN TAT. Co the da ghi de mot so file; xem bao cao/backup truoc khi thu lai. Khong tu rollback hoac import DB.'
+            fi
+        else
+            log_info 'Da huy copy; chua ghi de code.'
         fi
         press_enter
-        confirm_action 'Copy another domain using this SSH connection (no new password)?' || return
+        confirm_action 'Copy another domain using this SSH connection (no new password)?' || return 0
         domain=''
     done
+}
+
+_import_batch_json() {
+    # JSON travels on a private inherited FD, not argv (large site lists can
+    # exceed Linux/macOS per-argument limits). No application code is executed.
+    local payload="$1"; shift
+    python3 -I -c '
+import json,os,re,sys
+safe=lambda v: json.dumps(str(v),ensure_ascii=True)[1:-1]
+valid_path=lambda p: isinstance(p,str) and re.fullmatch(r"/home/[A-Za-z0-9_./-]{1,500}",p) and not any(x in ["",".",".."] for x in p.split("/")[1:])
+try:
+    with os.fdopen(3) as stream: data=json.load(stream)
+    action=sys.argv[1]; args=sys.argv[2:]
+    if action=="options":
+        print("SITE DA TAO TREN VPS DICH (khong tu tao site tu VPS nguon):")
+        for i,row in enumerate(data["sites"],1): print("  %3d) %s | %s | %s"%(i,safe(row["domain"]),safe(row["type"]),safe(row["status"])))
+        for row in data.get("rejected",[])[:100]: print("  BO QUA %s: %s"%(safe(row["name"]),safe(row["reason"])))
+    elif action=="select":
+        text=args[0].strip(); rows=data["sites"]; assert len(text)<=4096 and rows
+        if text.lower()=="a": indices=set(range(1,len(rows)+1))
+        else:
+            assert not re.search(r"(^|,)\s*(,|$)",text)
+            indices=set()
+            for token in re.split(r"[\s,]+",text):
+                match=re.fullmatch(r"([1-9][0-9]{0,8})(?:-([1-9][0-9]{0,8}))?",token); assert match
+                start=int(match[1]); end=int(match[2] or match[1]); assert 1<=start<=end<=len(rows)
+                indices.update(range(start,end+1))
+        assert indices; print(json.dumps([rows[i-1] for i in sorted(indices)],ensure_ascii=True))
+    elif action=="count": print(len(data))
+    elif action=="row":
+        row=data[int(args[0])-1]; assert 1<=int(args[0])<=len(data)
+        print("|".join(str(row.get(k,"")) for k in ["domain","type","target","snapshot","source","state"]))
+    elif action=="add":
+        try:
+            with os.fdopen(4) as stream: probe=json.load(stream)
+            assert probe.get("domain")==args[0]
+            paths=probe["paths"]; assert isinstance(paths,list) and all(valid_path(p) for p in paths)
+            paths=list(dict.fromkeys(paths)); state="ready" if len(paths)==1 else ("missing" if not paths else "ambiguous")
+        except (ValueError,KeyError,AssertionError): paths=[]; state="probe-error"
+        row=dict(zip(["domain","type","target","snapshot"],args)); row.update(paths=paths,state=state,source=paths[0] if len(paths)==1 else "")
+        data.append(row); print(json.dumps(data,ensure_ascii=True))
+    elif action=="ready": print(json.dumps([r for r in data if r["state"]=="ready"],ensure_ascii=True))
+    elif action=="show":
+        for i,row in enumerate(data,1):
+            print("  %3d) %s | %s | %s\n       NGUON: %s\n       DICH : %s"%(i,safe(row["domain"]),safe(row["type"]),safe(row["state"]),safe(row["source"] or "CHUA CHON / se bo qua"),safe(row["target"])))
+    elif action=="paths":
+        index=int(args[0]); assert 1<=index<=len(data)
+        for i,path in enumerate(data[index-1]["paths"],1): print("  %s) %s"%(i,safe(path)))
+    elif action=="set":
+        index=int(args[0]); assert 1<=index<=len(data); row=data[index-1]; value=args[1]
+        if value.lower()=="s": row.update(source="",state="skipped")
+        else:
+            if value.isdigit(): assert 1<=int(value)<=len(row["paths"]); value=row["paths"][int(value)-1]
+            assert valid_path(value); row.update(source=value,state="ready")
+        print(json.dumps(data,ensure_ascii=True))
+    elif action=="result":
+        assert data.get("domain")==args[0] and data.get("copied") is True and data.get("overwrite_confirmed") is True
+        assert isinstance(data.get("backup"),str)
+        print("Backup: %s | file moi=%s | ghi de=%s"%(safe(data["backup"]),int(data["files_created"]),int(data["files_overwritten"])))
+    else: raise ValueError("Unknown action")
+except (ValueError,AssertionError,IndexError,KeyError,TypeError,OSError):
+    print("Lua chon/du lieu khong hop le. Dung A, so thu tu, dau cach/phay hoac khoang nhu 2-6; kiem tra lai danh sach.",file=sys.stderr); sys.exit(1)
+' "$@" 3<<< "$payload"
+}
+
+_import_sync_menu() {
+    # Creation wizard keeps its explicit single-site context. The general menu
+    # uses multi-select; both paths invoke the exact same guarded copy engine.
+    if [[ -n "${1:-}" ]]; then _import_sync_single "$1"; return; fi
+    local profile panel choice listing selected total i row domain kind target snapshot source state probe plan ready count
+    local edit value acknowledgment result detail summary completed failed pending skipped stopped
+    _import_profile_select || return
+    profile="$IMPORT_PROFILE"
+    while true; do
+        echo '  1) CyberPanel   2) DirectAdmin   0) Back'
+        read -r -p 'Source panel: ' choice || return 0
+        case "$choice" in 1) panel=cyberpanel; break ;; 2) panel=directadmin; break ;; 0|'') return 0 ;; *) log_warn 'Chi chon 1, 2 hoac 0.' ;; esac
+    done
+    while true; do
+        listing=$(_liuer_import_api sites) || { log_error 'Khong doc duoc danh sach site dich.'; return 1; }
+        _import_batch_json "$listing" options || return 1
+        echo '  A) Chon tat ca   |   Vi du: 1 3 5 / 1,3,5 / 2-6   |   0) Quay lai'
+        read -r -p 'Chon cac domain: ' choice || return 0
+        case "$choice" in 0|'') return 0 ;; esac
+        selected=$(_import_batch_json "$listing" select "$choice") || continue
+        total=$(_import_batch_json "$selected" count) || return 1
+        plan='[]'; i=1
+        while [[ "$i" -le "$total" ]]; do
+            row=$(_import_batch_json "$selected" row "$i") || return 1
+            IFS='|' read -r domain kind target snapshot source state <<< "$row"
+            log_info "Do nguon ${i}/${total}: ${domain} (${kind})..."
+            probe=$(_liuer_import_api probe "$profile" "$panel" "$domain" "$kind") || probe='{}'
+            plan=$(_import_batch_json "$plan" add "$domain" "$kind" "$target" "$snapshot" 4<<< "$probe") || return 1
+            i=$((i+1))
+        done
+        while true; do
+            print_section 'KIEM TRA DOT COPY / GHI DE'
+            _import_batch_json "$plan" show || return 1
+            ready=$(_import_batch_json "$plan" ready) || return 1
+            count=$(_import_batch_json "$ready" count) || return 1
+            printf '\033[1;31m\nCANH BAO: COPY SE GHI DE FILE TRUNG TEN CUA %s WEBSITE SAN SANG O TREN!\nKhong can Lock. Website dang chay co the gian doan; wp-config.php / .env cung bi ghi de neu nguon co.\nBackup file cu truoc khi ghi de; giu file chi co o dich, KHONG --delete.\nDB/ket noi DB la buoc rieng. Khong tu doi DNS, trang thai site hay dung cron/queue.\nNeu mot site loi se DUNG DOT; site da copy khong tu rollback, site con lai chua chay.\033[0m\n' "$count"
+            echo '  E) Sua duong dan nguon / bo qua site (missing/ambiguous/probe-error KHONG tu copy)'
+            echo '  B) Chon lai domain   |   0) Huy toan bo, khong ghi de'
+            read -r -p "Go GHI DE ${count} DOMAIN de copy ${count} site ready, hoac E/B/0: " acknowledgment || return 0
+            case "$acknowledgment" in
+                0|'') log_info 'Da huy dot copy; chua ghi de code.'; return 0 ;;
+                b|B) break ;;
+                e|E)
+                    read -r -p 'So thu tu site can sua (0=quay lai): ' edit || return 0
+                    [[ "$edit" != 0 && -n "$edit" ]] || continue
+                    _import_batch_json "$plan" paths "$edit" || continue
+                    read -r -p 'Chon so duong dan / nhap /home/...; S=bo qua site; 0/Enter=giu nguyen: ' value || return 0
+                    [[ "$value" != 0 && -n "$value" ]] || continue
+                    if result=$(_import_batch_json "$plan" set "$edit" "$value"); then plan="$result"; fi
+                    continue ;;
+            esac
+            [[ "$count" -gt 0 && "$acknowledgment" == "GHI DE ${count} DOMAIN" ]] && break
+            log_warn 'Chua xac nhan dung. Khong co site nao duoc copy.'
+        done
+        [[ "$acknowledgment" != b && "$acknowledgment" != B ]] && break
+    done
+    summary=''; completed=0; failed=0; pending=0; skipped=0; stopped=0; i=1
+    while [[ "$i" -le "$total" ]]; do
+        row=$(_import_batch_json "$plan" row "$i") || return 1
+        IFS='|' read -r domain kind target snapshot source state <<< "$row"
+        if [[ "$state" != ready ]]; then
+            summary+="${domain} | BO QUA (${state})"$'\n'; skipped=$((skipped+1))
+        elif [[ "$stopped" == 1 ]]; then
+            summary+="${domain} | CHUA CHAY (dot da dung)"$'\n'; pending=$((pending+1))
+        else
+            log_info "COPY ${i}/${total}: ${domain} -> ${target}"
+            if result=$(_liuer_import_api sync "$profile" "$panel" "$domain" "$source" --site-snapshot "$snapshot" --overwrite-confirmed --confirm) && detail=$(_import_batch_json "$result" result "$domain"); then
+                log_success "COPY HOAN TAT: ${domain}. ${detail}"
+                summary+="${domain} | OK | ${detail}"$'\n'; completed=$((completed+1))
+            else
+                log_error "COPY CHUA HOAN TAT: ${domain}. Co the da thay mot so file; kiem tra bao cao/backup. Khong tu retry/rollback; dung cac site con lai."
+                summary+="${domain} | LOI / CAN KIEM TRA BACKUP"$'\n'; failed=$((failed+1)); stopped=1
+            fi
+        fi
+        i=$((i+1))
+    done
+    print_section 'KET QUA DOT COPY'
+    printf '%s\nOK: %s | Loi: %s | Bo qua: %s | Chua chay: %s\n' "$summary" "$completed" "$failed" "$skipped" "$pending"
+    log_info 'Khong import DB, sua ket noi DB hoac doi trang thai site. Kiem tra config/ket noi DB cua tung domain rieng.'
+    press_enter
 }
 
 _import_create_site() {
@@ -11017,7 +11357,7 @@ _import_create_site() {
         break
     done
     while true; do
-        echo '  1) Copy code (optional)  2) Import SQL (optional)  3) Update WP/Laravel DB connection (optional)'
+        echo '  1) Copy / overwrite code (optional)  2) Import SQL (optional)  3) Update WP/Laravel DB connection (optional)'
         echo '  0) Finish / skip remaining steps (site stays locked; no DNS changes)'
         read -r -p 'Next independent step: ' choice
         case "$choice" in 1) _import_sync_menu "$domain" ;; 2) _import_sql_menu "$domain" ;; 3) _import_config_menu "$domain" ;; 0|'') return ;; *) log_warn 'Invalid selection.' ;; esac
@@ -11029,7 +11369,7 @@ _import_menu() {
     while true; do
         print_section 'IMPORT / MIGRATION'
         echo '  1) Prepare private SQL directory (root SFTP upload)'
-        echo '  2) Copy code from CyberPanel / DirectAdmin (batch, same SSH key)'
+        echo '  2) Copy / overwrite code: select many / all domains (same SSH key)'
         echo '  3) Import SQL into existing EMPTY database'
         echo '  4) Update WordPress / Laravel DB connection only'
         echo '  5) List / clean uploaded SQL (confirmation required)'
@@ -11051,7 +11391,6 @@ _import_menu() {
         esac
     done
 }
-
 # END EMBEDDED IMPORT TOOLS
 
 main_menu() {
