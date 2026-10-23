@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.27"
+readonly VERSION="2.7.28"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -10667,33 +10667,8 @@ def seal_received_tree(source, depth=0):
                 os.close(src)
 
 
-def copy_bytes(source, destination, info):
-    """Bounded snapshot copy through pinned FDs, never application code."""
-    space = os.fstatvfs(destination)
-    require(space.f_bavail * space.f_frsize > info.st_size + 1024 ** 3, 'Insufficient disk reserve for code/overwrite backups.')
-    remaining = info.st_size
-    while remaining:
-        chunk = os.read(source, min(remaining, 1024 * 1024))
-        require(chunk, 'File changed while preparing code/backup; review before retrying.')
-        view = memoryview(chunk)
-        while view:
-            written = os.write(destination, view)
-            require(written > 0, 'Cannot write code/backup snapshot.')
-            view = view[written:]
-        remaining -= len(chunk)
-        copy_progress(size=len(chunk))
-    require(fingerprint(os.fstat(source)) == fingerprint(info), 'File changed while preparing code/backup; review before retrying.')
-    # No fsync per file: backup preparation is completed before replacements,
-    # but this is not a power-loss-durable or whole-site atomic transaction.
-
-
-def overlay_plan(source, target, backup, owner, plan, prefix='', depth=0):
-    """Validate touched paths and back up EVERY overwritten file before writes.
-
-    Unmatched destination entries are not visited or deleted. Destination links,
-    hardlinks, special files and file/directory conflicts are never followed or
-    automatically removed. Backup directories/files remain root-only.
-    """
+def overlay_plan(source, target, owner, plan, prefix='', depth=0):
+    """Validate all touched paths before writes. No old-file content backup."""
     require(depth <= 64 and len(plan) < 200000, 'Code tree is too large/deep; migrate manually.')
     for name in sorted(os.listdir(source)):
         relative = prefix + name
@@ -10707,19 +10682,16 @@ def overlay_plan(source, target, backup, owner, plan, prefix='', depth=0):
         if stat.S_ISDIR(incoming.st_mode):
             require(current is None or stat.S_ISDIR(current.st_mode), 'Destination path conflicts with an incoming directory: ' + json.dumps(relative))
             src = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=source)
-            dst = saved = None
+            dst = None
             try:
                 if current is not None:
                     dst = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=target)
                     require((os.fstat(dst).st_dev, os.fstat(dst).st_ino) == (current.st_dev, current.st_ino), 'Destination directory changed during preflight.')
-                os.mkdir(name, 0o700, dir_fd=backup)
-                saved = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=backup)
                 plan[relative] = {'kind': 'directory', 'expected': [current.st_dev, current.st_ino] if current else None}
-                overlay_plan(src, dst, saved, owner, plan, relative + '/', depth + 1)
+                overlay_plan(src, dst, owner, plan, relative + '/', depth + 1)
             finally:
                 os.close(src)
                 if dst is not None: os.close(dst)
-                if saved is not None: os.close(saved)
         else:
             require(stat.S_ISREG(incoming.st_mode) and incoming.st_nlink == 1, 'Incoming special file/hardlink refused.')
             require(current is None or (stat.S_ISREG(current.st_mode) and current.st_nlink == 1
@@ -10727,16 +10699,6 @@ def overlay_plan(source, target, backup, owner, plan, prefix='', depth=0):
             row = {'kind': 'file', 'expected': fingerprint(current) if current else None}
             if current is not None:
                 row.update({'uid': current.st_uid, 'gid': current.st_gid, 'mode': stat.S_IMODE(current.st_mode)})
-                original = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=target)
-                saved = None
-                try:
-                    require(fingerprint(os.fstat(original)) == row['expected'], 'Destination file changed before backup.')
-                    saved = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=backup)
-                    os.fchmod(saved, 0o600)
-                    copy_bytes(original, saved, current)
-                finally:
-                    os.close(original)
-                    if saved is not None: os.close(saved)
             plan[relative] = row
             copy_progress(files=1)
 
@@ -10756,7 +10718,7 @@ def apply_overlay(source, target, owner, plan, counts, prefix=''):
             try:
                 info = os.fstat(dst)
                 if not created:
-                    require([info.st_dev, info.st_ino] == row['expected'], 'Destination directory changed after backup; stopped.')
+                    require([info.st_dev, info.st_ino] == row['expected'], 'Destination directory changed after preflight; stopped.')
                 src = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=source)
                 apply_overlay(src, dst, owner, plan, counts, relative + '/')
                 if created:
@@ -10779,7 +10741,7 @@ def apply_overlay(source, target, owner, plan, counts, prefix=''):
                     current = os.stat(name, dir_fd=target, follow_symlinks=False)
                 except FileNotFoundError:
                     current = None
-                require((fingerprint(current) if current else None) == row['expected'], 'Destination file changed since backup: ' + json.dumps(relative) + '. Stopped; review running writers.')
+                require((fingerprint(current) if current else None) == row['expected'], 'Destination file changed since preflight: ' + json.dumps(relative) + '. Stopped; review running writers.')
                 if row['expected'] is None:
                     # Atomic create without clobbering a file that appeared
                     # after validation. Both names are on this same filesystem.
@@ -10795,29 +10757,24 @@ def apply_overlay(source, target, owner, plan, counts, prefix=''):
 
 
 def merge_code(source, target, report, owner, target_path=None):
-    backup_path = report + '/code-before'
-    os.mkdir(backup_path, 0o700)
-    backup = directory(backup_path, private=True)
     counts = {'files_created': 0, 'files_overwritten': 0, 'directories_created': 0}
     plan = {}
     try:
         require(os.fstat(source).st_dev == os.fstat(target).st_dev, 'Receiving area and destination must share a filesystem.')
-        copy_progress('KIEM TRA + BACKUP FILE CU')
-        overlay_plan(source, target, backup, owner, plan)
+        copy_progress('KIEM TRA TRUOC GHI DE (KHONG BACKUP)')
+        overlay_plan(source, target, owner, plan)
         with open(report + '/code-manifest.json', 'x') as manifest:
             os.fchmod(manifest.fileno(), 0o600)
-            json.dump({'schema': 1, 'target': target_path, 'entries': plan, 'backup': backup_path}, manifest, ensure_ascii=True)
+            json.dump({'schema': 2, 'target': target_path, 'entries': plan, 'backup_created': False}, manifest, ensure_ascii=True)
             manifest.flush()
             os.fsync(manifest.fileno())
         copy_progress('DUA FILE VAO WEBSITE (KHONG COPY LAI NOI DUNG)')
         apply_overlay(source, target, owner, plan, counts)
         copy_progress(force=True)
-        return dict(counts, backup=backup_path)
+        return dict(counts, backup_created=False)
     except (Refused, OSError) as error:
         message = str(error) if isinstance(error, Refused) else type(error).__name__
-        raise Refused('Code copy stopped: ' + message + '. Applied so far: ' + json.dumps(counts) + '. Review destination before retrying; file-by-file copy is not transactional and no automatic rollback is performed. Original conflicting files backed up under ' + backup_path + ' (check code-manifest.json; backup preparation may be incomplete). No DB import or automatic site-state change.') from None
-    finally:
-        os.close(backup)
+        raise Refused('Code copy stopped: ' + message + '. Applied so far: ' + json.dumps(counts) + '. Review destination before retrying; file-by-file copy is not transactional. NO CODE BACKUP or automatic rollback; overwritten old contents cannot be restored by this tool. Metadata-only report: ' + report + '/code-manifest.json. No DB import or automatic site-state change.') from None
 
 
 @contextlib.contextmanager
@@ -10842,7 +10799,7 @@ def receiving_area(target, identity):
     finally:
         os.close(parent)
         if path is not None:
-            copy_progress('DON VUNG TAM (GIU BACKUP)')
+            copy_progress('DON VUNG TAM')
             shutil.rmtree(path)
 
 
@@ -10883,7 +10840,7 @@ def receive_rsync(command, identity, receive, report):
                     copy_progress(detail='Dang quet/nhan file; %ss tu du lieu rsync gan nhat (khong phai %% hoan tat).' % int(now - last_activity), force=True)
             process.wait(timeout=5)
             require(process.returncode == 0, 'Rsync failed; destination code was not changed. Private log: ' + report + '/rsync.log')
-            copy_progress(detail='DA NHAN XONG CODE (rsync exit=0); con backup/dua file. So lieu rsync cuoi: ' + (last_detail or 'khong co'), force=True)
+            copy_progress(detail='DA NHAN XONG CODE (rsync exit=0); con kiem tra/dua file, KHONG backup. So lieu rsync cuoi: ' + (last_detail or 'khong co'), force=True)
         finally:
             selector.close()
             # Kill only the owned operation's process group (SSH included).
@@ -10939,11 +10896,11 @@ def sync_code(identifier, panel, domain, source, expected_site=None):
                 finally:
                     os.close(source_fd)
                     if target_fd is not None: os.close(target_fd)
-        copy_progress('HOAN TAT', 'Backup: ' + outcome['backup'], force=True)
+        copy_progress('HOAN TAT', 'KHONG BACKUP CODE. Bao cao: ' + report, force=True)
         return dict(outcome, domain=domain, copied=True, target=target, overwrite_confirmed=True,
                     locked=data.get('STATUS') == 'locked', site_status=data.get('STATUS'), database_imported=False,
                     report=report, transfer_mode='rsync-single-receive-rename',
-                    note='Single rsync receive on the destination filesystem, then rename/link promotion without another payload copy. Old conflicting files backed up; destination-only entries retained. No --delete, DB import, DNS or site-state change. Incoming links/special files omitted; destination conflicts refused. Backups are not power-loss-durable snapshots. Copied wp-config.php/.env retain SOURCE credentials; update separately.')
+                    note='Single rsync receive then same-filesystem rename/link promotion. NO CODE BACKUP; old overwritten contents are not retained. Existing older backup directories are not removed. Destination-only entries retained. No --delete, DB import, DNS or site-state change. Incoming links/special files omitted; destination conflicts refused. Copied wp-config.php/.env retain SOURCE credentials; update separately.')
     finally:
         COPY_PROGRESS = None
 
@@ -10954,7 +10911,9 @@ def main(arguments):
     def interrupted(signum, frame):
         if arguments[:1] == ['sql']:
             raise Refused('SQL import interrupted; DB may be partial. Review and clean manually before retrying. Source SQL is retained.')
-        raise Refused('Operation interrupted. Code copy/config may be partial; inspect private job reports/backups before retrying. No automatic rollback or DB cleanup.')
+        if arguments[:1] == ['sync']:
+            raise Refused('Code copy interrupted; changes may be partial. NO CODE BACKUP or automatic rollback. Inspect private job reports and destination before retrying; no DB cleanup is needed for code copy.')
+        raise Refused('Operation interrupted. Inspect private job reports before retrying. No automatic rollback or DB cleanup.')
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
     require(arguments, 'Missing import operation.')
@@ -10992,9 +10951,9 @@ def main(arguments):
             password = os.read(3, 4096).decode('utf-8')
             return update_config(args[0], password)
         if action == 'sync':
-            if len(args) == 8 and args[4] == '--site-snapshot' and args[6:] == ['--overwrite-confirmed', '--confirm']:
+            if len(args) == 9 and args[4] == '--site-snapshot' and args[6:] == ['--overwrite-confirmed', '--confirm', '--no-code-backup']:
                 return sync_code(*args[:4], expected_site=args[5])
-            require(len(args) == 6 and args[4:] == ['--overwrite-confirmed', '--confirm'], 'Code overwrite requires explicit --overwrite-confirmed --confirm. Update the CLI/Web Panel and acknowledge the red overwrite warning; old copy jobs are not automatically upgraded.')
+            require(len(args) == 7 and args[4:] == ['--overwrite-confirmed', '--confirm', '--no-code-backup'], 'Code overwrite WITHOUT BACKUP requires explicit --overwrite-confirmed --confirm --no-code-backup. Update the CLI/Web Panel and acknowledge the red no-backup warning; old copy jobs are not automatically upgraded.')
             return sync_code(*args[:4])
         raise Refused('Invalid operation/arguments or missing explicit --confirm.')
 
@@ -11008,7 +10967,7 @@ if __name__ == '__main__':
         if not isinstance(error, Refused) and sys.argv[1:2] == ['sql']:
             message += ' SQL imports may be partial; inspect the DB and clean manually before retrying.'
         elif not isinstance(error, Refused) and sys.argv[1:2] == ['sync']:
-            message += ' Code copy may be partial; inspect private job reports/overwrite backups before retrying. No automatic rollback.'
+            message += ' Code copy may be partial; inspect private job reports/destination before retrying. NO CODE BACKUP or automatic rollback.'
         print(message, file=sys.stderr)
         sys.exit(1)
 LIUER_IMPORT_PY
@@ -11244,19 +11203,19 @@ _import_sync_single() {
         read -r -p 'Concrete source /home/... project path (0=back, S=skip this site): ' source || return 0
         case "$source" in 0) return ;; s|S|'') domain=''; continue ;; esac
         printf 'Source: %s\nDomain: %s\n' "$source" "$domain"
-        printf '\033[1;31m\nCANH BAO: LENH COPY SE COPY VA GHI DE FILE TRUNG TEN TREN WEBSITE DICH!\nKhong can Lock. Website dang chay co the loi/tam gian doan khi thay code.\nwp-config.php / .env cung bi ghi de neu nguon co; can sua ket noi DB rieng.\nFile cu bi ghi de duoc backup truoc; file chi co o dich duoc giu, KHONG --delete.\nCopy khong phai giao dich toan site: neu loi giua chung co the da thay mot so file.\033[0m\n'
+        printf '\033[1;31m\nCANH BAO: LENH COPY SE COPY VA GHI DE FILE TRUNG TEN TREN WEBSITE DICH!\nKHONG BACKUP CODE: FILE CU BI GHI DE KHONG DUOC GIU LAI DE KHOI PHUC!\nKhong can Lock. Website dang chay co the loi/tam gian doan khi thay code.\nwp-config.php / .env cung bi ghi de neu nguon co; can sua ket noi DB rieng.\nFile chi co o dich duoc giu, KHONG --delete. Backup cu neu co van giu nguyen.\nCopy khong phai giao dich toan site: neu loi giua chung co the da thay mot so file.\033[0m\n'
         log_warn 'Laravel: chon toan bo project co artisan + public/index.php. Khong tu import DB, doi DNS, Lock/Unlock hay dung cron/queue. Symlink/file dac biet tu nguon bi bo qua; xung dot symlink/file-thu muc o dich se bi tu choi.'
         _import_copy_confirmation_hint "GHI DE ${domain}"
         read -r -p 'Nhập đúng dòng màu đỏ ở trên; 0/Enter để hủy: ' acknowledgment || return
         if [[ "$acknowledgment" == "GHI DE ${domain}" ]]; then
-            if result=$(_liuer_import_api sync "$profile" "$panel" "$domain" "$source" --overwrite-confirmed --confirm); then
-                if python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert d.get("copied") is True and d.get("overwrite_confirmed") is True and d.get("domain")==sys.argv[2]; print("Backup file cu: "+str(d.get("backup",""))); print("File moi: %s | Ghi de: %s"%(d.get("files_created",0),d.get("files_overwritten",0)))' "$result" "$domain"; then
+            if result=$(_liuer_import_api sync "$profile" "$panel" "$domain" "$source" --overwrite-confirmed --confirm --no-code-backup); then
+                if python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert d.get("copied") is True and d.get("overwrite_confirmed") is True and d.get("domain")==sys.argv[2] and d.get("backup_created") is False; print("KHONG BACKUP CODE. Bao cao: "+str(d.get("report",""))); print("File moi: %s | Ghi de: %s"%(d.get("files_created",0),d.get("files_overwritten",0)))' "$result" "$domain"; then
                     log_success 'COPY HOAN TAT. Khong import DB hoac doi trang thai site. Kiem tra ket noi DB va code truoc khi su dung.'
                 else
-                    log_error 'CHUA XAC NHAN DUOC KET QUA COPY. Kiem tra website/backup; khong tu chay lai.'
+                    log_error 'CHUA XAC NHAN DUOC KET QUA COPY. Kiem tra website/bao cao; khong backup code, khong tu chay lai.'
                 fi
             else
-                log_error 'COPY THAT BAI / CHUA HOAN TAT. Co the da ghi de mot so file; xem bao cao/backup truoc khi thu lai. Khong tu rollback hoac import DB.'
+                log_error 'COPY THAT BAI / CHUA HOAN TAT. Co the da ghi de mot so file; xem bao cao/website truoc khi thu lai. KHONG BACKUP CODE, khong tu rollback hoac import DB.'
             fi
         else
             log_info 'Da huy copy; chua ghi de code.'
@@ -11322,8 +11281,8 @@ try:
         print(json.dumps(data,ensure_ascii=True))
     elif action=="result":
         assert data.get("domain")==args[0] and data.get("copied") is True and data.get("overwrite_confirmed") is True
-        assert isinstance(data.get("backup"),str)
-        print("Backup: %s | file moi=%s | ghi de=%s"%(safe(data["backup"]),int(data["files_created"]),int(data["files_overwritten"])))
+        assert data.get("backup_created") is False and isinstance(data.get("report"),str)
+        print("KHONG BACKUP CODE | Bao cao: %s | file moi=%s | ghi de=%s"%(safe(data["report"]),int(data["files_created"]),int(data["files_overwritten"])))
     else: raise ValueError("Unknown action")
 except (ValueError,AssertionError,IndexError,KeyError,TypeError,OSError):
     print("Lua chon/du lieu khong hop le. Dung A, so thu tu, dau cach/phay hoac khoang nhu 2-6; kiem tra lai danh sach.",file=sys.stderr); sys.exit(1)
@@ -11365,7 +11324,7 @@ _import_sync_menu() {
             _import_batch_json "$plan" show || return 1
             ready=$(_import_batch_json "$plan" ready) || return 1
             count=$(_import_batch_json "$ready" count) || return 1
-            printf '\033[1;31m\nCANH BAO: COPY SE GHI DE FILE TRUNG TEN CUA %s WEBSITE SAN SANG O TREN!\nKhong can Lock. Website dang chay co the gian doan; wp-config.php / .env cung bi ghi de neu nguon co.\nBackup file cu truoc khi ghi de; giu file chi co o dich, KHONG --delete.\nDB/ket noi DB la buoc rieng. Khong tu doi DNS, trang thai site hay dung cron/queue.\nNeu mot site loi se DUNG DOT; site da copy khong tu rollback, site con lai chua chay.\033[0m\n' "$count"
+            printf '\033[1;31m\nCANH BAO: COPY SE GHI DE FILE TRUNG TEN CUA %s WEBSITE SAN SANG O TREN!\nKHONG BACKUP CODE: FILE CU BI GHI DE KHONG DUOC GIU LAI DE KHOI PHUC!\nKhong can Lock. Website dang chay co the gian doan; wp-config.php / .env cung bi ghi de neu nguon co.\nGiu file chi co o dich, KHONG --delete; backup cu neu co khong bi xoa.\nDB/ket noi DB la buoc rieng. Khong tu doi DNS, trang thai site hay dung cron/queue.\nNeu mot site loi se DUNG DOT; site da copy khong tu rollback, site con lai chua chay.\033[0m\n' "$count"
             echo '  E) Sua duong dan nguon / bo qua site (missing/ambiguous/probe-error KHONG tu copy)'
             echo '  B) Chon lai domain   |   0) Huy toan bo, khong ghi de'
             if [[ "$count" -gt 0 ]]; then
@@ -11403,12 +11362,12 @@ _import_sync_menu() {
             summary+="${domain} | CHUA CHAY (dot da dung)"$'\n'; pending=$((pending+1))
         else
             log_info "COPY ${i}/${total}: ${domain} -> ${target}"
-            if result=$(_liuer_import_api sync "$profile" "$panel" "$domain" "$source" --site-snapshot "$snapshot" --overwrite-confirmed --confirm) && detail=$(_import_batch_json "$result" result "$domain"); then
+            if result=$(_liuer_import_api sync "$profile" "$panel" "$domain" "$source" --site-snapshot "$snapshot" --overwrite-confirmed --confirm --no-code-backup) && detail=$(_import_batch_json "$result" result "$domain"); then
                 log_success "COPY HOAN TAT: ${domain}. ${detail}"
                 summary+="${domain} | OK | ${detail}"$'\n'; completed=$((completed+1))
             else
-                log_error "COPY CHUA HOAN TAT: ${domain}. Co the da thay mot so file; kiem tra bao cao/backup. Khong tu retry/rollback; dung cac site con lai."
-                summary+="${domain} | LOI / CAN KIEM TRA BACKUP"$'\n'; failed=$((failed+1)); stopped=1
+                log_error "COPY CHUA HOAN TAT: ${domain}. Co the da thay mot so file; kiem tra bao cao/website. KHONG BACKUP CODE, khong tu retry/rollback; dung cac site con lai."
+                summary+="${domain} | LOI / CAN KIEM TRA WEBSITE"$'\n'; failed=$((failed+1)); stopped=1
             fi
         fi
         i=$((i+1))
