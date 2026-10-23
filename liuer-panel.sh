@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.28"
+readonly VERSION="2.7.29"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -10508,10 +10508,92 @@ def profile(identifier):
     fd = directory(path, private=True)
     os.close(fd)
     data = json.loads(read_private(path + '/connection.json'))
+    require(isinstance(data, dict), 'Invalid SSH connection metadata.')
     require(data.get('id') == identifier and valid_host(data.get('host', ''))
-            and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]{0,31}', data.get('user', ''))
+            and isinstance(data.get('user'), str)
+            and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]{0,31}', data['user'])
             and isinstance(data.get('port'), int) and 1 <= data['port'] <= 65535, 'Invalid SSH connection metadata.')
     return data
+
+
+PROFILE_FILES = {'connection.json', 'key', 'key.pub', 'known_hosts', 'known_hosts.old'}
+
+
+def inspect_profile_directory(fd):
+    info = os.fstat(fd)
+    require(info.st_uid == 0 and info.st_mode & 0o077 == 0, 'SSH connection directory must be root-owned/private; review it manually.')
+    entries = []
+    for name in sorted(os.listdir(fd)):
+        require(name in PROFILE_FILES, 'Unexpected file/subdirectory in SSH connection; nothing deleted. Review manually.')
+        item = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        require(stat.S_ISREG(item.st_mode) and item.st_uid == 0 and item.st_nlink == 1, 'SSH connection contains a link/special/non-root file; nothing deleted. Review manually.')
+        entries.append({'name': name, 'fingerprint': fingerprint(item)})
+    snapshot = hashlib.sha256(json.dumps({'directory': [info.st_dev, info.st_ino], 'entries': entries}, sort_keys=True).encode()).hexdigest()
+    return entries, snapshot
+
+
+def profile_inventory():
+    result = {'profiles': [], 'rejected': []}
+    if not os.path.lexists(PROFILES): return result
+    parent = directory(PROFILES, private=True)
+    try:
+        for identifier in sorted(os.listdir(parent)):
+            if not re.fullmatch(r'[a-f0-9]{24}', identifier):
+                result['rejected'].append({'id': identifier, 'reason': 'Not a managed SSH connection ID; manual review only.'})
+                continue
+            child = None
+            try:
+                child = os.open(identifier, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+                entries, snapshot = inspect_profile_directory(child)
+                row = {'id': identifier, 'snapshot': snapshot, 'files': [entry['name'] for entry in entries], 'configured': False}
+                try:
+                    metadata = profile(identifier)
+                    row.update({key: metadata[key] for key in ['host', 'port', 'user']})
+                    row['configured'] = True
+                except (Refused, OSError, ValueError, KeyError, TypeError):
+                    # Failed/incomplete setup can also be removed safely. Do
+                    # not expose key contents or unvalidated metadata fields.
+                    pass
+                result['profiles'].append(row)
+            except (Refused, OSError) as error:
+                result['rejected'].append({'id': identifier, 'reason': str(error) if isinstance(error, Refused) else 'Cannot inspect this connection safely; manual review required.'})
+            finally:
+                if child is not None: os.close(child)
+    finally:
+        os.close(parent)
+    return result
+
+
+def delete_profile(identifier, expected):
+    require(re.fullmatch(r'[a-f0-9]{24}', identifier) and re.fullmatch(r'[a-f0-9]{64}', expected), 'Select an exact managed SSH connection and its current snapshot.')
+    parent = directory(PROFILES, private=True)
+    child = None; removed = []
+    try:
+        child = os.open(identifier, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        info = os.fstat(child)
+        entries, actual = inspect_profile_directory(child)
+        require(actual == expected, 'SSH connection changed after selection; refresh before deleting. Nothing deleted.')
+        # Validate the COMPLETE allowlisted set before unlinking any key.
+        for row in entries:
+            require(fingerprint(os.stat(row['name'], dir_fd=child, follow_symlinks=False)) == row['fingerprint'], 'SSH connection changed before deletion. Nothing deleted.')
+        current = os.stat(identifier, dir_fd=parent, follow_symlinks=False)
+        require((current.st_dev, current.st_ino) == (info.st_dev, info.st_ino), 'SSH connection directory changed. Nothing deleted.')
+        for row in entries:
+            require(fingerprint(os.stat(row['name'], dir_fd=child, follow_symlinks=False)) == row['fingerprint'], 'SSH connection changed during deletion; inspect remaining files.')
+            os.unlink(row['name'], dir_fd=child)
+            removed.append(row['name'])
+        current = os.stat(identifier, dir_fd=parent, follow_symlinks=False)
+        require((current.st_dev, current.st_ino) == (info.st_dev, info.st_ino), 'SSH connection directory changed during deletion; inspect remaining entry.')
+        os.rmdir(identifier, dir_fd=parent)
+        return {'connection': identifier, 'deleted': True, 'removed_files': removed, 'remote_key_revoked': False,
+                'note': 'Local Liuer connection/key removed only. Source authorized_keys was NOT changed; revoke the key with comment liuer-transfer-' + identifier + ' separately on the source. No website/DB/backups/global SSH keys changed.'}
+    except (Refused, OSError) as error:
+        if removed:
+            raise Refused('SSH connection deletion incomplete. Removed local files: ' + ', '.join(removed) + '. Inspect the remaining connection directory manually. No source key revocation or website/DB change.') from None
+        raise
+    finally:
+        if child is not None: os.close(child)
+        os.close(parent)
 
 
 def valid_host(value):
@@ -10922,6 +11004,8 @@ def main(arguments):
         return inventory()
     if action == 'sites' and not args:
         return site_inventory()
+    if action == 'profiles' and not args:
+        return profile_inventory()
     if action == 'permissions-inventory' and not args:
         return permission_inventory()
     if action == 'permissions' and len(args) == 2 and args[1] == '--confirm':
@@ -10941,6 +11025,8 @@ def main(arguments):
             return profile_create(*args)
         if action == 'profile-install' and len(args) == 1:
             return profile_install(*args)
+        if action == 'profile-delete' and len(args) == 3 and args[2] == '--confirm':
+            return delete_profile(*args[:2])
         if action == 'probe' and len(args) == 4:
             return probe(*args)
         if action == 'sql' and len(args) == 4 and args[3] == '--confirm':
@@ -11151,15 +11237,51 @@ _import_files_menu() {
     done
 }
 
+_import_profile_delete_menu() {
+    local listing count choice row identifier snapshot result
+    while true; do
+        listing=$(_liuer_import_api profiles) || { log_error 'Khong doc duoc danh sach ket noi SSH an toan.'; press_enter; return 1; }
+        count=$(python3 -I -c 'import json,sys; print(len(json.loads(sys.argv[1])["profiles"]))' "$listing") || return 1
+        python3 -I -c '
+import json,sys
+d=json.loads(sys.argv[1]); safe=lambda v:json.dumps(str(v),ensure_ascii=True)[1:-1]
+print("XOA KET NOI SSH CUC BO (KHONG THU HOI KEY TREN VPS NGUON)")
+for i,p in enumerate(d["profiles"],1):
+    peer=(str(p["user"])+"@"+str(p["host"])+":"+str(p["port"])) if p.get("configured") else "Thiet lap chua hoan tat / metadata khong hop le"
+    print("  %s) %s [%s]"%(i,safe(peer),p["id"]))
+for p in d.get("rejected",[])[:100]: print("  KHONG THE XOA %s: %s"%(safe(p["id"]),safe(p["reason"])))
+print("  0) Quay lai")
+' "$listing" || return 1
+        [[ "$count" -gt 0 ]] || { log_info 'Khong co ket noi du dieu kien xoa. Khong tu sua/xoa muc bat thuong.'; press_enter; return 0; }
+        read -r -p 'Chon so thu tu ket noi can XOA (0=quay lai): ' choice || return 0
+        case "$choice" in 0|'') return 0 ;; esac
+        [[ "$choice" =~ ^[1-9][0-9]*$ && ${#choice} -lt 9 ]] || { log_warn 'Nhap so thu tu trong danh sach.'; continue; }
+        row=$(python3 -I -c 'import json,sys; p=json.loads(sys.argv[1])["profiles"]; i=int(sys.argv[2])-1; assert 0<=i<len(p); r=p[i]; print(r["id"]+"|"+r["snapshot"])' "$listing" "$choice" 2>/dev/null) || { log_warn 'So thu tu khong hop le.'; continue; }
+        IFS='|' read -r identifier snapshot <<< "$row"
+        python3 -I -c 'import json,sys; r=json.loads(sys.argv[1])["profiles"][int(sys.argv[2])-1]; safe=lambda v:json.dumps(str(v),ensure_ascii=True)[1:-1]; print("Ket noi da chon: "+safe(r.get("user","?")+"@"+r.get("host","?")+":"+str(r.get("port","?")))); print("Se xoa cac file cuc bo: "+", ".join(r["files"]))' "$listing" "$choice" || return 1
+        printf '\033[1;31mChi xoa ket noi %s va key/known_hosts RIENG cua no tren VPS dich.\nKhong xoa code/DB/backup hay SSH key khac. KHONG tu xoa public key tren VPS nguon!\nThu hoi tren nguon bang cach xoa dung dong co comment: liuer-transfer-%s\033[0m\n' "$identifier" "$identifier"
+        confirm_action 'Xac nhan XOA ket noi SSH da chon? Private key cuc bo se khong con de dung lai.' || { log_info 'Da huy xoa ket noi SSH; khong thay doi file nao.'; return 0; }
+        if result=$(_liuer_import_api profile-delete "$identifier" "$snapshot" --confirm) && python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert d.get("connection")==sys.argv[2] and d.get("deleted") is True and d.get("remote_key_revoked") is False' "$result" "$identifier"; then
+            [[ "${IMPORT_PROFILE:-}" != "$identifier" ]] || IMPORT_PROFILE=''
+            log_success 'DA XOA KET NOI/KEY CUC BO. Public key tren VPS nguon van con; can thu hoi rieng.'
+        else
+            log_error 'XOA KET NOI CHUA HOAN TAT. Neu dang copy/import thi cho xong roi thu lai; neu xoa do dang hay kiem tra thu muc ket noi. Khong tu xoa key tren nguon.'
+        fi
+        press_enter; return 0
+    done
+}
+
 _import_profile_select() {
     local listing choice row host port user identifier
+    IMPORT_PROFILE=''
     while true; do
         listing=$(_liuer_import_api inventory) || return 1
         python3 -I -c 'import json,sys; [print("  %s) %s@%s:%s [%s]"%(i+1,p["user"],p["host"],p["port"],p["id"])) for i,p in enumerate(json.loads(sys.argv[1])["profiles"])]' "$listing"
         echo '  N) Set up SSH connection (one-time password + verify source host fingerprint)'
         echo '  R) Retry key installation for an existing connection'
+        echo '  D) Xoa ket noi SSH cu / Delete saved connection (local key only)'
         echo '  0) Back'
-        read -r -p 'Connection: ' choice
+        read -r -p 'Connection: ' choice || return 1
         case "$choice" in
             0|'') return 1 ;;
             n|N)
@@ -11175,6 +11297,7 @@ _import_profile_select() {
                 read -r -p 'Existing connection ID (0=back): ' identifier; [[ "$identifier" != 0 ]] || continue
                 confirm_action 'Retry adding the dedicated key to source authorized_keys?' && _liuer_import_api profile-install "$identifier"
                 continue ;;
+            d|D) _import_profile_delete_menu; continue ;;
             *)
                 [[ "$choice" =~ ^[1-9][0-9]*$ && ${#choice} -lt 5 ]] || continue
                 IMPORT_PROFILE=$(python3 -I -c 'import json,sys; a=json.loads(sys.argv[1])["profiles"]; i=int(sys.argv[2])-1; print(a[i]["id"]) if 0<=i<len(a) else sys.exit(1)' "$listing" "$choice") && return 0 ;;
