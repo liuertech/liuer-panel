@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.19"
+readonly VERSION="2.7.20"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -2028,6 +2028,14 @@ manage_web_users() {
 
 create_website() {
     print_section "CREATE NEW WEBSITE"
+    local creation_mode
+    while true; do
+        echo '  1) Normal creation (download source / empty directory)'
+        echo '  2) Migration (empty locked site; optional code copy / SQL / config)'
+        echo '  0) Back'
+        read -r -p 'Creation mode [1]: ' creation_mode
+        case "$creation_mode" in 2) _import_create_site; return ;; 0) return ;; 1|'') break ;; *) log_warn 'Invalid selection.' ;; esac
+    done
 
     # --- Domain ---
     local domain
@@ -4169,6 +4177,10 @@ change_php_version() {
 # Create DB + user + save to db_list.txt
 _create_db_for() {
     local domain="$1" db_type="${2:-mysql}"
+    if [[ -f "$DB_LIST_FILE" ]] && awk -F'|' -v d="$domain" '$1==d {found=1} END {exit !found}' "$DB_LIST_FILE"; then
+        log_error 'A managed DB mapping already exists. Reuse it for import/config; database creation never replaces that mapping.'
+        return 1
+    fi
 
     # Auto-generate credentials
     local db_name="db_$(echo "$domain" | tr '.-' '_' | cut -c1-14)_$(rand_str 4)"
@@ -9741,11 +9753,13 @@ menu_database() {
         echo "   1  Create database"
         echo "   2  List databases"
         echo "   3  Delete database"
+        echo "   4  Import / migration / SQL cleanup"
         _sub_footer; read -r _ch
         case "$_ch" in
             1) create_database ;;
             2) list_databases ;;
             3) delete_database ;;
+            4) _import_menu ;;
             0) return ;;
             *) log_warn "Invalid selection." ;;
         esac
@@ -9844,9 +9858,991 @@ menu_system() {
 # =============================================================================
 # MAIN MENU
 # =============================================================================
+# BEGIN EMBEDDED IMPORT TOOLS (canonical private sources: bin/import-tools.py, bin/import-menu.sh)
+_liuer_import_tools() {
+    python3 -I - "$@" <<'LIUER_IMPORT_PY'
+#!/usr/bin/env python3
+"""Liuer migration operations. Embedded verbatim in the standalone CLI release.
+
+No application PHP is executed. SQL is never executed by an administrative DB
+account. Root coordinates fixed-path filesystem operations; network receivers
+and SQL clients run under separate unprivileged Linux identities.
+"""
+import contextlib
+import fcntl
+import gzip
+import hashlib
+import ipaddress
+import json
+import os
+import pathlib
+import pwd
+import re
+import resource
+import secrets
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+BASE = '/var/lib/liuer-panel/imports'
+SQL = BASE + '/sql'
+PROFILES = BASE + '/connections'
+JOBS = BASE + '/jobs'
+RUNTIME = '/var/tmp/liuer-transfer'
+META = '/etc/liuer-panel/sites'
+DB_LIST = '/etc/liuer-panel/db_list.txt'
+MAX_INPUT = 2 * 1024 ** 3
+MAX_SQL = 8 * 1024 ** 3
+FILE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,180}\.sql(?:\.gz)?$')
+DOMAIN_RE = re.compile(r'^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$')
+
+
+class Refused(Exception):
+    pass
+
+
+def require(ok, message):
+    if not ok:
+        raise Refused(message)
+
+
+def directory(path, create=False, private=False):
+    """Pin a directory chain without following a single symlink."""
+    require(os.path.isabs(path) and '..' not in path.split('/'), 'Invalid directory.')
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in path.split('/')[1:]:
+            if not part:
+                continue
+            try:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                require(create, 'Directory is missing: ' + path)
+                os.mkdir(part, 0o700, dir_fd=fd)
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        info = os.fstat(fd)
+        if private:
+            require(info.st_uid == 0 and info.st_mode & 0o077 == 0, 'Import directory must be root-owned and mode 700: ' + path)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def initialize():
+    for path in [BASE, SQL, PROFILES, JOBS]:
+        fd = directory(path, True, True)
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def operation_lock():
+    initialize()
+    fd = os.open(BASE + '/operation.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        require(os.fstat(fd).st_uid == 0 and stat.S_ISREG(os.fstat(fd).st_mode), 'Unsafe operation lock.')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refused('An import/sync/config/cleanup operation is running. Retry after it finishes.')
+        yield
+    finally:
+        os.close(fd)
+
+
+def read_private(path, limit=1024 * 1024):
+    parent = directory(os.path.dirname(path))
+    try:
+        fd = os.open(os.path.basename(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == 0
+                    and info.st_mode & 0o022 == 0 and info.st_size <= limit, 'Unsafe managed metadata.')
+            return stream.read(limit + 1).decode('utf-8')
+    finally:
+        os.close(parent)
+
+
+def site(domain):
+    require(len(domain) <= 253 and DOMAIN_RE.fullmatch(domain), 'Invalid domain.')
+    data = dict(line.split('=', 1) for line in read_private(META + '/' + domain + '.conf').splitlines() if '=' in line)
+    require(data.get('DOMAIN') == domain, 'Site metadata mismatch.')
+    user = data.get('WEB_USER', '')
+    require(re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,63}', user), 'Invalid site user.')
+    account = pwd.getpwnam(user)
+    require(account.pw_uid != 0, 'Site user must not be root.')
+    root = data.get('SITE_DIR', '')
+    require(root == '/home/web/' + user + '/' + domain, 'Custom site directory requires manual migration.')
+    web = data.get('WEB_ROOT', '')
+    require(web in [root + '/public', root + '/public_html'], 'Custom document root requires manual migration.')
+    fd = directory(root)
+    os.close(fd)
+    data['_account'] = account
+    return data
+
+
+def database(domain):
+    require(DOMAIN_RE.fullmatch(domain), 'Invalid domain.')
+    require(os.path.isfile(DB_LIST), 'Create a managed database for this domain first; import never creates one.')
+    rows = [line.split('|') for line in read_private(DB_LIST).splitlines() if line.split('|')[0] == domain]
+    require(len(rows) == 1 and len(rows[0]) == 5, 'Create a managed database for this domain first; ambiguous DB mappings are refused.')
+    _, name, user, encrypted, kind = rows[0]
+    require(kind in ['mysql', 'mariadb'], 'This importer supports MySQL/MariaDB SQL only.')
+    require(re.fullmatch(r'[A-Za-z0-9_]{1,64}', name) and name.lower() not in ['mysql', 'sys', 'information_schema', 'performance_schema', 'liuer_panel'], 'Unsafe target database.')
+    require(re.fullmatch(r'[A-Za-z0-9_]{1,64}', user), 'Unsafe database user.')
+    return name, user
+
+
+def client():
+    for path in ['/usr/bin/mariadb', '/usr/bin/mysql']:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    raise Refused('MariaDB/MySQL client is not installed.')
+
+
+def admin_sql(statement):
+    result = subprocess.run([client(), '--user=root', '--protocol=socket', '--batch', '--skip-column-names'], input=statement.encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+                            env={'PATH':'/usr/bin:/bin','HOME':'/root','LC_ALL':'C'})
+    require(result.returncode == 0, 'Cannot inspect or prepare the local database. No SQL dump was run as root.')
+    return result.stdout.decode('utf-8').strip()
+
+
+def database_empty(name):
+    # Database names are strict identifiers before interpolation.
+    require(re.fullmatch(r'[A-Za-z0-9_]{1,64}', name), 'Invalid database name.')
+    exists = admin_sql("SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='" + name + "';")
+    require(exists == '1', 'Target database does not exist. Create it first; import does not create a database.')
+    count = admin_sql("SELECT (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='{0}') + (SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA='{0}') + (SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA='{0}') + (SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA='{0}');".format(name))
+    require(count == '0', 'Database already contains tables/views/routines/events. Clean it MANUALLY before importing again. No objects were deleted.')
+
+
+def fingerprint(info):
+    return hashlib.sha256(repr((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)).encode()).hexdigest()
+
+
+def open_sql(name, expected=None):
+    require(FILE_RE.fullmatch(name), 'Select a .sql or .sql.gz basename from the import directory.')
+    parent = directory(SQL, private=True)
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    finally:
+        os.close(parent)
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == 0
+                and info.st_mode & 0o077 == 0 and 0 < info.st_size <= MAX_INPUT,
+                'SQL must be a regular root-owned mode-600 file, no hardlinks, at most 2 GiB.')
+        require(expected is None or expected == fingerprint(info), 'SQL file changed since selection; refresh the list.')
+        return fd, info
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def inventory():
+    result = {'directory': SQL, 'files': [], 'profiles': [], 'rejected': 0, 'bytes': 0}
+    if not os.path.lexists(BASE):
+        return result
+    fd = directory(BASE, private=True)
+    os.close(fd)
+    if os.path.lexists(SQL):
+        fd = directory(SQL, private=True)
+        try:
+            for name in sorted(os.listdir(fd)):
+                if not FILE_RE.fullmatch(name):
+                    result['rejected'] += 1
+                    continue
+                try:
+                    source, info = open_sql(name)
+                    os.close(source)
+                    result['files'].append({'name': name, 'size': info.st_size, 'modified': int(info.st_mtime), 'fingerprint': fingerprint(info)})
+                    result['bytes'] += info.st_size
+                except (OSError, Refused):
+                    result['rejected'] += 1
+        finally:
+            os.close(fd)
+    if os.path.lexists(PROFILES):
+        fd = directory(PROFILES, private=True)
+        try:
+            for entry in sorted(os.listdir(fd)):
+                if re.fullmatch(r'[a-f0-9]{24}', entry):
+                    try:
+                        record = profile(entry)
+                        result['profiles'].append({key: record[key] for key in ['id', 'host', 'port', 'user']})
+                    except (OSError, ValueError, Refused):
+                        pass
+        finally:
+            os.close(fd)
+    return result
+
+
+def cleanup(selections):
+    require(isinstance(selections, list) and 0 < len(selections) <= 200, 'Select 1–200 exact SQL files.')
+    require(all(isinstance(row, dict) and isinstance(row.get('name'), str) and isinstance(row.get('fingerprint'), str) for row in selections), 'Invalid cleanup selection.')
+    require(len({x.get('name') for x in selections}) == len(selections), 'Duplicate cleanup selection.')
+    opened = []
+    removed = []
+    try:
+        # Validate the complete selection before removing anything.
+        for row in selections:
+            require(set(row) == {'name', 'fingerprint'}, 'Invalid cleanup selection.')
+            fd, info = open_sql(row['name'], row['fingerprint'])
+            opened.append((row['name'], fd, info))
+        parent = directory(SQL, private=True)
+        try:
+            for name, fd, info in opened:
+                require(fingerprint(os.stat(name, dir_fd=parent, follow_symlinks=False)) == fingerprint(info), 'SQL changed during cleanup; stopped.')
+                os.unlink(name, dir_fd=parent)
+                removed.append(name)
+        finally:
+            os.close(parent)
+        return {'removed': removed, 'permanent': True, 'databases_changed': False}
+    except (Refused, OSError):
+        if removed:
+            raise Refused('Cleanup stopped after permanently removing: ' + ', '.join(removed) + '. Other entries must be reviewed again. No database was changed.')
+        raise
+    finally:
+        for _, fd, _ in opened:
+            os.close(fd)
+
+
+def account(name):
+    try:
+        user = pwd.getpwnam(name)
+    except KeyError:
+        subprocess.run(['/usr/sbin/useradd', '--system', '--no-create-home', '--home-dir', '/nonexistent', '--shell', '/usr/sbin/nologin', name], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        user = pwd.getpwnam(name)
+    require(user.pw_uid != 0 and user.pw_shell.endswith('/nologin'), 'Unsafe migration service identity.')
+    return user
+
+
+def drop_identity(user):
+    os.setgroups([])
+    os.setgid(user.pw_gid)
+    os.setuid(user.pw_uid)
+    os.umask(0o077)
+
+
+def sql_identity(user):
+    # A malicious SELECT-heavy dump must not grow the root-owned client log
+    # without limit. The database itself still needs its normal storage quotas.
+    resource.setrlimit(resource.RLIMIT_FSIZE, (16 * 1024 ** 2, 16 * 1024 ** 2))
+    drop_identity(user)
+
+
+def job_directory():
+    path = tempfile.mkdtemp(prefix=time.strftime('%Y%m%d-') , dir=JOBS)
+    os.chmod(path, 0o700)
+    return path
+
+
+def import_sql(domain, filename, expected):
+    require(site(domain).get('STATUS') == 'locked', 'Lock the destination website before importing. Pause its cron/queue writers too.')
+    name, unused_user = database(domain)
+    database_empty(name)  # Must happen before creating users or reading the dump.
+    fd, before = open_sql(filename, expected)
+    report = job_directory()
+    plain = report + '/input.sql'
+    try:
+        require(shutil.disk_usage(JOBS).free > before.st_size * 2 + 1024 ** 3, 'Not enough staging disk space (1 GiB reserve required).')
+        total = 0
+        with os.fdopen(os.dup(fd), 'rb') as raw, open(plain, 'xb') as output:
+            os.chmod(plain, 0o600)
+            source = gzip.GzipFile(fileobj=raw) if filename.endswith('.gz') else raw
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                require(total <= MAX_SQL and shutil.disk_usage(JOBS).free > len(chunk) + 1024 ** 3, 'SQL decompression limit/1 GiB disk reserve exceeded; nothing imported.')
+                output.write(chunk)
+        require(total > 0 and fingerprint(os.fstat(fd)) == fingerprint(before), 'SQL is empty or changed during staging.')
+        require(shutil.disk_usage(JOBS).free > total * 2 + 1024 ** 3, 'Insufficient storage reserve for database import; nothing imported.')
+        database_empty(name)  # Recheck immediately before running any dump SQL.
+        identity = account('liuerimport')
+        temporary_user = 'liuerimp_' + secrets.token_hex(8)
+        password = secrets.token_hex(24)
+        socket = admin_sql('SELECT @@socket;')
+        require(re.fullmatch(r'/[A-Za-z0-9_./-]+', socket), 'Only a local MariaDB Unix socket is supported.')
+        created = False
+        try:
+            admin_sql("CREATE USER '{0}'@'localhost' IDENTIFIED BY '{1}';".format(temporary_user, password))
+            created = True
+            # In schema-level GRANT, '_' is a wildcard even inside backticks.
+            # Escape it so db_site never authorizes dbXsite on another tenant.
+            exact_schema = name.replace('_', '\\_')
+            admin_sql("GRANT ALL PRIVILEGES ON `{0}`.* TO '{1}'@'localhost';".format(exact_schema, temporary_user))
+            # Anonymous option FD: no password in argv, environment, logs or a
+            # web-readable file. Dedicated UID cannot read the root-only SQL spool.
+            with tempfile.TemporaryFile() as options, open(plain, 'rb') as data, open(report + '/client.log', 'xb') as log:
+                options.write(('[client]\nuser=' + temporary_user + '\npassword=' + password + '\nsocket=' + socket + '\n').encode())
+                options.flush()
+                options.seek(0)
+                os.fchown(options.fileno(), identity.pw_uid, identity.pw_gid)
+                os.fchmod(options.fileno(), 0o600)
+                os.chmod(report + '/client.log', 0o600)
+                command = [client(), '--defaults-file=/proc/self/fd/' + str(options.fileno()), '--protocol=socket', '--default-character-set=utf8mb4', '--batch', '--binary-mode', '--local-infile=0', '--skip-reconnect', name]
+                result = subprocess.run(command, stdin=data, stdout=log, stderr=log, pass_fds=(options.fileno(),),
+                                        preexec_fn=lambda: sql_identity(identity), cwd='/',
+                                        env={'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', 'LC_ALL': 'C'}, timeout=3600)
+                require(result.returncode == 0, 'SQL import failed; DB may contain partial objects. Clean it MANUALLY before retrying. Private log: ' + report + '/client.log')
+            return {'domain': domain, 'database': name, 'imported': filename, 'config_updated': False, 'source_kept': True}
+        finally:
+            if created:
+                admin_sql("DROP USER '{0}'@'localhost';".format(temporary_user))
+    finally:
+        os.close(fd)
+        # The uploaded source stays until an explicit cleanup. Never retain a
+        # second plaintext copy of sensitive data after finishing/failing.
+        if os.path.isfile(plain):
+            os.unlink(plain)
+
+
+def php_tokens(text):
+    """Minimal lexer, not eval/include: retain offsets and skip PHP comments."""
+    tokens = []
+    i = 0
+    while i < len(text):
+        if text[i].isspace():
+            i += 1
+            continue
+        if text.startswith('//', i) or text[i] == '#':
+            end = text.find('\n', i)
+            i = len(text) if end < 0 else end + 1
+            continue
+        if text.startswith('/*', i):
+            end = text.find('*/', i + 2)
+            require(end >= 0, 'Unclosed PHP comment; edit config manually.')
+            i = end + 2
+            continue
+        if text[i] in "\"'":
+            quote, start = text[i], i
+            i += 1
+            closed = False
+            while i < len(text):
+                if text[i] == '\\':
+                    i += 2
+                elif text[i] == quote:
+                    i += 1
+                    closed = True
+                    break
+                else:
+                    i += 1
+            require(closed, 'Invalid PHP string; edit manually.')
+            tokens.append(('string', text[start + 1:i - 1], start, i))
+            continue
+        word = re.match(r'[A-Za-z_][A-Za-z0-9_]*', text[i:])
+        if word:
+            end = i + len(word.group())
+            tokens.append(('word', word.group(), i, end))
+            i = end
+            continue
+        require(not text.startswith('<<<', i), 'Heredoc config requires manual editing.')
+        tokens.append(('symbol', text[i], i, i + 1))
+        i += 1
+    return tokens
+
+
+def wordpress_config(text, values):
+    tokens = php_tokens(text)
+    changes = {}
+    for i, token in enumerate(tokens):
+        if token[:2] != ('word', 'define') or i + 2 >= len(tokens):
+            continue
+        if tokens[i + 1][1] != '(' or tokens[i + 2][0] != 'string' or tokens[i + 2][1] not in values:
+            continue
+        key = tokens[i + 2][1]
+        require(i == 0 or tokens[i - 1][1] not in ['>', ':', '\\', '$'], 'Namespaced/method DB defines require manual editing.')
+        require(key not in changes and i + 6 < len(tokens) and tokens[i + 3][1] == ','
+                and tokens[i + 4][0] == 'string' and tokens[i + 5][1] == ')' and tokens[i + 6][1] == ';',
+                'Duplicate/dynamic WordPress DB configuration; edit manually.')
+        value_token = tokens[i + 4]
+        changes[key] = (value_token[2], value_token[3], "'" + values[key].replace('\\', '\\\\').replace("'", "\\'") + "'")
+    require(set(changes) == set(values), 'Expected four literal WordPress DB defines; edit custom config manually.')
+    for start, end, value in sorted(changes.values(), reverse=True):
+        text = text[:start] + value + text[end:]
+    return text
+
+
+def laravel_config(text, values):
+    for key in ['DB_URL', 'DATABASE_URL']:
+        match = re.search(r'^\s*' + key + r'\s*=\s*(.*?)\s*$', text, re.M)
+        require(not match or match[1] in ['', '""', "''"], 'DB_URL/DATABASE_URL overrides require manual configuration.')
+    for key, value in values.items():
+        require('\n' not in value and '\r' not in value, 'Unsupported credential newline.')
+        encoded = '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$') + '"'
+        pattern = r'^[ \t]*' + key + r'[ \t]*=.*$'
+        require(len(re.findall(pattern, text, re.M)) <= 1, 'Duplicate Laravel DB key; edit manually.')
+        previous = re.search(pattern, text, re.M)
+        if previous:
+            old = previous[0].split('=', 1)[1].strip()
+            require(not old.startswith(('"', "'")) or re.fullmatch(r"(['\"])(?:\\.|(?!\1).)*\1(?:\s*#.*)?", old), 'Multiline/custom Laravel DB values require manual editing.')
+        if re.search(pattern, text, re.M):
+            text = re.sub(pattern, lambda unused: key + '=' + encoded, text, flags=re.M)
+        else:
+            text = text.rstrip('\r\n') + '\n' + key + '=' + encoded + '\n'
+    return text
+
+
+def update_config(domain, password):
+    data = site(domain)
+    require(data.get('STATUS') == 'locked', 'Lock the destination website before updating its DB connection.')
+    name, user = database(domain)
+    require(password and '\x00' not in password, 'Cannot read managed database credentials.')
+    require(admin_sql("SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='" + name + "';") == '1', 'Managed database is missing.')
+    kind = data.get('TYPE')
+    require(kind in ['wordpress', 'laravel'], 'Plain PHP/static code must be configured manually.')
+    path = data['WEB_ROOT'] + '/wp-config.php' if kind == 'wordpress' else data['SITE_DIR'] + '/.env'
+    parent = directory(os.path.dirname(path))
+    try:
+        fd = os.open(os.path.basename(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size <= 1024 * 1024
+                    and info.st_uid in [0, data['_account'].pw_uid], 'Unsafe application config.')
+            original = stream.read().decode('utf-8')
+        if kind == 'wordpress':
+            changed = wordpress_config(original, {'DB_NAME': name, 'DB_USER': user, 'DB_PASSWORD': password, 'DB_HOST': 'localhost'})
+        else:
+            changed = laravel_config(original, {'DB_CONNECTION': 'mysql', 'DB_HOST': 'localhost', 'DB_PORT': '3306', 'DB_DATABASE': name, 'DB_USERNAME': user, 'DB_PASSWORD': password})
+        report = job_directory()
+        with open(report + '/config-before', 'xb') as backup:
+            os.chmod(report + '/config-before', 0o600)
+            backup.write(original.encode())
+        temporary = '.liuer-config-' + secrets.token_hex(8)
+        out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+        try:
+            with os.fdopen(out, 'wb') as stream:
+                stream.write(changed.encode())
+                stream.flush()
+                os.fsync(stream.fileno())
+                os.fchown(stream.fileno(), data['_account'].pw_uid, data['_account'].pw_gid)
+                os.fchmod(stream.fileno(), 0o640)
+            current = os.stat(os.path.basename(path), dir_fd=parent, follow_symlinks=False)
+            require(fingerprint(current) == fingerprint(info), 'Config changed during confirmation; original was not overwritten.')
+            # Never replace a file selected through a symlink.
+            os.replace(temporary, os.path.basename(path), src_dir_fd=parent, dst_dir_fd=parent)
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=parent)
+            except FileNotFoundError:
+                pass
+        return {'domain': domain, 'config_updated': True, 'backup': report, 'note': 'Laravel: clear existing config cache as the site user before testing; no artisan/migrations/APP_KEY changes were run.' if kind == 'laravel' else 'DB defines only; table prefix and salts preserved.'}
+    finally:
+        os.close(parent)
+
+
+def profile(identifier):
+    require(re.fullmatch(r'[a-f0-9]{24}', identifier), 'Invalid SSH connection ID.')
+    path = PROFILES + '/' + identifier
+    fd = directory(path, private=True)
+    os.close(fd)
+    data = json.loads(read_private(path + '/connection.json'))
+    require(data.get('id') == identifier and valid_host(data.get('host', ''))
+            and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]{0,31}', data.get('user', ''))
+            and isinstance(data.get('port'), int) and 1 <= data['port'] <= 65535, 'Invalid SSH connection metadata.')
+    return data
+
+
+def valid_host(value):
+    if not isinstance(value, str) or len(value) > 253:
+        return False
+    if not re.fullmatch(r'[A-Za-z0-9:._%-]+', value):
+        return False
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return bool(DOMAIN_RE.fullmatch(value.lower()))
+
+
+def profile_create(host, port, user):
+    require(valid_host(host) and port.isdigit() and 1 <= int(port) <= 65535
+            and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]{0,31}', user), 'Invalid SSH host, port or user.')
+    require(all(os.access(path, os.X_OK) for path in ['/usr/bin/ssh','/usr/bin/ssh-keygen','/usr/bin/ssh-copy-id','/usr/bin/rsync']), 'Install rsync and OpenSSH clients on this VPS first (apt: rsync openssh-client; dnf: rsync openssh-clients). Source also needs rsync.')
+    identifier = secrets.token_hex(12)
+    path = PROFILES + '/' + identifier
+    os.mkdir(path, 0o700)
+    subprocess.run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', 'liuer-transfer-' + identifier, '-f', path + '/key'], check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    data = {'id': identifier, 'host': host, 'port': int(port), 'user': user}
+    with open(path + '/connection.json', 'x') as stream:
+        os.chmod(path + '/connection.json', 0o600)
+        json.dump(data, stream)
+    return data
+
+
+def profile_install(identifier):
+    data = profile(identifier)
+    path = PROFILES + '/' + identifier
+    # Explicit CLI-only step: ssh-copy-id asks for host-key approval/password.
+    # No password reaches the panel, command argv, disk or operation logs.
+    with open('/dev/tty', 'r+') as terminal:
+        result = subprocess.run(['/usr/bin/ssh-copy-id', '-i', path + '/key.pub', '-p', str(data['port']),
+                                 '-o', 'UserKnownHostsFile=' + path + '/known_hosts', '-o', 'StrictHostKeyChecking=ask',
+                                 data['user'] + '@' + data['host']], stdin=terminal, stdout=terminal, stderr=terminal,
+                                env={'PATH':'/usr/bin:/bin','HOME':'/root','LC_ALL':'C'})
+    require(result.returncode == 0, 'SSH key setup failed; connection metadata was kept for retry.')
+    return {'connection': identifier, 'installed': True, 'note': 'Dedicated key remains authorized on the source until you revoke it there.'}
+
+
+@contextlib.contextmanager
+def transport(identifier):
+    data = profile(identifier)
+    identity = account('liuertransfer')
+    if not os.path.exists(RUNTIME):
+        os.mkdir(RUNTIME, 0o711)
+    parent = directory(RUNTIME)
+    require(os.fstat(parent).st_uid == 0 and os.fstat(parent).st_mode & 0o022 == 0, 'Unsafe transfer runtime directory.')
+    # The caller's 077 umask would otherwise turn mkdir(0711) into 0700,
+    # preventing the unprivileged SSH/rsync receiver from traversing it.
+    os.fchmod(parent, 0o711)
+    os.close(parent)
+    path = tempfile.mkdtemp(prefix='job-', dir=RUNTIME)
+    os.chown(path, identity.pw_uid, identity.pw_gid)
+    os.chmod(path, 0o700)
+    try:
+        for source, target in [('key', 'key'), ('known_hosts', 'known_hosts')]:
+            contents = read_private(PROFILES + '/' + identifier + '/' + source)
+            with open(path + '/' + target, 'x') as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(contents)
+                os.fchown(stream.fileno(), identity.pw_uid, identity.pw_gid)
+        options = ['/usr/bin/ssh', '-F', '/dev/null', '-p', str(data['port']), '-i', path + '/key',
+                   '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none', '-o', 'BatchMode=yes',
+                   '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=' + path + '/known_hosts', '-o', 'ConnectTimeout=15']
+        yield data, identity, path, options
+    finally:
+        # Owned per-operation scratch only; no source/website directory deletion.
+        shutil.rmtree(path)
+
+
+def remote(transport_data, command):
+    data, identity, path, options = transport_data
+    def limited_identity():
+        resource.setrlimit(resource.RLIMIT_FSIZE, (65536,65536))
+        drop_identity(identity)
+    # Bound output at the kernel, not after buffering an attacker-controlled
+    # remote shell banner/output into the privileged process's memory.
+    with tempfile.TemporaryFile() as output:
+        result = subprocess.run(options + [data['user'] + '@' + data['host'], command], stdin=subprocess.DEVNULL,
+                                stdout=output, stderr=output, timeout=40, cwd='/',
+                                preexec_fn=limited_identity, env={'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', 'LC_ALL': 'C'})
+        require(result.returncode == 0, 'SSH read failed. Check the selected key, host fingerprint, source permissions and path.')
+        output.seek(0)
+        value=output.read(65537)
+    require(len(value) < 65536, 'Unexpected SSH output.')
+    return value.decode('utf-8')
+
+
+def source_path(path):
+    require(re.fullmatch(r'/home/[A-Za-z0-9_./-]{1,500}', path) and not any(x in ['.', '..', ''] for x in path.split('/')[1:]), 'Source must be a concrete /home/... path, without traversal, spaces or shell characters.')
+    return path
+
+
+def probe(identifier, panel, domain, kind):
+    require(panel in ['cyberpanel', 'directadmin'] and DOMAIN_RE.fullmatch(domain)
+            and kind in ['wordpress', 'laravel', 'php', 'static'], 'Invalid source panel/domain/type.')
+    base = '/home/' + domain if panel == 'cyberpanel' else '/home/*/domains/' + domain
+    if kind == 'laravel':
+        command = 'for base in ' + base + '; do for p in "$base" "$base/public_html"; do if [ -f "$p/artisan" ] && [ -f "$p/public/index.php" ]; then printf "LIUER_PATH:%s\\n" "$p"; fi; done; done'
+    else:
+        command = 'for base in ' + base + '; do p="$base/public_html"; if [ -d "$p" ]; then printf "LIUER_PATH:%s\\n" "$p"; fi; done'
+    with transport(identifier) as connection:
+        output = remote(connection, command)
+    paths = []
+    for line in output.splitlines():
+        if line.startswith('LIUER_PATH:'):
+            candidate = line[len('LIUER_PATH:'):]
+            source_path(candidate)
+            if candidate not in paths:
+                paths.append(candidate)
+    return {'domain': domain, 'panel': panel, 'paths': paths, 'note': 'Review/override the concrete source path. Laravel copies its complete project, not only public/.'}
+
+
+def empty_target(path):
+    """Allow only the empty directories created by Liuer for a fresh site."""
+    for root, directories, files in os.walk(path, followlinks=False):
+        require(not files, 'Target already contains files. Sync never overwrites/deletes existing website code.')
+        for name in directories:
+            full = os.path.join(root, name)
+            require(not os.path.islink(full), 'Target contains a symlink; refused.')
+            relative = os.path.relpath(full, path)
+            require(relative in ['public', 'public_html', '.well-known', '.well-known/acme-challenge',
+                                 'public/.well-known', 'public/.well-known/acme-challenge'], 'Target is not a fresh empty website.')
+
+
+def copy_tree(source, destination, owner, depth=0):
+    """FD-relative copy: an untrusted receiver can never redirect root writes."""
+    require(depth <= 64, 'Source tree is too deeply nested; migrate manually.')
+    for name in os.listdir(source):
+        info = os.stat(name, dir_fd=source, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            src = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=source)
+            try:
+                os.mkdir(name, 0o700, dir_fd=destination)
+                dst = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=destination)
+                try:
+                    copy_tree(src, dst, owner, depth + 1)
+                    os.fchown(dst, owner.pw_uid, owner.pw_gid)
+                    os.fchmod(dst, 0o750)
+                finally:
+                    os.close(dst)
+            finally:
+                os.close(src)
+        else:
+            src = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=source)
+            try:
+                current = os.fstat(src)
+                require(stat.S_ISREG(current.st_mode) and current.st_nlink == 1, 'Special files/hardlinks are refused.')
+                space = os.fstatvfs(destination)
+                require(space.f_bavail * space.f_frsize > current.st_size + 1024 ** 3, 'Insufficient free disk space for a safe copy.')
+                dst = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=destination)
+                with os.fdopen(dst, 'wb') as output, os.fdopen(os.dup(src), 'rb') as incoming:
+                    remaining=current.st_size
+                    while remaining:
+                        chunk=incoming.read(min(remaining,1024 * 1024))
+                        require(chunk, 'Source file changed while copying; destination was not activated.')
+                        output.write(chunk)
+                        remaining-=len(chunk)
+                    require(fingerprint(os.fstat(src))==fingerprint(current), 'Source file changed while copying; destination was not activated.')
+                    os.fchown(output.fileno(), owner.pw_uid, owner.pw_gid)
+                    os.fchmod(output.fileno(), 0o640)
+            finally:
+                os.close(src)
+
+
+def sync_code(identifier, panel, domain, source):
+    data = site(domain)
+    require(data.get('STATUS') == 'locked', 'Lock this destination website before receiving remote code. It must stay offline until DB/config are checked.')
+    require(panel in ['cyberpanel', 'directadmin'], 'Invalid source panel.')
+    source_path(source)
+    kind = data.get('TYPE')
+    target = data['SITE_DIR'] if kind == 'laravel' else data['WEB_ROOT']
+    empty_target(target)
+    with transport(identifier) as connection:
+        peer, identity, scratch, options = connection
+        quoted = shlex.quote(source)
+        check = '[ -d ' + quoted + ' ]'
+        if kind == 'laravel':
+            check += ' && [ -f ' + quoted + '/artisan ] && [ -f ' + quoted + '/public/index.php ]'
+        elif kind == 'wordpress':
+            check += ' && [ -d ' + quoted + '/wp-admin ] && [ -d ' + quoted + '/wp-includes ]'
+        remote(connection, check)
+        receive = scratch + '/receive'
+        scratch_fd = directory(scratch)
+        try:
+            os.mkdir('receive', 0o700, dir_fd=scratch_fd)
+            receive_fd = os.open('receive', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=scratch_fd)
+            try:
+                require(os.fstat(receive_fd).st_uid == 0, 'Receiver changed during setup.')
+                os.fchown(receive_fd, identity.pw_uid, identity.pw_gid)
+            finally:
+                os.close(receive_fd)
+        finally:
+            os.close(scratch_fd)
+        report = job_directory()
+        with open(report + '/rsync.log', 'xb') as log:
+            os.chmod(report + '/rsync.log', 0o600)
+            command = ['/usr/bin/rsync', '-rlt', '--protect-args', '--no-owner', '--no-group', '--no-perms',
+                                     '--no-links', '--no-devices', '--no-specials', '--chmod=Du=rwx,Dgo=,Fu=rw,Fgo=',
+                                     '-e', ' '.join(shlex.quote(x) for x in options), '--',
+                                     peer['user'] + '@' + ('[' + peer['host'] + ']' if ':' in peer['host'] else peer['host']) + ':' + source + '/', receive + '/']
+            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log, cwd='/', start_new_session=True,
+                                       preexec_fn=lambda: drop_identity(identity), env={'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', 'LC_ALL': 'C'})
+            started = time.monotonic()
+            try:
+                while process.poll() is None:
+                    require(time.monotonic() - started < 7200, 'Copy exceeded two hours; destination is still locked.')
+                    require(shutil.disk_usage(scratch).free > 1024 ** 3, 'Copy stopped: less than 1 GiB disk reserve. No destination code was activated.')
+                    time.sleep(0.25)
+                require(process.returncode == 0, 'Rsync failed. Website code was not activated. Private log: ' + report + '/rsync.log')
+            finally:
+                # Terminate this operation's process group, including an SSH
+                # child; never kill unrelated source/queue processes.
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+        owner = data['_account']
+        parent = directory(os.path.dirname(target))
+        source_fd = directory(receive)
+        stage = '.liuer-receive-' + secrets.token_hex(8)
+        old = '.liuer-empty-' + secrets.token_hex(8)
+        try:
+            # Stage on the target filesystem (not /run tmpfs). Root only writes
+            # through pinned FDs; never chmod/chown paths supplied by rsync.
+            os.mkdir(stage, 0o700, dir_fd=parent)
+            stage_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            try:
+                copy_tree(source_fd, stage_fd, owner)
+                os.fchown(stage_fd, 0 if kind == 'laravel' else owner.pw_uid, 0 if kind == 'laravel' else owner.pw_gid)
+                os.fchmod(stage_fd, 0o755 if kind == 'laravel' else 0o750)
+                staged = os.fstat(stage_fd)
+            finally:
+                os.close(stage_fd)
+            empty_target(target)
+            current_stage = os.stat(stage, dir_fd=parent, follow_symlinks=False)
+            require((current_stage.st_dev, current_stage.st_ino) == (staged.st_dev, staged.st_ino), 'Staging changed; promotion refused.')
+            os.rename(os.path.basename(target), old, src_dir_fd=parent, dst_dir_fd=parent)
+            try:
+                os.rename(stage, os.path.basename(target), src_dir_fd=parent, dst_dir_fd=parent)
+            except BaseException:
+                os.rename(old, os.path.basename(target), src_dir_fd=parent, dst_dir_fd=parent)
+                raise
+        finally:
+            os.close(source_fd)
+            os.close(parent)
+        # Keep the old EMPTY directory as recoverable scaffolding, never rm -rf
+        # a website path. Site remains locked; user reviews it before unlock.
+        return {'domain': domain, 'copied': True, 'target': target, 'locked': True, 'database_imported': False,
+                'note': 'No --delete, no source changes. Symlinks/special files were not copied; recreate safe Laravel storage links manually. Import SQL/config and verify before unlocking. Site may require its normal permission repair for Nginx readability.'}
+
+
+def main(arguments):
+    require(os.geteuid() == 0, 'Migration operations require root/the privileged worker.')
+    os.umask(0o077)
+    def interrupted(signum, frame):
+        raise Refused('Operation interrupted. A database import may be partial; review it and clean manually before retrying. Source SQL is retained.')
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    require(arguments, 'Missing import operation.')
+    action, args = arguments[0], arguments[1:]
+    if action == 'inventory' and not args:
+        return inventory()
+    if action == 'init' and not args:
+        initialize()
+        return {'directory': SQL, 'ready': True}
+    with operation_lock():
+        if action == 'check' and len(args) == 1:
+            metadata = site(args[0])
+            name, user = database(args[0])
+            database_empty(name)
+            return {'domain': args[0], 'database': name, 'empty': True, 'status': metadata.get('STATUS')}
+        if action == 'profile-create' and len(args) == 3:
+            return profile_create(*args)
+        if action == 'profile-install' and len(args) == 1:
+            return profile_install(*args)
+        if action == 'probe' and len(args) == 4:
+            return probe(*args)
+        if action == 'sql' and len(args) == 4 and args[3] == '--confirm':
+            return import_sql(*args[:3])
+        if action == 'cleanup' and len(args) == 2 and args[1] == '--confirm':
+            return cleanup(json.loads(args[0]))
+        if action == 'config' and len(args) == 2 and args[1] == '--confirm':
+            password = os.read(3, 4096).decode('utf-8')
+            return update_config(args[0], password)
+        if action == 'sync' and len(args) == 5 and args[4] == '--confirm':
+            return sync_code(*args[:4])
+        raise Refused('Invalid operation/arguments or missing explicit --confirm.')
+
+
+if __name__ == '__main__':
+    try:
+        print(json.dumps(main(sys.argv[1:]), ensure_ascii=True))
+    except (Refused, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        # Never echo credentials, query text or raw application config.
+        message = str(error) if isinstance(error, Refused) else 'Operation failed safely (' + type(error).__name__ + '). Review prerequisites; partial database imports require manual cleanup.'
+        print(message, file=sys.stderr)
+        sys.exit(1)
+LIUER_IMPORT_PY
+}
+
+# Canonical menu helpers embedded in liuer-panel.sh; not sourced by the panel.
+_liuer_import_api() {
+    command -v python3 >/dev/null || { log_error 'Install python3 first (apt/dnf install python3).'; return 1; }
+    if [[ "${1:-}" == config ]]; then
+        local domain="${2:-}" encrypted
+        validate_domain "$domain" || return 1
+        encrypted=$(awk -F'|' -v d="$domain" '$1==d {print $4}' "$DB_LIST_FILE")
+        [[ -n "$encrypted" && "$encrypted" != *$'\n'* ]] || { log_error 'Create one managed database for this domain first.'; return 1; }
+        _liuer_import_tools "$@" 3< <(decrypt_pass "$encrypted")
+    else
+        _liuer_import_tools "$@"
+    fi
+}
+
+_import_warning() {
+    [[ -d /var/lib/liuer-panel/imports/sql ]] || return 0
+    local listing
+    listing=$(_liuer_import_api inventory 2>/dev/null) || { log_warn 'Cannot inspect SQL import directory. Check root ownership/mode 700.'; return 0; }
+    python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); n=len(d["files"])+d["rejected"]; print("[WARN] SQL files remain: %s entries, %s bytes eligible. /var/lib/liuer-panel/imports/sql/ — Database > Import/migration > SQL files; cleanup requires confirmation."%(n,d["bytes"])) if n else None' "$listing"
+}
+
+_import_select_sql() {
+    local listing choice row
+    listing=$(_liuer_import_api inventory) || return 1
+    python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); [print("  %s) %s (%s bytes)"%(i+1,f["name"],f["size"])) for i,f in enumerate(d["files"])]; print("  0) Back")' "$listing"
+    read -r -p 'Select SQL file: ' choice
+    [[ "$choice" =~ ^[1-9][0-9]*$ && ${#choice} -lt 5 ]] || return 1
+    row=$(python3 -I -c 'import json,sys; a=json.loads(sys.argv[1])["files"]; i=int(sys.argv[2])-1; print(a[i]["name"]+"|"+a[i]["fingerprint"]) if 0<=i<len(a) else sys.exit(1)' "$listing" "$choice") || return 1
+    IFS='|' read -r IMPORT_SQL_NAME IMPORT_SQL_FINGERPRINT <<< "$row"
+}
+
+_import_sql_menu() {
+    local domain="${1:-}"
+    if [[ -z "$domain" ]]; then SELECTED_DOMAIN=''; _select_domain 'Import SQL into existing EMPTY database' || return; domain="$SELECTED_DOMAIN"; fi
+    _liuer_import_api check "$domain" || { press_enter; return 1; }
+    log_warn 'DB must exist and contain NO tables/views/routines/events. Non-empty DB must be cleaned MANUALLY. No force/automatic deletion.'
+    log_warn 'Lock this site first and pause its cron/queue writers. SQL is untrusted: review its source before importing.'
+    _import_select_sql || return
+    printf 'Website: %s\nSQL: %s\n' "$domain" "$IMPORT_SQL_NAME"
+    confirm_action 'Import into this EMPTY managed DB (source SQL is kept)?' || return
+    _liuer_import_api sql "$domain" "$IMPORT_SQL_NAME" "$IMPORT_SQL_FINGERPRINT" --confirm
+    press_enter
+}
+
+_import_config_menu() {
+    local domain="${1:-}"
+    if [[ -z "$domain" ]]; then SELECTED_DOMAIN=''; _select_domain 'Update WP/Laravel database connection only' || return; domain="$SELECTED_DOMAIN"; fi
+    log_warn 'Only the managed DB connection changes. WP prefix/salts and Laravel APP_KEY are preserved. Keep the site locked until reviewed.'
+    confirm_action "Update DB connection for $domain (separate from SQL import)?" || return
+    _liuer_import_api config "$domain" --confirm
+    press_enter
+}
+
+_import_files_menu() {
+    local listing selection choice
+    while true; do
+        print_section 'SQL IMPORT FILES'
+        listing=$(_liuer_import_api inventory) || { press_enter; return 1; }
+        python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); print(d["directory"]); [print("  %s) %s (%s bytes)"%(i+1,f["name"],f["size"])) for i,f in enumerate(d["files"])]; print("Rejected/unsafe entries: %s (review manually; never followed/deleted)"%d["rejected"])' "$listing"
+        echo '  A) Select ALL eligible SQL files for cleanup'
+        echo '  0) Back (no deletion)'
+        read -r -p 'Select file number/A to clean: ' choice
+        [[ "$choice" != 0 && -n "$choice" ]] || return 0
+        selection=$(python3 -I -c 'import json,sys; a=json.loads(sys.argv[1])["files"]; c=sys.argv[2]; chosen=a if c.lower()=="a" else ([a[int(c)-1]] if c.isdigit() and 0<int(c)<=len(a) else []); print(json.dumps([{k:f[k] for k in ["name","fingerprint"]} for f in chosen])) if chosen else sys.exit(1)' "$listing" "$choice") || continue
+        python3 -I -c 'import json,sys; a=json.loads(sys.argv[1])["files"]; s={f["name"] for f in json.loads(sys.argv[2])}; [print("DELETE: %s — %s bytes"%(f["name"],f["size"])) for f in a if f["name"] in s]; print("Total: %s bytes"%sum(f["size"] for f in a if f["name"] in s))' "$listing" "$selection"
+        confirm_danger 'Permanently delete ONLY the listed uploaded SQL files (no databases/backups)' || continue
+        _liuer_import_api cleanup "$selection" --confirm
+        press_enter
+    done
+}
+
+_import_profile_select() {
+    local listing choice row host port user identifier
+    while true; do
+        listing=$(_liuer_import_api inventory) || return 1
+        python3 -I -c 'import json,sys; [print("  %s) %s@%s:%s [%s]"%(i+1,p["user"],p["host"],p["port"],p["id"])) for i,p in enumerate(json.loads(sys.argv[1])["profiles"])]' "$listing"
+        echo '  N) Set up SSH connection (one-time password + verify source host fingerprint)'
+        echo '  R) Retry key installation for an existing connection'
+        echo '  0) Back'
+        read -r -p 'Connection: ' choice
+        case "$choice" in
+            0|'') return 1 ;;
+            n|N)
+                read -r -p 'Source host/IP (0=back): ' host; [[ "$host" != 0 ]] || continue
+                read -r -p 'SSH port [22], 0=back: ' port; [[ "$port" != 0 ]] || continue; port="${port:-22}"
+                read -r -p 'SSH user [root], 0=back: ' user; [[ "$user" != 0 ]] || continue; user="${user:-root}"
+                confirm_action 'Generate a dedicated key and add it to source authorized_keys? Revoke it on source when migration is finished.' || continue
+                row=$(_liuer_import_api profile-create "$host" "$port" "$user") || continue
+                identifier=$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1])["id"])' "$row") || continue
+                _liuer_import_api profile-install "$identifier" || { press_enter; continue; }
+                IMPORT_PROFILE="$identifier"; return 0 ;;
+            r|R)
+                read -r -p 'Existing connection ID (0=back): ' identifier; [[ "$identifier" != 0 ]] || continue
+                confirm_action 'Retry adding the dedicated key to source authorized_keys?' && _liuer_import_api profile-install "$identifier"
+                continue ;;
+            *)
+                [[ "$choice" =~ ^[1-9][0-9]*$ && ${#choice} -lt 5 ]] || continue
+                IMPORT_PROFILE=$(python3 -I -c 'import json,sys; a=json.loads(sys.argv[1])["profiles"]; i=int(sys.argv[2])-1; print(a[i]["id"]) if 0<=i<len(a) else sys.exit(1)' "$listing" "$choice") && return 0 ;;
+        esac
+    done
+}
+
+_import_sync_menu() {
+    local domain="${1:-}" profile panel kind probe source choice
+    _import_profile_select || return
+    profile="$IMPORT_PROFILE"
+    while true; do
+        echo '  1) CyberPanel   2) DirectAdmin   0) Back / stop batch'
+        read -r -p 'Source panel: ' choice
+        case "$choice" in 1) panel=cyberpanel ;; 2) panel=directadmin ;; 0|'') return ;; *) continue ;; esac
+        if [[ -z "$domain" ]]; then SELECTED_DOMAIN=''; _select_domain 'Copy remote code into EMPTY locked site' || return; domain="$SELECTED_DOMAIN"; fi
+        kind=$(sed -n 's/^TYPE=//p' "${SITES_META_DIR}/${domain}.conf")
+        probe=$(_liuer_import_api probe "$profile" "$panel" "$domain" "$kind") || { press_enter; domain=''; continue; }
+        printf '%s\n' "$probe"
+        read -r -p 'Concrete source /home/... project path (0=back, S=skip this site): ' source
+        case "$source" in 0) return ;; s|S|'') domain=''; continue ;; esac
+        log_warn 'Destination must be LOCKED and EMPTY. Laravel: select whole project containing artisan + public/index.php. No --delete/overwrite, symlinks omitted.'
+        printf 'Source: %s\nDomain: %s\n' "$source" "$domain"
+        if confirm_action 'Copy code only? DB/config are independent; site stays locked.'; then
+            _liuer_import_api sync "$profile" "$panel" "$domain" "$source" --confirm
+        fi
+        press_enter
+        confirm_action 'Copy another domain using this SSH connection (no new password)?' || return
+        domain=''
+    done
+}
+
+_import_create_site() {
+    local domain kind version='8.2' choice with_db=0
+    while true; do
+        read -r -p 'New domain (0=back): ' domain
+        [[ "$domain" != 0 && -n "$domain" ]] || return
+        validate_domain "$domain" || { log_warn 'Invalid domain.'; continue; }
+        echo '  1) WordPress  2) Laravel  3) PHP  4) Static  0) Back'
+        read -r -p 'Type: ' choice
+        case "$choice" in 1) kind=wordpress ;; 2) kind=laravel ;; 3) kind=php ;; 4) kind=static ;; 0) continue ;; *) continue ;; esac
+        if [[ "$kind" != static ]]; then SELECTED_PHP_VERSION=''; select_php_version || continue; version="$SELECTED_PHP_VERSION"; fi
+        with_db=0
+        if [[ "$kind" != static ]] && confirm_action 'Create an EMPTY managed database (SQL import/config are separate optional steps)?'; then with_db=1; fi
+        printf 'Create %s (%s), EMPTY code, database=%s, initially LOCKED.\n' "$domain" "$kind" "$with_db"
+        confirm_action 'Create now? No source download or remote copy yet.' || continue
+        (_api_create_site "$domain" "$kind" "$version" empty "$with_db" '' locked) || return 1
+        break
+    done
+    while true; do
+        echo '  1) Copy code (optional)  2) Import SQL (optional)  3) Update WP/Laravel DB connection (optional)'
+        echo '  0) Finish / skip remaining steps (site stays locked; no DNS changes)'
+        read -r -p 'Next independent step: ' choice
+        case "$choice" in 1) _import_sync_menu "$domain" ;; 2) _import_sql_menu "$domain" ;; 3) _import_config_menu "$domain" ;; 0|'') return ;; *) log_warn 'Invalid selection.' ;; esac
+    done
+}
+
+_import_menu() {
+    local choice
+    while true; do
+        print_section 'IMPORT / MIGRATION'
+        echo '  1) Prepare private SQL directory (root SFTP upload)'
+        echo '  2) Copy code from CyberPanel / DirectAdmin (batch, same SSH key)'
+        echo '  3) Import SQL into existing EMPTY database'
+        echo '  4) Update WordPress / Laravel DB connection only'
+        echo '  5) List / clean uploaded SQL (confirmation required)'
+        echo '  6) Create empty locked website for migration'
+        echo '  0) Back'
+        read -r -p 'Select: ' choice
+        case "$choice" in
+            1) confirm_action 'Create private root-owned import directories?' && _liuer_import_api init
+               echo 'Upload via ROOT SFTP to /var/lib/liuer-panel/imports/sql/; files root:root 600, directory 700. Never upload SQL under public_html/public.'; press_enter ;;
+            2) _import_sync_menu ;;
+            3) _import_sql_menu ;;
+            4) _import_config_menu ;;
+            5) _import_files_menu ;;
+            6) _import_create_site ;;
+            0|'') return ;;
+            *) log_warn 'Invalid selection.' ;;
+        esac
+    done
+}
+
+# END EMBEDDED IMPORT TOOLS
+
 main_menu() {
     while true; do
         print_header
+        _import_warning
         echo -e "  ${DIM}──────────────────────────────────────────────────────────${NC}"
         printf "  %-28s%s\n"  " 1  Website"      " 6  Backup"
         printf "  %-28s%s\n"  " 2  Database"     " 7  PHP Manager"
@@ -10079,6 +11075,8 @@ _api_rollback_new_site() {
 _api_create_site() {
     local domain="$1" type="${2:-php}" php_ver="${3:-8.2}"
     local source_mode="${4:-empty}" with_db="${5:-0}" framework_version="${6:-}"
+    local initial_status="${7:-active}"
+    [[ "$initial_status" == active || ( "$initial_status" == locked && "$source_mode" == empty ) ]] || { log_error 'Migration requires empty source and locked status.'; return 1; }
     [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
     validate_domain "$domain" || { log_error "Invalid domain: $domain"; exit 1; }
     [[ -e "${SITES_META_DIR}/${domain}.conf" || -e "${NGINX_CONF_DIR}/${domain}.conf" || -e "${NGINX_CONF_DIR}/${domain}.conf.disabled" ]] && { log_error "Domain already exists: $domain"; exit 1; }
@@ -10087,6 +11085,10 @@ _api_create_site() {
         [[ " $(_installed_php_versions_on_disk) " == *" ${php_ver} "* && -n "$php_ver" ]] || { log_error "PHP-FPM version is not installed."; return 1; }
     fi
     [[ "$source_mode" != "version" || "$framework_version" =~ ^[0-9]{1,2}(\.[0-9]{1,3}){0,2}$ ]] || { log_error "Invalid Laravel version."; return 1; }
+    if [[ "$with_db" == 1 && -f "$DB_LIST_FILE" ]] && awk -F'|' -v d="$domain" '$1==d {found=1} END {exit !found}' "$DB_LIST_FILE"; then
+        log_error 'This domain already has a managed DB. Disable Create database to reuse it; nothing was changed.'
+        return 1
+    fi
 
     SELECTED_WEB_USER=""
     SELECTED_DOMAIN="$domain"
@@ -10193,17 +11195,30 @@ _api_create_site() {
     } > "$meta"
     chmod 600 "$meta"
 
-    if [[ -n "$php_ver" ]]; then
-        local _php_svc; _php_svc=$(get_php_service "$php_ver")
-        systemctl reload "$_php_svc" 2>/dev/null || systemctl restart "$_php_svc" 2>/dev/null || true
+    if [[ "$initial_status" == locked ]]; then
+        # Lock the empty scaffold BEFORE receiving any external code or SQL.
+        if [[ ! -s "$nginx_conf" ]] || ! nginx -t &>/dev/null; then
+            _api_rollback_new_site "$domain" "$site_user" "$site_dir" "$php_ver"
+            rm -f "$meta"
+            log_error 'Generated Nginx configuration is invalid; empty site rolled back.'
+            return 1
+        fi
+        _api_lock_site "$domain"
+        [[ -s "${nginx_conf}.disabled" ]] && grep -qx 'STATUS=locked' "$meta" || { log_error 'Failed to lock migration scaffold. Do not upload code yet.'; return 1; }
+        log_success "Empty migration site created and locked: $domain"
+    else
+        if [[ -n "$php_ver" ]]; then
+            local _php_svc; _php_svc=$(get_php_service "$php_ver")
+            systemctl reload "$_php_svc" 2>/dev/null || systemctl restart "$_php_svc" 2>/dev/null || true
+        fi
+        if [[ ! -s "$nginx_conf" ]] || ! nginx -t &>/dev/null; then
+            _api_rollback_new_site "$domain" "$site_user" "$site_dir" "$php_ver"
+            rm -f "$meta"
+            log_error "Nginx rejected the generated website configuration. Changes were rolled back."
+            exit 1
+        fi
+        nginx -s reload
     fi
-    if [[ ! -s "$nginx_conf" ]] || ! nginx -t &>/dev/null; then
-        _api_rollback_new_site "$domain" "$site_user" "$site_dir" "$php_ver"
-        rm -f "$meta"
-        log_error "Nginx rejected the generated website configuration. Changes were rolled back."
-        exit 1
-    fi
-    nginx -s reload
     lcp_notify "site_created" "\"domain\":\"${domain}\",\"type\":\"${type}\",\"php_version\":\"${php_ver}\""
     log_success "Site created: $domain (user: $site_user)"
     if [[ -n "$result_db_name" ]]; then
@@ -11319,6 +12334,17 @@ main() {
             esac
             ;;
 
+        imports)
+            check_root; detect_os
+            [[ $# == 1 ]] || { log_error 'Use liuer imports for the interactive workflow.'; return 1; }
+            _import_menu
+            ;;
+        web_import)
+            check_root
+            shift
+            _liuer_import_api "$@"
+            ;;
+
         # ── Auto repair (called internally after update, no interaction) ──────
         _repair_auto)
             check_root
@@ -11375,6 +12401,7 @@ main() {
             echo "  web-panel      Install or manage the optional browser panel"
             echo "  php-maintenance  Audit/update runtimes; migrate only confirmed 8.0/8.1 sites"
             echo "  php-versions     Show installed FPM/CLI patch versions (--tsv for inventory)"
+            echo "  imports          Optional code migration, EMPTY-DB SQL import, config and confirmed SQL cleanup"
             echo "  help           Show this help"
             echo ""
             ;;
@@ -11399,7 +12426,7 @@ main() {
             ;;
 
         # ── Internal API (called non-interactively by liuercp) ────────────────
-        create_site)       check_root; detect_os; _api_create_site    "${2:-}" "${3:-php}" "${4:-8.2}" "${5:-empty}" "${6:-0}" "${7:-}" ;;
+        create_site)       check_root; detect_os; _api_create_site    "${2:-}" "${3:-php}" "${4:-8.2}" "${5:-empty}" "${6:-0}" "${7:-}" "${8:-active}" ;;
         web_site_action)   check_root; detect_os; _api_web_site_action "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
         web_panel_grants)  check_root; detect_os; _apply_web_panel_db_grants ;;
         web_cache)         check_root; detect_os; _api_web_cache "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
