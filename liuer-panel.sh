@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.25"
+readonly VERSION="2.7.27"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -9887,6 +9887,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import selectors
 import sys
 import tempfile
 import time
@@ -9906,6 +9907,34 @@ DOMAIN_RE = re.compile(r'^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}
 
 class Refused(Exception):
     pass
+
+
+class CopyProgress:
+    """CLI progress is stderr-only; successful machine stdout stays JSON."""
+    def __init__(self, domain, report):
+        self.domain, self.report = domain, report
+        self.phase = ''; self.last = 0; self.files = 0; self.bytes = 0
+
+    def show(self, phase=None, detail='', force=False):
+        if phase is not None and phase != self.phase:
+            self.phase = phase; self.files = 0; self.bytes = 0; force = True
+        now = time.monotonic()
+        if not force and now - self.last < 2: return
+        self.last = now
+        line = '[COPY] %s | %s | %s' % (self.domain, self.phase, detail or ('%s files | %.1f MiB' % (self.files, self.bytes / 1024**2)))
+        with open(self.report + '/progress.log', 'a') as stream:
+            stream.write(line + '\n')
+        if sys.stderr.isatty():
+            print(line, file=sys.stderr, flush=True)
+
+
+COPY_PROGRESS = None
+
+
+def copy_progress(phase=None, detail='', force=False, files=0, size=0):
+    if COPY_PROGRESS is not None:
+        COPY_PROGRESS.files += files; COPY_PROGRESS.bytes += size
+        COPY_PROGRESS.show(phase, detail, force)
 
 
 def require(ok, message):
@@ -10610,22 +10639,21 @@ def probe(identifier, panel, domain, kind):
     return {'domain': domain, 'panel': panel, 'paths': paths, 'note': 'Review/override the concrete source path. Laravel copies its complete project, not only public/.'}
 
 
-def copy_tree(source, destination, owner, depth=0):
-    """FD-relative copy: an untrusted receiver can never redirect root writes."""
+def seal_received_tree(source, depth=0):
+    """Revoke receiver path access before promotion; never follow links.
+
+    No payload copy: every directory becomes root-owned/private, including
+    directories for which a receiver might still hold an open descriptor.
+    """
     require(depth <= 64, 'Source tree is too deeply nested; migrate manually.')
+    os.fchown(source, 0, 0)
+    os.fchmod(source, 0o700)
     for name in os.listdir(source):
         info = os.stat(name, dir_fd=source, follow_symlinks=False)
         if stat.S_ISDIR(info.st_mode):
             src = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=source)
             try:
-                os.mkdir(name, 0o700, dir_fd=destination)
-                dst = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=destination)
-                try:
-                    copy_tree(src, dst, owner, depth + 1)
-                    os.fchown(dst, owner.pw_uid, owner.pw_gid)
-                    os.fchmod(dst, 0o750)
-                finally:
-                    os.close(dst)
+                seal_received_tree(src, depth + 1)
             finally:
                 os.close(src)
         else:
@@ -10633,19 +10661,8 @@ def copy_tree(source, destination, owner, depth=0):
             try:
                 current = os.fstat(src)
                 require(stat.S_ISREG(current.st_mode) and current.st_nlink == 1, 'Special files/hardlinks are refused.')
-                space = os.fstatvfs(destination)
-                require(space.f_bavail * space.f_frsize > current.st_size + 1024 ** 3, 'Insufficient free disk space for a safe copy.')
-                dst = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=destination)
-                with os.fdopen(dst, 'wb') as output, os.fdopen(os.dup(src), 'rb') as incoming:
-                    remaining=current.st_size
-                    while remaining:
-                        chunk=incoming.read(min(remaining,1024 * 1024))
-                        require(chunk, 'Source file changed while copying; destination was not activated.')
-                        output.write(chunk)
-                        remaining-=len(chunk)
-                    require(fingerprint(os.fstat(src))==fingerprint(current), 'Source file changed while copying; destination was not activated.')
-                    os.fchown(output.fileno(), owner.pw_uid, owner.pw_gid)
-                    os.fchmod(output.fileno(), 0o640)
+                os.fchown(src, 0, 0); os.fchmod(src, 0o600)
+                copy_progress(files=1)
             finally:
                 os.close(src)
 
@@ -10664,8 +10681,10 @@ def copy_bytes(source, destination, info):
             require(written > 0, 'Cannot write code/backup snapshot.')
             view = view[written:]
         remaining -= len(chunk)
+        copy_progress(size=len(chunk))
     require(fingerprint(os.fstat(source)) == fingerprint(info), 'File changed while preparing code/backup; review before retrying.')
-    os.fsync(destination)
+    # No fsync per file: backup preparation is completed before replacements,
+    # but this is not a power-loss-durable or whole-site atomic transaction.
 
 
 def overlay_plan(source, target, backup, owner, plan, prefix='', depth=0):
@@ -10719,6 +10738,7 @@ def overlay_plan(source, target, backup, owner, plan, prefix='', depth=0):
                     os.close(original)
                     if saved is not None: os.close(saved)
             plan[relative] = row
+            copy_progress(files=1)
 
 
 def apply_overlay(source, target, owner, plan, counts, prefix=''):
@@ -10746,14 +10766,15 @@ def apply_overlay(source, target, owner, plan, counts, prefix=''):
                 os.close(dst)
                 if src is not None: os.close(src)
         else:
-            temporary = '.liuer-copy-' + secrets.token_hex(12)
-            out = src = None
+            src = None
             try:
                 src = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=source)
                 info = os.fstat(src)
                 require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, 'Staged code changed; refused.')
-                out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=target)
-                copy_bytes(src, out, info)
+                require(info.st_dev == os.fstat(target).st_dev, 'Receiving area and destination must be on the same filesystem; no slow cross-device copy fallback.')
+                os.fchown(src, owner.pw_uid, owner.pw_gid)
+                os.fchmod(src, 0o640)
+                require(fingerprint(os.stat(name, dir_fd=source, follow_symlinks=False)) == fingerprint(os.fstat(src)), 'Received entry changed before promotion.')
                 try:
                     current = os.stat(name, dir_fd=target, follow_symlinks=False)
                 except FileNotFoundError:
@@ -10762,18 +10783,15 @@ def apply_overlay(source, target, owner, plan, counts, prefix=''):
                 if row['expected'] is None:
                     # Atomic create without clobbering a file that appeared
                     # after validation. Both names are on this same filesystem.
-                    os.link(temporary, name, src_dir_fd=target, dst_dir_fd=target, follow_symlinks=False)
+                    os.link(name, name, src_dir_fd=source, dst_dir_fd=target, follow_symlinks=False)
+                    os.unlink(name, dir_fd=source)
                     counts['files_created'] += 1
                 else:
-                    os.replace(temporary, name, src_dir_fd=target, dst_dir_fd=target)
+                    os.replace(name, name, src_dir_fd=source, dst_dir_fd=target)
                     counts['files_overwritten'] += 1
-                os.fchown(out, owner.pw_uid, owner.pw_gid)
-                os.fchmod(out, 0o640)
+                copy_progress(files=1, size=info.st_size)
             finally:
                 if src is not None: os.close(src)
-                if out is not None: os.close(out)
-                try: os.unlink(temporary, dir_fd=target)
-                except FileNotFoundError: pass
 
 
 def merge_code(source, target, report, owner, target_path=None):
@@ -10783,13 +10801,17 @@ def merge_code(source, target, report, owner, target_path=None):
     counts = {'files_created': 0, 'files_overwritten': 0, 'directories_created': 0}
     plan = {}
     try:
+        require(os.fstat(source).st_dev == os.fstat(target).st_dev, 'Receiving area and destination must share a filesystem.')
+        copy_progress('KIEM TRA + BACKUP FILE CU')
         overlay_plan(source, target, backup, owner, plan)
         with open(report + '/code-manifest.json', 'x') as manifest:
             os.fchmod(manifest.fileno(), 0o600)
             json.dump({'schema': 1, 'target': target_path, 'entries': plan, 'backup': backup_path}, manifest, ensure_ascii=True)
             manifest.flush()
             os.fsync(manifest.fileno())
+        copy_progress('DUA FILE VAO WEBSITE (KHONG COPY LAI NOI DUNG)')
         apply_overlay(source, target, owner, plan, counts)
+        copy_progress(force=True)
         return dict(counts, backup=backup_path)
     except (Refused, OSError) as error:
         message = str(error) if isinstance(error, Refused) else type(error).__name__
@@ -10798,7 +10820,83 @@ def merge_code(source, target, report, owner, target_path=None):
         os.close(backup)
 
 
+@contextlib.contextmanager
+def receiving_area(target, identity):
+    # Same-filesystem private staging allows metadata-only promotion. Never
+    # place received files in a public document root or run network rsync root.
+    parent_path = os.path.dirname(target)
+    parent = directory(parent_path)
+    path = None
+    try:
+        info = os.fstat(parent)
+        require(info.st_uid == 0 and info.st_mode & 0o022 == 0, 'Transfer parent must be root-owned and not writable by group/other. Run the normal site permission repair; do not chmod 777.')
+        target_fd = directory(target)
+        try:
+            require(os.fstat(target_fd).st_dev == info.st_dev, 'Destination is a separate mount: prepare a same-filesystem migration manually; no cross-device slow copy fallback.')
+        finally:
+            os.close(target_fd)
+        path = tempfile.mkdtemp(prefix='.liuer-transfer-', dir=parent_path)
+        os.chown(path, identity.pw_uid, identity.pw_gid)
+        os.chmod(path, 0o700)
+        yield path
+    finally:
+        os.close(parent)
+        if path is not None:
+            copy_progress('DON VUNG TAM (GIU BACKUP)')
+            shutil.rmtree(path)
+
+
+def receive_rsync(command, identity, receive, report):
+    # Drain output continuously; never mix progress with stdout's JSON.
+    with open(report + '/rsync.log', 'xb') as log:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   cwd='/', start_new_session=True, preexec_fn=lambda: drop_identity(identity),
+                                   env={'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', 'LC_ALL': 'C'})
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        started = last_activity = last_heartbeat = time.monotonic()
+        pending = b''; logged = 0; last_detail = ''
+        try:
+            while selector.get_map():
+                now = time.monotonic()
+                require(now - started < 7200, 'Rsync exceeded two hours; no destination code was changed.')
+                require(shutil.disk_usage(receive).free > 1024 ** 3, 'Rsync stopped: less than 1 GiB disk reserve. Destination code was not changed.')
+                for key, unused in selector.select(0.25):
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj); continue
+                    last_activity = time.monotonic()
+                    room = max(0, 32 * 1024 ** 2 - logged)
+                    if room:
+                        log.write(chunk[:room]); log.flush(); logged += min(room, len(chunk))
+                    pending = (pending + chunk).replace(b'\r', b'\n')
+                    lines = pending.split(b'\n'); pending = lines.pop()[-4096:]
+                    for line in lines:
+                        # Progress numbers only. Never print remote-controlled
+                        # filenames, control sequences, passwords or banners.
+                        match = re.match(rb'^\s*([0-9,]+)\s+([0-9]+%)\s+([0-9.a-zA-Z/]+)\s+([0-9:]+)', line)
+                        if match:
+                            last_detail = ' | '.join(part.decode('ascii') for part in match.groups())
+                            copy_progress(detail=last_detail)
+                if now - last_heartbeat >= 5:
+                    last_heartbeat = now
+                    copy_progress(detail='Dang quet/nhan file; %ss tu du lieu rsync gan nhat (khong phai %% hoan tat).' % int(now - last_activity), force=True)
+            process.wait(timeout=5)
+            require(process.returncode == 0, 'Rsync failed; destination code was not changed. Private log: ' + report + '/rsync.log')
+            copy_progress(detail='DA NHAN XONG CODE (rsync exit=0); con backup/dua file. So lieu rsync cuoi: ' + (last_detail or 'khong co'), force=True)
+        finally:
+            selector.close()
+            # Kill only the owned operation's process group (SSH included).
+            try: os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError: pass
+            try: process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL); process.wait()
+            process.stdout.close()
+
+
 def sync_code(identifier, panel, domain, source, expected_site=None):
+    global COPY_PROGRESS
     data = site(domain)
     if expected_site is not None:
         require(isinstance(expected_site, str) and re.fullmatch(r'[a-f0-9]{64}', expected_site)
@@ -10806,80 +10904,48 @@ def sync_code(identifier, panel, domain, source, expected_site=None):
     require(panel in ['cyberpanel', 'directadmin'], 'Invalid source panel.')
     source_path(source)
     kind = data.get('TYPE')
+    require(kind in ['wordpress', 'laravel', 'php', 'static'], 'Unsupported site type for code transfer.')
     target = data['SITE_DIR'] if kind == 'laravel' else data['WEB_ROOT']
-    target_fd = directory(target)
-    os.close(target_fd)
-    with transport(identifier) as connection:
-        peer, identity, scratch, options = connection
-        quoted = shlex.quote(source)
-        check = '[ -d ' + quoted + ' ]'
-        if kind == 'laravel':
-            check += ' && [ -f ' + quoted + '/artisan ] && [ -f ' + quoted + '/public/index.php ]'
-        elif kind == 'wordpress':
-            check += ' && [ -d ' + quoted + '/wp-admin ] && [ -d ' + quoted + '/wp-includes ]'
-        remote(connection, check)
-        receive = scratch + '/receive'
-        scratch_fd = directory(scratch)
-        try:
-            os.mkdir('receive', 0o700, dir_fd=scratch_fd)
-            receive_fd = os.open('receive', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=scratch_fd)
-            try:
-                require(os.fstat(receive_fd).st_uid == 0, 'Receiver changed during setup.')
-                os.fchown(receive_fd, identity.pw_uid, identity.pw_gid)
-            finally:
-                os.close(receive_fd)
-        finally:
-            os.close(scratch_fd)
-        report = job_directory()
-        with open(report + '/rsync.log', 'xb') as log:
-            os.chmod(report + '/rsync.log', 0o600)
-            command = ['/usr/bin/rsync', '-rlt', '--protect-args', '--no-owner', '--no-group', '--no-perms',
-                                     '--no-links', '--no-devices', '--no-specials', '--chmod=Du=rwx,Dgo=,Fu=rw,Fgo=',
-                                     '-e', ' '.join(shlex.quote(x) for x in options), '--',
-                                     peer['user'] + '@' + ('[' + peer['host'] + ']' if ':' in peer['host'] else peer['host']) + ':' + source + '/', receive + '/']
-            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log, cwd='/', start_new_session=True,
-                                       preexec_fn=lambda: drop_identity(identity), env={'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', 'LC_ALL': 'C'})
-            started = time.monotonic()
-            try:
-                while process.poll() is None:
-                    require(time.monotonic() - started < 7200, 'Copy exceeded two hours; destination code has not been changed.')
-                    require(shutil.disk_usage(scratch).free > 1024 ** 3, 'Copy stopped: less than 1 GiB disk reserve. No destination code was activated.')
-                    time.sleep(0.25)
-                require(process.returncode == 0, 'Rsync failed. Website code was not activated. Private log: ' + report + '/rsync.log')
-            finally:
-                # Terminate this operation's process group, including an SSH
-                # child; never kill unrelated source/queue processes.
+    reviewed = site_snapshot(data)
+    report = job_directory()
+    COPY_PROGRESS = CopyProgress(domain, report)
+    try:
+        copy_progress('KIEM TRA SSH / DUONG DAN NGUON', 'Bao cao: ' + report, force=True)
+        with transport(identifier) as connection:
+            peer, identity, scratch, options = connection
+            quoted = shlex.quote(source)
+            check = '[ -d ' + quoted + ' ]'
+            if kind == 'laravel':
+                check += ' && [ -f ' + quoted + '/artisan ] && [ -f ' + quoted + '/public/index.php ]'
+            elif kind == 'wordpress':
+                check += ' && [ -d ' + quoted + '/wp-admin ] && [ -d ' + quoted + '/wp-includes ]'
+            remote(connection, check)
+            with receiving_area(target, identity) as receive:
+                command = ['/usr/bin/rsync', '-rltz', '--partial', '--info=progress2,name0', '--outbuf=L',
+                           '--protect-args', '--no-owner', '--no-group', '--no-perms',
+                           '--no-links', '--no-devices', '--no-specials', '--chmod=Du=rwx,Dgo=,Fu=rw,Fgo=',
+                           '-e', ' '.join(shlex.quote(x) for x in options), '--',
+                           peer['user'] + '@' + ('[' + peer['host'] + ']' if ':' in peer['host'] else peer['host']) + ':' + source + '/', receive + '/']
+                copy_progress('RSYNC TAI CODE', 'Dang quet/nhan danh sach file...', force=True)
+                receive_rsync(command, identity, receive, report)
+                source_fd = directory(receive)
+                target_fd = None
                 try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
-        owner = data['_account']
-        source_fd = directory(receive)
-        stage = report + '/code-stage'
-        os.mkdir(stage, 0o700)
-        stage_fd = directory(stage, private=True)
-        target_fd = None
-        try:
-            copy_tree(source_fd, stage_fd, owner)
-            if expected_site is not None:
-                require(site_snapshot(site(domain)) == expected_site, 'Destination site changed during transfer. No destination code overwritten for this site; review again.')
-            target_fd = directory(target)
-            outcome = merge_code(stage_fd, target_fd, report, owner, target_path=target)
-        finally:
-            os.close(source_fd)
-            os.close(stage_fd)
-            if target_fd is not None: os.close(target_fd)
-            # Only this root-private, newly created staging tree, never the
-            # destination/source website or retained overwrite backups.
-            shutil.rmtree(stage)
+                    copy_progress('KIEM TRA QUYEN FILE NHAN')
+                    seal_received_tree(source_fd)
+                    require(site_snapshot(site(domain)) == reviewed, 'Destination site changed during transfer. No destination code overwritten for this site; review again.')
+                    target_fd = directory(target)
+                    outcome = merge_code(source_fd, target_fd, report, data['_account'], target_path=target)
+                finally:
+                    os.close(source_fd)
+                    if target_fd is not None: os.close(target_fd)
+        copy_progress('HOAN TAT', 'Backup: ' + outcome['backup'], force=True)
         return dict(outcome, domain=domain, copied=True, target=target, overwrite_confirmed=True,
                     locked=data.get('STATUS') == 'locked', site_status=data.get('STATUS'), database_imported=False,
-                    note='Matching regular files overwritten after backup; destination-only files retained. No --delete, automatic DB import, DNS or site-state change. Source symlinks/special files omitted; conflicting destination links/type changes refused. Copied wp-config.php/.env still contain SOURCE credentials until updated separately. Review code/permissions/Laravel cache before use.')
+                    report=report, transfer_mode='rsync-single-receive-rename',
+                    note='Single rsync receive on the destination filesystem, then rename/link promotion without another payload copy. Old conflicting files backed up; destination-only entries retained. No --delete, DB import, DNS or site-state change. Incoming links/special files omitted; destination conflicts refused. Backups are not power-loss-durable snapshots. Copied wp-config.php/.env retain SOURCE credentials; update separately.')
+    finally:
+        COPY_PROGRESS = None
 
 
 def main(arguments):
@@ -11157,6 +11223,12 @@ _import_profile_select() {
     done
 }
 
+_import_copy_confirmation_hint() {
+    printf '\n  ĐỂ BẮT ĐẦU COPY: gõ chính xác dòng màu đỏ bên dưới rồi nhấn Enter.\n\n'
+    printf '    \033[1;31m%s\033[0m\n\n' "$1"
+    printf '  Đây là nội dung cần nhập tại menu này, không phải lệnh chạy riêng.\n'
+}
+
 _import_sync_single() {
     local domain="${1:-}" profile panel kind probe source choice acknowledgment result
     _import_profile_select || return
@@ -11174,7 +11246,8 @@ _import_sync_single() {
         printf 'Source: %s\nDomain: %s\n' "$source" "$domain"
         printf '\033[1;31m\nCANH BAO: LENH COPY SE COPY VA GHI DE FILE TRUNG TEN TREN WEBSITE DICH!\nKhong can Lock. Website dang chay co the loi/tam gian doan khi thay code.\nwp-config.php / .env cung bi ghi de neu nguon co; can sua ket noi DB rieng.\nFile cu bi ghi de duoc backup truoc; file chi co o dich duoc giu, KHONG --delete.\nCopy khong phai giao dich toan site: neu loi giua chung co the da thay mot so file.\033[0m\n'
         log_warn 'Laravel: chon toan bo project co artisan + public/index.php. Khong tu import DB, doi DNS, Lock/Unlock hay dung cron/queue. Symlink/file dac biet tu nguon bi bo qua; xung dot symlink/file-thu muc o dich se bi tu choi.'
-        read -r -p "Go GHI DE ${domain} de tiep tuc, 0/Enter de huy: " acknowledgment || return
+        _import_copy_confirmation_hint "GHI DE ${domain}"
+        read -r -p 'Nhập đúng dòng màu đỏ ở trên; 0/Enter để hủy: ' acknowledgment || return
         if [[ "$acknowledgment" == "GHI DE ${domain}" ]]; then
             if result=$(_liuer_import_api sync "$profile" "$panel" "$domain" "$source" --overwrite-confirmed --confirm); then
                 if python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert d.get("copied") is True and d.get("overwrite_confirmed") is True and d.get("domain")==sys.argv[2]; print("Backup file cu: "+str(d.get("backup",""))); print("File moi: %s | Ghi de: %s"%(d.get("files_created",0),d.get("files_overwritten",0)))' "$result" "$domain"; then
@@ -11295,7 +11368,14 @@ _import_sync_menu() {
             printf '\033[1;31m\nCANH BAO: COPY SE GHI DE FILE TRUNG TEN CUA %s WEBSITE SAN SANG O TREN!\nKhong can Lock. Website dang chay co the gian doan; wp-config.php / .env cung bi ghi de neu nguon co.\nBackup file cu truoc khi ghi de; giu file chi co o dich, KHONG --delete.\nDB/ket noi DB la buoc rieng. Khong tu doi DNS, trang thai site hay dung cron/queue.\nNeu mot site loi se DUNG DOT; site da copy khong tu rollback, site con lai chua chay.\033[0m\n' "$count"
             echo '  E) Sua duong dan nguon / bo qua site (missing/ambiguous/probe-error KHONG tu copy)'
             echo '  B) Chon lai domain   |   0) Huy toan bo, khong ghi de'
-            read -r -p "Go GHI DE ${count} DOMAIN de copy ${count} site ready, hoac E/B/0: " acknowledgment || return 0
+            if [[ "$count" -gt 0 ]]; then
+                printf '\n  Sẽ copy %s website có trạng thái ready trong danh sách trên.\n' "$count"
+                _import_copy_confirmation_hint "GHI DE ${count} DOMAIN"
+                read -r -p 'Nhập dòng màu đỏ để COPY; E sửa nguồn / B chọn lại / 0 hủy: ' acknowledgment || return 0
+            else
+                printf '\033[1;31m\nCHƯA CÓ WEBSITE SẴN SÀNG ĐỂ COPY. Chọn E để sửa nguồn hoặc B để chọn lại site.\033[0m\n'
+                read -r -p 'Nhập E sửa nguồn / B chọn lại / 0 hủy: ' acknowledgment || return 0
+            fi
             case "$acknowledgment" in
                 0|'') log_info 'Da huy dot copy; chua ghi de code.'; return 0 ;;
                 b|B) break ;;
