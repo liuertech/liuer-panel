@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.21"
+readonly VERSION="2.7.22"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -9754,12 +9754,14 @@ menu_database() {
         echo "   2  List databases"
         echo "   3  Delete database"
         echo "   4  Import / migration / SQL cleanup"
+        echo "   5  Fix SQL import permissions"
         _sub_footer; read -r _ch
         case "$_ch" in
             1) create_database ;;
             2) list_databases ;;
             3) delete_database ;;
             4) _import_menu ;;
+            5) _import_permissions_menu ;;
             0) return ;;
             *) log_warn "Invalid selection." ;;
         esac
@@ -10094,6 +10096,92 @@ def inventory():
     return result
 
 
+def permission_inventory():
+    """Read-only repair plan; never follow/adopt untrusted SQL entries."""
+    result = {'directory': SQL, 'directories': [], 'files': [], 'skipped': [], 'skipped_count': 0}
+    for path in [BASE, SQL]:
+        fd = directory(path)
+        try:
+            info = os.fstat(fd)
+            require(info.st_uid == 0, 'Import directories must already be owned by root; ownership is never changed automatically.')
+            if path == BASE:
+                require(info.st_mode & 0o022 == 0, 'Import base is writable by group/other. Secure its ownership/permissions manually before repair.')
+            result['directories'].append({'path': path, 'mode': format(stat.S_IMODE(info.st_mode), '04o'), 'target': '0700'})
+        finally:
+            os.close(fd)
+    parent = directory(SQL)
+    try:
+        for name in sorted(os.listdir(parent)):
+            info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1:
+                result['files'].append({'name': name, 'size': info.st_size, 'mode': format(stat.S_IMODE(info.st_mode), '04o'), 'target': '0600', 'fingerprint': fingerprint(info)})
+            else:
+                result['skipped_count'] += 1
+                if len(result['skipped']) < 100:
+                    result['skipped'].append({'name': name, 'reason': 'Requires a root-owned regular file, one hardlink only; no symlinks or directories.'})
+    finally:
+        os.close(parent)
+    return result
+
+
+def fix_permissions(selections):
+    require(isinstance(selections, list) and len(selections) <= 200, 'Select at most 200 SQL files, or an empty list for directories only.')
+    require(all(isinstance(row, dict) and set(row) == {'name','fingerprint'}
+                and isinstance(row['name'], str) and row['name'] not in ['', '.', '..'] and '/' not in row['name'] and '\x00' not in row['name']
+                and isinstance(row['fingerprint'], str) and re.fullmatch(r'[a-f0-9]{64}',row['fingerprint']) for row in selections), 'Invalid permission repair selection.')
+    require(len({row['name'] for row in selections}) == len(selections), 'Duplicate permission repair selection.')
+    base = directory(BASE)
+    parent = lock = None
+    opened = []
+    changed = []
+    try:
+        require(os.fstat(base).st_uid == 0 and os.fstat(base).st_mode & 0o022 == 0, 'Unsafe import base; fix root ownership/group-write permissions manually first.')
+        parent = directory(SQL)
+        require(os.fstat(parent).st_uid == 0, 'SQL directory must already be root-owned.')
+        lock = os.open('operation.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600, dir_fd=base)
+        info = os.fstat(lock)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1 and info.st_mode & 0o077 == 0, 'Unsafe operation lock.')
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refused('An import/sync/config/cleanup operation is running. Permission repair must wait.')
+        # Close directory write access first so another UID cannot rename
+        # entries between verification and fchmod. This is part of the exact
+        # directory repair the operator just confirmed, even on a stale plan.
+        for label, fd in [(BASE,base),(SQL,parent)]:
+            if stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
+                os.fchmod(fd,0o700)
+                changed.append(label)
+        # Validate every selected inode before chmodding any SQL file.
+        for row in selections:
+            fd = os.open(row['name'], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            opened.append((row['name'], fd))
+            info = os.fstat(fd)
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1, 'Repair refuses symlinks/hardlinks/special files and files not owned by root.')
+            require(fingerprint(info) == row['fingerprint'], 'SQL file changed since repair selection; refresh the list.')
+        for name, fd in opened:
+            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            require(fingerprint(current) == fingerprint(os.fstat(fd)), 'SQL entry changed before repair; no SQL file was chmodded.')
+        for label, fd, mode in [(BASE,base,0o700),(SQL,parent,0o700)]+[(name,fd,0o600) for name,fd in opened]:
+            if stat.S_IMODE(os.fstat(fd).st_mode) != mode:
+                os.fchmod(fd, mode)
+                changed.append(label)
+        return {'changed': changed, 'selected_files': len(opened), 'directory_mode': '0700', 'file_mode': '0600', 'contents_changed': False, 'databases_changed': False, 'ownership_changed': False}
+    except (Refused, OSError) as error:
+        if changed:
+            reason = str(error) if isinstance(error,Refused) else 'Filesystem permission operation failed.'
+            raise Refused('Permission repair stopped after changing: ' + ', '.join(json.dumps(name,ensure_ascii=True) for name in changed) + '. ' + reason + ' Review permissions again; no SQL content or database was changed.')
+        raise
+    finally:
+        for _, fd in opened:
+            os.close(fd)
+        if lock is not None:
+            os.close(lock)
+        if parent is not None:
+            os.close(parent)
+        os.close(base)
+
+
 def cleanup(selections):
     require(isinstance(selections, list) and 0 < len(selections) <= 200, 'Select 1–200 exact SQL files.')
     require(all(isinstance(row, dict) and isinstance(row.get('name'), str) and isinstance(row.get('fingerprint'), str) for row in selections), 'Invalid cleanup selection.')
@@ -10155,7 +10243,7 @@ def job_directory():
 
 
 def import_sql(domain, filename, expected):
-    require(site(domain).get('STATUS') == 'locked', 'Lock the destination website before importing. Pause its cron/queue writers too.')
+    metadata = site(domain)
     name, unused_user = database(domain)
     database_empty(name)  # Must happen before creating users or reading the dump.
     fd, before = open_sql(filename, expected)
@@ -10204,7 +10292,8 @@ def import_sql(domain, filename, expected):
                                         preexec_fn=lambda: sql_identity(identity), cwd='/',
                                         env={'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', 'LC_ALL': 'C'}, timeout=3600)
                 require(result.returncode == 0, 'SQL import failed; DB may contain partial objects. Clean it MANUALLY before retrying. Private log: ' + report + '/client.log')
-            return {'domain': domain, 'database': name, 'imported': filename, 'config_updated': False, 'source_kept': True}
+            return {'domain': domain, 'database': name, 'imported': filename, 'config_updated': False, 'source_kept': True,
+                    'type': metadata.get('TYPE'), 'site_status': metadata.get('STATUS')}
         finally:
             if created:
                 admin_sql("DROP USER '{0}'@'localhost';".format(temporary_user))
@@ -10304,7 +10393,6 @@ def laravel_config(text, values):
 
 def update_config(domain, password):
     data = site(domain)
-    require(data.get('STATUS') == 'locked', 'Lock the destination website before updating its DB connection.')
     name, user = database(domain)
     require(password and '\x00' not in password, 'Cannot read managed database credentials.')
     require(admin_sql("SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='" + name + "';") == '1', 'Managed database is missing.')
@@ -10632,6 +10720,12 @@ def main(arguments):
     action, args = arguments[0], arguments[1:]
     if action == 'inventory' and not args:
         return inventory()
+    if action == 'permissions-inventory' and not args:
+        return permission_inventory()
+    if action == 'permissions' and len(args) == 2 and args[1] == '--confirm':
+        # Uses the SAME operation lock but must be able to repair root-owned
+        # 0755 directories which initialize() deliberately refuses.
+        return fix_permissions(json.loads(args[0]))
     if action == 'init' and not args:
         initialize()
         return {'directory': SQL, 'ready': True}
@@ -10640,7 +10734,7 @@ def main(arguments):
             metadata = site(args[0])
             name, user = database(args[0])
             database_empty(name)
-            return {'domain': args[0], 'database': name, 'empty': True, 'status': metadata.get('STATUS')}
+            return {'domain': args[0], 'database': name, 'empty': True, 'status': metadata.get('STATUS'), 'type': metadata.get('TYPE')}
         if action == 'profile-create' and len(args) == 3:
             return profile_create(*args)
         if action == 'profile-install' and len(args) == 1:
@@ -10720,15 +10814,16 @@ if d.get("rejected",0):
         print("    - %s: %s"%(safe(f["name"]),safe(f["reason"])))
     hidden=int(d["rejected"])-len(d.get("rejected_files",[]))
     if hidden: print("    Con %s muc bi loai khac; kiem tra qua root SFTP."%hidden)
-print("\n    R) Quet lai thu muc sau khi upload / sua quyen")
+print("\n    F) Fix permission toan thu muc SQL (co xac nhan)")
+print("    R) Quet lai thu muc sau khi upload / sua quyen")
 print("    0) Quay lai")
 ' "$listing" || return 1
         if [[ "$count" == 0 ]]; then
-            read -r -p 'Chon R de quet lai, 0 de quay lai: ' choice || return 1
+            read -r -p 'Chon F de sua quyen, R de quet lai, 0 de quay lai: ' choice || return 1
         else
-            read -r -p "Chon so thu tu [1-${count}], R hoac 0: " choice || return 1
+            read -r -p "Chon so thu tu [1-${count}], F, R hoac 0: " choice || return 1
         fi
-        case "$choice" in 0|'') return 1 ;; r|R) continue ;; esac
+        case "$choice" in 0|'') return 1 ;; r|R) continue ;; f|F) _import_permissions_menu || true; continue ;; esac
         if [[ "$choice" =~ ^[1-9][0-9]*$ && ${#choice} -lt 5 ]]; then
             row=$(python3 -I -c 'import json,sys; a=json.loads(sys.argv[1])["files"]; i=int(sys.argv[2])-1; print(a[i]["name"]+"|"+a[i]["fingerprint"]) if 0<=i<len(a) else sys.exit(1)' "$listing" "$choice") || row=''
             if [[ -n "$row" ]]; then
@@ -10742,24 +10837,91 @@ print("    0) Quay lai")
 }
 
 _import_sql_menu() {
-    local domain="${1:-}"
+    local domain="${1:-}" preflight kind result db_name choice
     if [[ -z "$domain" ]]; then SELECTED_DOMAIN=''; _select_domain 'Import SQL into existing EMPTY database' || return; domain="$SELECTED_DOMAIN"; fi
-    _liuer_import_api check "$domain" || { press_enter; return 1; }
+    if ! preflight=$(_liuer_import_api check "$domain"); then
+        log_error 'CHUA IMPORT: khong qua kiem tra DB dich. DB phai ton tai va trong; DB co du lieu phai tu don tay.'
+        press_enter; return 1
+    fi
+    kind=$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1]).get("type",""))' "$preflight") || { log_error 'CHUA IMPORT: khong doc duoc thong tin site.'; press_enter; return 1; }
+    db_name=$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1])["database"])' "$preflight") || { log_error 'CHUA IMPORT: khong doc duoc DB dich.'; press_enter; return 1; }
     log_warn 'DB must exist and contain NO tables/views/routines/events. Non-empty DB must be cleaned MANUALLY. No force/automatic deletion.'
-    log_warn 'Lock this site first and pause its cron/queue writers. SQL is untrusted: review its source before importing.'
+    log_warn 'Khong bat buoc Lock site. Neu web/cron/queue dang ghi DB dich, can can nhac tam dung de tranh ghi dong thoi; cong cu khong tu khoa/tat bat ky dich vu nao.'
+    log_warn 'Chi import SQL tu nguon tin cay. Import loi co the de lai du lieu do dang; khong tu xoa de thu lai.'
     _import_select_sql || return
-    printf 'Website: %s\nSQL: %s\n' "$domain" "$IMPORT_SQL_NAME"
+    printf 'Website: %s\nDB dich: %s\nSQL: %s\n' "$domain" "$db_name" "$IMPORT_SQL_NAME"
     confirm_action 'Import into this EMPTY managed DB (source SQL is kept)?' || return
-    _liuer_import_api sql "$domain" "$IMPORT_SQL_NAME" "$IMPORT_SQL_FINGERPRINT" --confirm
+    if ! result=$(_liuer_import_api sql "$domain" "$IMPORT_SQL_NAME" "$IMPORT_SQL_FINGERPRINT" --confirm); then
+        log_error 'IMPORT THAT BAI / CHUA HOAN TAT. Khong tu chay lai hoac sua config. DB co the co du lieu do dang; kiem tra va tu don tay truoc khi import lai.'
+        press_enter; return 1
+    fi
+    if ! python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert d.get("domain")==sys.argv[2] and d.get("imported")==sys.argv[3] and d.get("source_kept") is True' "$result" "$domain" "$IMPORT_SQL_NAME"; then
+        log_error 'CHUA XAC NHAN DUOC KET QUA IMPORT. Kiem tra DB truoc; khong import lai hoac sua config tu dong.'
+        press_enter; return 1
+    fi
+    log_success "IMPORT THANH CONG: ${domain} -> ${db_name}"
+    log_info 'File SQL van duoc giu; chua thay doi config, trang thai site hoac cron/queue.'
+    if [[ "$kind" == wordpress || "$kind" == laravel ]]; then
+        echo '  1) Cap nhat ket noi DB cho WordPress / Laravel ngay (xac nhan rieng)'
+        echo '  0) Bo qua, giu nguyen config hien tai'
+        while true; do
+            read -r -p 'Buoc ket noi DB [0]: ' choice || choice=0
+            case "$choice" in
+                1) _import_config_menu "$domain" || log_warn 'DB da import thanh cong, nhung buoc sua ket noi chua hoan tat. Khong import lai DB; vao muc 4 de sua ket noi.'; return ;;
+                0|'') log_info 'Da import DB; config khong thay doi.'; break ;;
+                *) log_warn 'Chi chon 1 de sua ket noi, hoac 0 de bo qua.' ;;
+            esac
+        done
+    else
+        log_info 'Code PHP thuan / HTML: thong tin ket noi DB can tu cau hinh tay.'
+    fi
     press_enter
 }
 
 _import_config_menu() {
-    local domain="${1:-}"
+    local domain="${1:-}" result
     if [[ -z "$domain" ]]; then SELECTED_DOMAIN=''; _select_domain 'Update WP/Laravel database connection only' || return; domain="$SELECTED_DOMAIN"; fi
-    log_warn 'Only the managed DB connection changes. WP prefix/salts and Laravel APP_KEY are preserved. Keep the site locked until reviewed.'
+    log_warn 'Only the managed DB connection changes. WP prefix/salts and Laravel APP_KEY are preserved. Khong bat buoc Lock site; site dang chay se dung ket noi moi.'
     confirm_action "Update DB connection for $domain (separate from SQL import)?" || return
-    _liuer_import_api config "$domain" --confirm
+    if ! result=$(_liuer_import_api config "$domain" --confirm); then
+        log_error 'SUA KET NOI DB THAT BAI / CHUA XAC NHAN DUOC. Buoc nay khong import lai hay xoa du lieu DB.'
+        press_enter; return 1
+    fi
+    if ! python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert d.get("domain")==sys.argv[2] and d.get("config_updated") is True; print("Backup: "+str(d.get("backup",""))); print(d.get("note",""))' "$result" "$domain"; then
+        log_error 'Khong doc duoc ket qua sua ket noi; kiem tra config truoc khi thu lai.'
+        press_enter; return 1
+    fi
+    log_success "DA CAP NHAT KET NOI DB: ${domain}. Khong thay doi du lieu DB."
+    press_enter
+}
+
+_import_permissions_menu() {
+    local listing selection result
+    print_section 'FIX SQL IMPORT PERMISSIONS'
+    listing=$(_liuer_import_api permissions-inventory) || { log_error 'Khong lap duoc danh sach. Can thu muc import root-owned; neu chua co, vao Prepare private SQL directory truoc.'; press_enter; return 1; }
+    python3 -I -c '
+import json,sys
+d=json.loads(sys.argv[1]); safe=lambda s: json.dumps(str(s),ensure_ascii=True)[1:-1]
+print("AP DUNG TOAN BO FILE THUONG ROOT-OWNED TRONG THU MUC SQL (khong de quy).")
+print("Chi sua quyen; khong sua noi dung, khong chown, khong dong den DB/website.")
+for row in d["directories"]: print("  %s: %s -> 0700"%(safe(row["path"]),row["mode"]))
+for i,row in enumerate(d["files"],1): print("  %3d) %s [%s bytes]: %s -> 0600"%(i,safe(row["name"]),row["size"],row["mode"]))
+if not d["files"]: print("  Khong co file thuong root-owned; chi sua quyen thu muc.")
+for row in d.get("skipped",[]): print("  BO QUA %s: %s"%(safe(row["name"]),safe(row["reason"])))
+if d.get("skipped_count",0)>len(d.get("skipped",[])): print("  Con %s muc bi bo qua khac."%(d["skipped_count"]-len(d.get("skipped",[]))))
+print("  Tong so file se sua: %s (toi da 200 moi lan)."%len(d["files"]))
+' "$listing" || return 1
+    selection=$(python3 -I -c 'import json,sys; a=json.loads(sys.argv[1])["files"]; assert len(a)<=200; s=json.dumps([{k:r[k] for k in ["name","fingerprint"]} for r in a]); assert len(s.encode())<60000; print(s)' "$listing" 2>/dev/null) || { log_error 'Danh sach qua lon (toi da 200 file / 60 KB). Chua sua quyen; can thu gon thu muc SQL truoc.'; press_enter; return 1; }
+    confirm_action 'Xac nhan sua TOAN BO quyen thu muc/file vua liet ke? Khong sua/xoa noi dung hoac DB.' || { log_info 'Da huy sua quyen; khong co file nao thay doi.'; return; }
+    if ! result=$(_liuer_import_api permissions "$selection" --confirm); then
+        log_error 'SUA QUYEN CHUA HOAN TAT. Kiem tra thong bao ben tren; khong co lenh import nao duoc chay.'
+        press_enter; return 1
+    fi
+    if ! python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert d.get("contents_changed") is False and d.get("databases_changed") is False' "$result"; then
+        log_error 'Chua xac nhan duoc ket qua sua quyen; hay quet lai danh sach.'
+        press_enter; return 1
+    fi
+    log_success 'DA SUA QUYEN SQL: thu muc 700, toan bo file thuong du dieu kien 600. Khong thay doi noi dung hay du lieu DB.'
     press_enter
 }
 
@@ -10872,6 +11034,7 @@ _import_menu() {
         echo '  4) Update WordPress / Laravel DB connection only'
         echo '  5) List / clean uploaded SQL (confirmation required)'
         echo '  6) Create empty locked website for migration'
+        echo '  7) Fix permission TOAN BO file trong thu muc SQL (co xac nhan)'
         echo '  0) Back'
         read -r -p 'Select: ' choice
         case "$choice" in
@@ -10882,6 +11045,7 @@ _import_menu() {
             4) _import_config_menu ;;
             5) _import_files_menu ;;
             6) _import_create_site ;;
+            7) _import_permissions_menu ;;
             0|'') return ;;
             *) log_warn 'Invalid selection.' ;;
         esac
