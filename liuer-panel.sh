@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.33"
+readonly VERSION="2.7.34"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -10299,7 +10299,7 @@ _batch_created_ok() {
 
 _batch_new_report() {
     local kind="$1" base='/var/backups/liuer-panel/batches'
-    [[ "$kind" == create || "$kind" == ssl ]] || return 1
+    [[ "$kind" == create || "$kind" == ssl || "$kind" == db-config ]] || return 1
     [[ ! -L "$base" ]] || { log_error 'Unsafe batch report directory.'; return 1; }
     install -d -m 700 "$base" || return 1
     BATCH_REPORT=$(mktemp -d "${base}/${kind}.XXXXXXXX") || return 1
@@ -11081,8 +11081,52 @@ def laravel_config(text, values):
     return text
 
 
-def update_config(domain, password):
+def config_snapshot(data):
+    """Non-secret review token: site identity, config inode/stat and DB mapping."""
+    domain = data['DOMAIN']
+    kind = data.get('TYPE')
+    require(kind in ['wordpress', 'laravel'], 'Plain PHP/static code must be configured manually.')
+    database(domain)
+    mapping = [line for line in read_private(DB_LIST).splitlines() if line.split('|')[0] == domain]
+    require(len(mapping) == 1, 'Missing or ambiguous managed database mapping.')
+    path = data['WEB_ROOT'] + '/wp-config.php' if kind == 'wordpress' else data['SITE_DIR'] + '/.env'
+    parent = directory(os.path.dirname(path))
+    try:
+        info = os.stat(os.path.basename(path), dir_fd=parent, follow_symlinks=False)
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size <= 1024 * 1024
+                and info.st_uid in [0, data['_account'].pw_uid], 'Unsafe application config.')
+        values = [site_snapshot(data), fingerprint(info), info.st_uid, info.st_gid, info.st_mode,
+                  hashlib.sha256(mapping[0].encode()).hexdigest()]
+        return hashlib.sha256(json.dumps(values).encode()).hexdigest()
+    finally:
+        os.close(parent)
+
+
+def config_inventory():
+    result = site_inventory()
+    for row in result['sites']:
+        row.update(state='manual', database='', snapshot='')
+        if row['type'] not in ['wordpress', 'laravel']:
+            continue
+        row['state'] = 'not-ready'
+        try:
+            data = site(row['domain'])
+            name, user = database(row['domain'])
+            snapshot = config_snapshot(data)
+            require(database(row['domain']) == (name, user), 'Managed DB changed while preparing the review.')
+            row.update(state='ready', database=name, snapshot=snapshot)
+        except (Refused, OSError, KeyError, ValueError):
+            # No config contents / encrypted passwords / raw exceptions leave here.
+            row.update(state='not-ready', snapshot='')
+    return result
+
+
+def update_config(domain, password, expected_snapshot=None):
     data = site(domain)
+    if expected_snapshot is not None:
+        require(isinstance(expected_snapshot, str) and re.fullmatch(r'[a-f0-9]{64}', expected_snapshot)
+                and config_snapshot(data) == expected_snapshot,
+                'Site/config/managed DB changed since batch review. Rescan; no config updated.')
     name, user = database(domain)
     require(password and '\x00' not in password, 'Cannot read managed database credentials.')
     require(admin_sql("SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='" + name + "';") == '1', 'Managed database is missing.')
@@ -11116,6 +11160,9 @@ def update_config(domain, password):
                 os.fchmod(stream.fileno(), 0o640)
             current = os.stat(os.path.basename(path), dir_fd=parent, follow_symlinks=False)
             require(fingerprint(current) == fingerprint(info), 'Config changed during confirmation; original was not overwritten.')
+            if expected_snapshot is not None:
+                require(config_snapshot(site(domain)) == expected_snapshot and database(domain) == (name, user),
+                        'Site/config/managed DB changed during update; original was not overwritten.')
             # Never replace a file selected through a symlink.
             os.replace(temporary, os.path.basename(path), src_dir_fd=parent, dst_dir_fd=parent)
         finally:
@@ -11634,6 +11681,8 @@ def main(arguments):
         return inventory()
     if action == 'sites' and not args:
         return site_inventory()
+    if action == 'config-sites' and not args:
+        return config_inventory()
     if action == 'profiles' and not args:
         return profile_inventory()
     if action == 'permissions-inventory' and not args:
@@ -11666,6 +11715,9 @@ def main(arguments):
         if action == 'config' and len(args) == 2 and args[1] == '--confirm':
             password = os.read(3, 4096).decode('utf-8')
             return update_config(args[0], password)
+        if action == 'config' and len(args) == 4 and args[1] == '--config-snapshot' and args[3] == '--confirm':
+            password = os.read(3, 4096).decode('utf-8')
+            return update_config(args[0], password, expected_snapshot=args[2])
         if action == 'sync':
             if len(args) == 9 and args[4] == '--site-snapshot' and args[6:] == ['--overwrite-confirmed', '--confirm', '--no-code-backup']:
                 return sync_code(*args[:4], expected_site=args[5])
@@ -11822,7 +11874,56 @@ _import_sql_once() {
 
 _import_config_menu() {
     if [[ -n "${1:-}" ]]; then _import_config_once "$1"; return; fi
-    _import_domain_loop _import_config_once 'Ket noi DB - chon domain'
+    local listing choice selected count
+    while true; do
+        listing=$(_liuer_import_api config-sites) || { log_error 'Khong doc duoc danh sach site/ket noi DB.'; return 1; }
+        _import_batch_json "$listing" config-options || return 1
+        read -r -p 'Chon domain (A / 1,3,5-8 / 0=Back): ' choice || return 0
+        [[ -n "$choice" && "$choice" != 0 ]] || return 0
+        selected=$(_import_batch_json "$listing" select "$choice") || continue
+        count=$(_import_batch_json "$selected" count) || return 1
+        [[ "$count" -le 200 ]] || { log_warn 'Toi da 200 domain/luot; chon lai danh sach nho hon.'; continue; }
+        _import_batch_json "$selected" config-show || return 1
+        log_warn 'Chi sua wp-config.php / .env bang DB RIENG da luu cua tung domain. Khong import/xoa DB, khong doi WP prefix/salts, Laravel APP_KEY, DNS hay trang thai site.'
+        confirm_action 'Cap nhat ket noi DB cho cac site da chon?' || continue
+        _import_config_batch_run "$selected" || true
+    done
+}
+
+_import_config_batch_run() {
+    (
+    umask 077
+    local selected="$1" total i row domain kind state snapshot result report ok=0 failed=0 skipped=0
+    command -v flock >/dev/null || { log_error 'Can flock; chua sua config.'; return 1; }
+    exec 9>/run/liuer-batch.lock; flock -n 9 || { log_error 'Mot luot batch dang chay; thu lai sau.'; return 1; }
+    total=$(_import_batch_json "$selected" count) || return 1
+    [[ "$total" -gt 0 && "$total" -le 200 ]] || return 1
+    _batch_new_report db-config || return 1; report="$BATCH_REPORT"
+    : > "$report/results.tsv"
+    log_info "Bao cao: $report"
+    i=1
+    while [[ "$i" -le "$total" ]]; do
+        row=$(_import_batch_json "$selected" config-row "$i") || return 1
+        IFS='|' read -r domain kind state snapshot <<< "$row"
+        validate_domain "$domain" || return 1
+        log_info "KET NOI DB ${i}/${total}: $domain"
+        if [[ "$kind" != wordpress && "$kind" != laravel ]]; then
+            printf '%s\tBO QUA\tPHP thuan/HTML: tu cau hinh tay\n' "$domain" >> "$report/results.tsv"; skipped=$((skipped+1))
+        elif [[ "$state" != ready || ! "$snapshot" =~ ^[a-f0-9]{64}$ ]]; then
+            printf '%s\tLOI\tThieu DB mapping/config hop le; chua sua file\n' "$domain" >> "$report/results.tsv"; failed=$((failed+1))
+        elif ( result=$(_liuer_import_api config "$domain" --config-snapshot "$snapshot" --confirm) \
+               && _import_batch_json "$result" config-result "$domain" ) 9>&- < /dev/null > "$report/$domain.log" 2>&1; then
+            printf '%s\tOK\tDA CAP NHAT KET NOI DB\n' "$domain" >> "$report/results.tsv"; ok=$((ok+1))
+            log_success "DA CAP NHAT KET NOI DB: ${domain}. Khong thay doi du lieu DB."
+        else
+            printf '%s\tLOI\tChua xac nhan cap nhat; xem log, khong import lai DB\n' "$domain" >> "$report/results.tsv"; failed=$((failed+1))
+        fi
+        i=$((i+1))
+    done
+    _batch_summary "$report" "$ok" "$failed" "$skipped"
+    log_info 'Laravel: can clear config cache rieng bang user cua site; khong tu chay artisan/migrations. Chon domain khac hoac 0 de quay lai.'
+    [[ "$failed" == 0 ]]
+    )
 }
 
 _import_config_once() {
@@ -12016,6 +12117,22 @@ try:
         print("SITE DA TAO TREN VPS DICH (khong tu tao site tu VPS nguon):")
         for i,row in enumerate(data["sites"],1): print("  %3d) %s | %s | %s"%(i,safe(row["domain"]),safe(row["type"]),safe(row["status"])))
         for row in data.get("rejected",[])[:100]: print("  BO QUA %s: %s"%(safe(row["name"]),safe(row["reason"])))
+    elif action=="config-options":
+        print("CAP NHAT KET NOI DB - CHON NHIEU DOMAIN (toi da 200/luot):")
+        for i,row in enumerate(data["sites"],1):
+            label={"ready":"San sang","manual":"Tu sua tay: se bo qua","not-ready":"Thieu DB/config hop le: se bao loi"}.get(row.get("state"),"Chua san sang")
+            print("  %3d) %s | %s | DB=%s | %s"%(i,safe(row["domain"]),safe(row["type"]),safe(row.get("database") or "--"),label))
+        for row in data.get("rejected",[])[:100]: print("  BO QUA %s: %s"%(safe(row["name"]),safe(row["reason"])))
+    elif action=="config-show":
+        for row in data: print("  %s | %s | DB=%s | %s"%(safe(row["domain"]),safe(row["type"]),safe(row.get("database") or "--"),safe(row.get("state","not-ready"))))
+    elif action=="config-row":
+        index=int(args[0]); assert 1<=index<=len(data)
+        row=data[index-1]
+        print("|".join(str(row.get(k,"")) for k in ["domain","type","state","snapshot"]))
+    elif action=="config-result":
+        assert data.get("domain")==args[0] and data.get("config_updated") is True and isinstance(data.get("backup"),str)
+        print("Backup config cu: "+safe(data["backup"]))
+        print(safe(data.get("note","")))
     elif action=="select":
         text=args[0].strip(); rows=data["sites"]; assert len(text)<=4096 and rows
         if text.lower()=="a": indices=set(range(1,len(rows)+1))
@@ -12186,7 +12303,7 @@ _import_menu() {
         echo '  1) Tao thu muc SQL'
         echo '  2) Copy code (nhieu domain)'
         echo '  3) Import DB'
-        echo '  4) Sua ket noi DB (WP / Laravel)'
+        echo '  4) Sua ket noi DB (chon nhieu domain)'
         echo '  5) Xem / don file SQL'
         echo '  6) Tao site rong de chuyen web'
         echo '  7) Sua quyen thu muc SQL'
@@ -13693,11 +13810,12 @@ main() {
 
         batch)
             check_root; detect_os
-            [[ $# == 2 ]] || { log_error 'Usage: liuer batch [create|ssl] (interactive)'; return 1; }
+            [[ $# == 2 ]] || { log_error 'Usage: liuer batch [create|ssl|db-config] (interactive)'; return 1; }
             case "$2" in
                 create) batch_create_sites ;;
                 ssl) batch_install_ssl ;;
-                *) log_error 'Usage: liuer batch [create|ssl] (interactive)'; return 1 ;;
+                db-config) _import_config_menu ;;
+                *) log_error 'Usage: liuer batch [create|ssl|db-config] (interactive)'; return 1 ;;
             esac
             ;;
 
@@ -13783,7 +13901,7 @@ main() {
             echo "  php-maintenance  Audit/update runtimes; migrate only confirmed 8.0/8.1 sites"
             echo "  php-maintenance legacy74  Review/update ONLY installed PHP 7.4 vendor packages"
             echo "  php-versions     Show installed FPM/CLI patch versions (--tsv for inventory)"
-            echo "  batch create|ssl  Create grouped sites / install SSL for multiple sites"
+            echo "  batch create|ssl|db-config  Bulk sites, SSL or managed DB connections"
             echo "  imports          Optional code migration, EMPTY-DB SQL import, config and confirmed SQL cleanup"
             echo "  help           Show this help"
             echo ""
