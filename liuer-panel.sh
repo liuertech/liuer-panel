@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.34"
+readonly VERSION="2.7.38"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -3799,100 +3799,11 @@ menu_framework_tools() {
 }
 
 toggle_static_cache() {
-    print_section "STATIC ASSET CACHING"
-    SELECTED_DOMAIN=""
-    _select_domain "Select site" || { press_enter; return; }
-    local domain="$SELECTED_DOMAIN"
-    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
-    [[ ! -f "$_conf" ]] && { log_error "Nginx config not found."; press_enter; return; }
-
-    local _cur="disabled"
-    grep -q '# liuer-static-cache-start' "$_conf" && _cur="enabled"
-
-    echo -e "\n  Site         : ${BOLD}${domain}${NC}"
-    echo -e "  Static cache : ${GREEN}${_cur}${NC}\n"
-    echo "  1) Enable  — cache JS/CSS/images 1 year (Cache-Control: immutable)"
-    echo "  2) Disable — remove caching block"
-    echo "  0) Cancel"
-    echo -e "${YELLOW}Select:${NC} \c"; read -r _ch
-
-    case "$_ch" in
-        1)
-            [[ "$_cur" == "enabled" ]] && { log_warn "Static cache already enabled."; press_enter; return; }
-            local _tmpf; _tmpf=$(mktemp)
-            awk '/location ~ \/\\./{
-                if (!ins) {
-                    print "    # liuer-static-cache-start"
-                    print "    location ~* \\.(png|jpg|webp|gif|jpeg|zip|css|svg|js|pdf|woff2|ttf|eot|otf|ico|mp4|webm)$ {"
-                    print "        add_header Cache-Control \"public, max-age=31536000, immutable\";"
-                    print "        access_log off;"
-                    print "    }"
-                    print "    # liuer-static-cache-end"
-                    print ""
-                    ins=1
-                }
-            } { print }' "$_conf" > "$_tmpf" && mv "$_tmpf" "$_conf"
-            log_success "Static asset caching enabled for ${domain}." ;;
-        2)
-            [[ "$_cur" == "disabled" ]] && { log_warn "Static cache already disabled."; press_enter; return; }
-            local _tmpf; _tmpf=$(mktemp)
-            awk '/# liuer-static-cache-start/{skip=1} skip && /# liuer-static-cache-end/{skip=0; next} !skip' \
-                "$_conf" > "$_tmpf" && mv "$_tmpf" "$_conf"
-            # Remove blank line left behind
-            sed -i '/^[[:space:]]*$/{ N; /^\n[[:space:]]*$/d }' "$_conf" 2>/dev/null || true
-            log_success "Static asset caching disabled for ${domain}." ;;
-        0) return ;;
-        *) log_warn "Invalid selection."; press_enter; return ;;
-    esac
-
-    nginx -t &>/dev/null && nginx -s reload || log_error "Nginx config error."
-    press_enter
+    batch_site_performance static_cache
 }
 
 toggle_gzip() {
-    print_section "GZIP COMPRESSION"
-    SELECTED_DOMAIN=""
-    _select_domain "Select site" || { press_enter; return; }
-    local domain="$SELECTED_DOMAIN"
-    local _conf="${NGINX_CONF_DIR}/${domain}.conf"
-    [[ ! -f "$_conf" ]] && { log_error "Nginx config not found."; press_enter; return; }
-
-    local _cur="disabled"
-    grep -q '^\s*gzip on' "$_conf" && _cur="enabled"
-
-    echo -e "\n  Site : ${BOLD}${domain}${NC}"
-    echo -e "  Gzip : ${GREEN}${_cur}${NC}\n"
-    echo "  1) Enable"
-    echo "  2) Disable"
-    echo "  0) Cancel"
-    echo -e "${YELLOW}Select:${NC} \c"; read -r _ch
-
-    case "$_ch" in
-        1)
-            [[ "$_cur" == "enabled" ]] && { log_warn "Gzip already enabled."; press_enter; return; }
-            local _tmpf; _tmpf=$(mktemp)
-            awk '/location ~ \/\\./{
-                if (!ins) {
-                    print "    gzip on;"
-                    print "    gzip_vary on;"
-                    print "    gzip_proxied any;"
-                    print "    gzip_comp_level 6;"
-                    print "    gzip_types text/plain text/css text/xml application/json application/javascript application/xml+rss application/atom+xml image/svg+xml;"
-                    print ""
-                    ins=1
-                }
-            } { print }' "$_conf" > "$_tmpf" && mv "$_tmpf" "$_conf"
-            log_success "Gzip enabled for ${domain}." ;;
-        2)
-            [[ "$_cur" == "disabled" ]] && { log_warn "Gzip already disabled."; press_enter; return; }
-            sed -i '/^\s*gzip/d' "$_conf"
-            log_success "Gzip disabled for ${domain}." ;;
-        0) return ;;
-        *) log_warn "Invalid selection."; press_enter; return ;;
-    esac
-
-    nginx -t &>/dev/null && nginx -s reload || log_error "Nginx config error."
-    press_enter
+    batch_site_performance gzip
 }
 
 toggle_php_routing() {
@@ -6656,22 +6567,44 @@ _php74_installed_builds() {
     esac
 }
 
-_php74_installed_verified() {
-    local records name build count=0
+_php74_core_build() {
+    local records name build core first='' seen=' ' count=0
+    # Capture the complete query before parsing. With pipefail, piping rpm to
+    # head can return SIGPIPE (141) even when the first record is valid.
     records=$(_php74_installed_builds) || return 1
     while IFS=$'\t' read -r name build; do
-        [[ -n "$name" && -n "$build" ]] && _php74_backport_build "$OS_FAMILY" "$build" || return 1
+        case "$OS_FAMILY" in
+            rhel) [[ "$name" =~ ^php74-php-(common|cli|fpm)$ ]] || return 1 ;;
+            debian) [[ "$name" =~ ^php7\.4-(common|cli|fpm)(:[a-z0-9]+)?$ ]] || return 1 ;;
+            *) return 1 ;;
+        esac
+        core="${name%%:*}"
+        [[ "$seen" != *" $core "* && "$build" =~ ^([0-9]+:)?7\.4\.[0-9]+-[A-Za-z0-9.+~_-]+$ ]] || return 1
+        seen+="$core "
+        [[ -n "$first" ]] || first="$build"
+        [[ "$build" == "$first" ]] || return 1
         count=$((count+1))
     done <<< "$records"
-    [[ "$count" == 3 ]]
+    [[ "$count" == 3 ]] || return 1
+    printf '%s\n' "$first"
+}
+
+_php74_installed_verified() {
+    local build
+    build=$(_php74_core_build) || return 1
+    _php74_backport_build "$OS_FAMILY" "$build"
 }
 
 _php74_runtime_matches() {
-    local build version
-    build=$(_php74_installed_builds | head -n 1 | cut -f2) || return 1
+    local build version cli fpm
+    build=$(_php74_core_build) || { log_error 'Cannot read three consistent PHP 7.4 common/CLI/FPM package builds; no package changes.'; return 1; }
     version="${build#*:}"; version="${version%%-*}"
-    [[ "$version" == 7.4.* ]] && [[ "$(_php_maint_version "$(get_php_bin 7.4)")" == "$version" ]] \
-        && [[ "$(_php_maint_version "$(_php_maint_fpm 7.4)")" == "$version" ]]
+    cli=$(_php_maint_version "$(get_php_bin 7.4)")
+    fpm=$(_php_maint_version "$(_php_maint_fpm 7.4)")
+    if [[ "$cli" != "$version" || "$fpm" != "$version" ]]; then
+        log_error "PHP 7.4 version check: package=${version}, CLI=${cli:-unknown}, FPM=${fpm:-unknown}. No package changes."
+        return 1
+    fi
 }
 
 _php74_plan_safe() {
@@ -6851,7 +6784,7 @@ php_maintenance_legacy74() {
     case "$boot_state" in enabled|disabled|static|indirect) ;; *) log_error 'Unsupported/masked PHP 7.4 service state; unchanged.'; return 1 ;; esac
     systemctl is-active --quiet "$svc" && active=1
     _php_maint_test_fpm 7.4 || { log_error 'Invalid existing PHP 7.4 FPM config; no package changes.'; return 1; }
-    _php74_runtime_matches || { log_error 'PHP 7.4 package / binary versions disagree; custom runtime left unchanged.'; return 1; }
+    _php74_runtime_matches || { log_error 'PHP 7.4 package/runtime verification failed; no package changes.'; return 1; }
     install -d -m 700 /var/backups/liuer-panel/runtime || return 1
     report=$(mktemp -d /var/backups/liuer-panel/runtime/php74.XXXXXXXX) || return 1
     log_info "PHP 7.4 protected config backup/report: $report"
@@ -10030,10 +9963,14 @@ menu_website_framework() {
         _sub_header "WEBSITE — WORDPRESS & LARAVEL"
         echo "   1  Framework tools"
         echo "   2  Permission profiles"
+        echo "   3  Update WordPress core (multiple sites / all)"
+        echo "   4  Update WordPress.org plugins (multiple sites / all)"
         _sub_footer; read -r _ch
         case "$_ch" in
             1) menu_framework_tools ;;
             2) manage_framework_permissions ;;
+            3) batch_update_wordpress ;;
+            4) batch_update_wp_plugins ;;
             0) return ;;
             *) log_warn "Invalid selection." ;;
         esac
@@ -10299,7 +10236,7 @@ _batch_created_ok() {
 
 _batch_new_report() {
     local kind="$1" base='/var/backups/liuer-panel/batches'
-    [[ "$kind" == create || "$kind" == ssl || "$kind" == db-config ]] || return 1
+    [[ "$kind" == create || "$kind" == ssl || "$kind" == db-config || "$kind" == gzip || "$kind" == static-cache || "$kind" == wp-core || "$kind" == wp-plugins ]] || return 1
     [[ ! -L "$base" ]] || { log_error 'Unsafe batch report directory.'; return 1; }
     install -d -m 700 "$base" || return 1
     BATCH_REPORT=$(mktemp -d "${base}/${kind}.XXXXXXXX") || return 1
@@ -10391,18 +10328,27 @@ batch_create_sites() {
     )
 }
 
-_batch_select_ssl_domains() {
+_batch_select_domains() {
     BATCH_DOMAINS=()
-    local meta domain choice selected i=0 label
+    local setting="${1:-ssl}" meta domain choice selected i=0 label conf
     local -a candidates=()
+    case "$setting" in ssl|gzip|static_cache|wp-core|wp-plugins) ;; *) return 1 ;; esac
     command -v python3 >/dev/null || { log_error 'Can python3 de chon nhieu domain.'; return 1; }
     for meta in "${SITES_META_DIR}"/*.conf; do
         [[ -f "$meta" && ! -L "$meta" ]] || continue
         domain="${meta##*/}"; domain="${domain%.conf}"
         _batch_site_meta_ok "$domain" || continue
         candidates+=("$domain"); i=$((i+1)); label='Chua cai SSL'
-        if grep -qx 'STATUS=locked' "$meta" || [[ -e "${NGINX_CONF_DIR}/${domain}.conf.disabled" ]]; then label='Locked: se bo qua'
-        elif grep -Eq '^[[:space:]]*ssl_certificate[[:space:]]' "${NGINX_CONF_DIR}/${domain}.conf" 2>/dev/null; then label='Da co SSL: se bo qua'; fi
+        conf="${NGINX_CONF_DIR}/${domain}.conf"
+        if [[ "$setting" == wp-* ]] && ! grep -Fqx 'TYPE=wordpress' "$meta"; then label='Khong phai WordPress: se bo qua'
+        elif grep -qx 'STATUS=locked' "$meta" || [[ -e "${NGINX_CONF_DIR}/${domain}.conf.disabled" ]]; then label='Locked: se bo qua'
+        elif [[ ! -s "$conf" || -L "$conf" ]]; then label='Config thieu/khong an toan: se bao loi'
+        elif [[ "$setting" != ssl && ( -e "${conf}.premaint" || -L "${conf}.premaint" ) ]]; then label='Bao tri: se bo qua'
+        elif [[ "$setting" == wp-* ]]; then label='WordPress: se kiem tra core/PHP truoc khi update'
+        elif [[ "$setting" == ssl ]]; then
+            if grep -Eq '^[[:space:]]*ssl_certificate[[:space:]]' "$conf" 2>/dev/null; then label='Da co SSL: se bo qua'; fi
+        elif _site_performance_matches "$setting" 1 "$conf"; then label='Dang bat tai site'
+        else label='Chua bat rieng tai site'; fi
         printf '  %3d) %-38s %s\n' "$i" "$domain" "$label"
     done
     [[ ${#candidates[@]} -gt 0 ]] || { log_warn 'Chua co site duoc quan ly.'; return 1; }
@@ -10432,6 +10378,547 @@ except (AssertionError,ValueError): sys.exit(1)
         log_warn 'Lua chon khong hop le / qua 200 domain. Chon lai hoac 0 de huy.'
     done
     return 1
+}
+
+_batch_select_ssl_domains() {
+    _batch_select_domains ssl
+}
+
+_batch_run_performance() {
+    (
+    umask 077
+    local setting="$1" enabled="$2" domain meta conf status report kind="$1" i=0 ok=0 failed=0 skipped=0
+    case "$setting:$enabled" in gzip:0|gzip:1|static_cache:0|static_cache:1) ;; *) return 1 ;; esac
+    [[ ${#BATCH_DOMAINS[@]} -gt 0 && ${#BATCH_DOMAINS[@]} -le 200 ]] || return 1
+    command -v flock >/dev/null || { log_error 'Can flock; chua sua config.'; return 1; }
+    exec 9>/run/liuer-batch.lock; flock -n 9 || { log_error 'Mot luot batch dang chay; thu lai sau.'; return 1; }
+    [[ "$kind" != static_cache ]] || kind=static-cache
+    _batch_new_report "$kind" || return 1; report="$BATCH_REPORT"
+    : > "$report/results.tsv"
+    for domain in "${BATCH_DOMAINS[@]}"; do
+        i=$((i+1)); log_info "${setting} ${i}/${#BATCH_DOMAINS[@]}: $domain"
+        meta="${SITES_META_DIR}/${domain}.conf"; conf="${NGINX_CONF_DIR}/${domain}.conf"
+        if ! _batch_site_meta_ok "$domain" || [[ -L "$conf" ]]; then
+            printf '%s\tLOI\tMetadata/config khong an toan; khong sua\n' "$domain" >> "$report/results.tsv"; failed=$((failed+1)); continue
+        fi
+        status=$(sed -n 's/^STATUS=//p' "$meta")
+        if [[ "$status" == locked || -e "${conf}.disabled" || -L "${conf}.disabled" || -e "${conf}.premaint" || -L "${conf}.premaint" ]]; then
+            log_warn "BO QUA ${domain}: site locked/bao tri."
+            printf '%s\tBO QUA\tSite locked/bao tri; giu nguyen\n' "$domain" >> "$report/results.tsv"; skipped=$((skipped+1)); continue
+        fi
+        if [[ ! -s "$conf" || ( -n "$status" && "$status" != active ) ]]; then
+            printf '%s\tLOI\tKhong co config active hop le\n' "$domain" >> "$report/results.tsv"; failed=$((failed+1)); continue
+        fi
+        if _site_performance_matches "$setting" "$enabled" "$conf"; then
+            printf '%s\tBO QUA\tDa o trang thai yeu cau\n' "$domain" >> "$report/results.tsv"; skipped=$((skipped+1)); continue
+        fi
+        if ( nginx -t && _api_web_site_action settings "$domain" "$setting" "$enabled" ) 9>&- < /dev/null > "$report/$domain.log" 2>&1; then
+            printf '%s\tOK\tDa cap nhat config Nginx\n' "$domain" >> "$report/results.tsv"; ok=$((ok+1))
+            log_success "DA CAP NHAT: ${domain}."
+        else
+            printf '%s\tLOI\tXem log; config loi duoc phuc hoi, can kiem tra neu reload that bai\n' "$domain" >> "$report/results.tsv"; failed=$((failed+1))
+            log_warn "LOI ${domain}: xem bao cao; tiep tuc site ke tiep."
+        fi
+    done
+    _batch_summary "$report" "$ok" "$failed" "$skipped"
+    [[ "$failed" == 0 ]]
+    )
+}
+
+batch_site_performance() {
+    (
+    umask 077
+    local setting="$1" title choice enabled domain
+    case "$setting" in gzip) title='GZIP COMPRESSION' ;; static_cache) title='STATIC ASSET CACHING' ;; *) return 1 ;; esac
+    while true; do
+        print_section "$title - CHON NHIEU SITE"
+        _batch_select_domains "$setting" || return 0
+        echo '1) Bat  |  2) Tat  |  0) Back'
+        read -r -p 'Chon: ' choice || return 0
+        case "$choice" in 1) enabled=1 ;; 2) enabled=0 ;; 0|'') continue ;; *) log_warn 'Lua chon khong hop le; chua sua config.'; continue ;; esac
+        printf '\n  %s | %s | %s domain\n' "$title" "$([[ "$enabled" == 1 ]] && echo BAT || echo TAT)" "${#BATCH_DOMAINS[@]}"
+        printf '  %s\n' "${BATCH_DOMAINS[@]}"
+        if [[ "$setting:$enabled" == static_cache:1 ]]; then
+            log_warn 'Cache JS/CSS/anh 1 nam, immutable. Hay doi ten/gan version asset khi deploy; tat khong xoa cache da luu trong trinh duyet.'
+        fi
+        log_warn 'Site locked/bao tri va site da dung trang thai se bo qua. Loi mot site van tiep tuc; khong sua code, DB, DNS hay SSL.'
+        if confirm_action 'Ap dung cho cac domain da chon?'; then
+            _batch_run_performance "$setting" "$enabled" || true
+            press_enter
+        fi
+    done
+    )
+}
+
+_batch_wp_latest() {
+    curl -q -fsS --proto '=https' --connect-timeout 15 --max-time 45 --max-filesize 1048576 \
+        https://api.wordpress.org/core/version-check/1.7/ | python3 -I -c '
+import json,re,sys
+try:
+    data=json.load(sys.stdin)
+    offer=next(row for row in data["offers"] if row.get("response")=="upgrade")
+    version=offer["version"]; minimum=offer["php_version"]
+    assert re.fullmatch(r"[0-9]{1,3}\.[0-9]{1,3}(?:\.[0-9]{1,3})?",version)
+    assert re.fullmatch(r"[0-9]{1,3}\.[0-9]{1,3}(?:\.[0-9]{1,3})?",minimum)
+    print(version+"|"+minimum)
+except (KeyError,StopIteration,TypeError,ValueError,AssertionError): sys.exit(1)
+'
+}
+
+_batch_wp_at_least() {
+    python3 -I -c 'import re,sys
+def version(v):
+    if not re.fullmatch(r"[0-9]{1,3}\.[0-9]{1,3}(?:\.[0-9]{1,3})?",v): raise ValueError()
+    return tuple((list(map(int,v.split(".")))+[0])[:3])
+try: sys.exit(0 if version(sys.argv[1])>=version(sys.argv[2]) else 1)
+except ValueError: sys.exit(2)' "$1" "$2"
+}
+
+_batch_wp_context() {
+    # Read root-owned metadata as DATA, never source/evaluate PHP as root.
+    python3 -I - "$1" "$SITES_META_DIR" <<'LIUER_WP_CONTEXT'
+import hashlib,os,pwd,re,stat,sys
+try:
+    domain,folder=sys.argv[1:]
+    assert re.fullmatch(r'[A-Za-z0-9.-]+',domain) and '/' not in domain
+    path=folder+'/'+domain+'.conf'
+    fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    with os.fdopen(fd,'rb') as stream:
+        info=os.fstat(stream.fileno())
+        assert stat.S_ISREG(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022 and info.st_nlink==1 and info.st_size<=1048576
+        raw=stream.read(1048577); assert len(raw)<=1048576
+    values={}
+    for line in raw.decode('utf-8').splitlines():
+        if not line or line.startswith('#'): continue
+        key,value=line.split('=',1); assert key not in values; values[key]=value
+    user=values['WEB_USER']; root=values['WEB_ROOT']; site=values['SITE_DIR']; branch=values['PHP_VERSION']
+    assert values['DOMAIN']==domain and values['TYPE']=='wordpress' and values.get('STATUS','active')=='active'
+    assert re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,63}',user) and user not in ['root','nginx','www-data','apache']
+    account=pwd.getpwnam(user); assert account.pw_uid!=0
+    assert re.fullmatch(r'(?:5\.6|7\.4|8\.[0-5])',branch)
+    assert site=='/home/web/'+user+'/'+domain and root.startswith(site+'/') and re.fullmatch(r'/[A-Za-z0-9_./-]+',root)
+    assert os.path.realpath(site)==site and os.path.realpath(root)==root
+    for directory in [site,root,root+'/wp-admin',root+'/wp-includes']:
+        assert os.path.isdir(directory) and os.path.realpath(directory)==directory
+    assert os.stat(root).st_uid==account.pw_uid
+    for name in ['wp-config.php','wp-load.php','wp-includes/version.php','wp-admin/includes/update-core.php']:
+        item=os.lstat(root+'/'+name); assert stat.S_ISREG(item.st_mode) and item.st_nlink==1 and os.path.realpath(root+'/'+name)==root+'/'+name
+    root_info=os.stat(root)
+    token=hashlib.sha256(raw+repr((info.st_dev,info.st_ino,info.st_mtime_ns,account.pw_uid,root_info.st_dev,root_info.st_ino)).encode()).hexdigest()
+    print('|'.join([user,branch,root,site,token]))
+except (AssertionError,OSError,KeyError,ValueError,UnicodeError):
+    print('Invalid WordPress metadata/user/root, or missing regular core/wp-config.php files; no core update started.',file=sys.stderr)
+    sys.exit(1)
+LIUER_WP_CONTEXT
+}
+
+_batch_wp_cli_prepare() {
+    local candidate temporary
+    candidate=$(command -v wp || true)
+    if [[ -z "$candidate" ]]; then
+        [[ ! -e /usr/local/bin/wp && ! -L /usr/local/bin/wp ]] || { log_error 'WP-CLI path exists but is not usable; review manually.'; return 1; }
+        log_info 'Cai WP-CLI tu nguon chinh thuc (HTTPS); khong chay ma website bang root.'
+        temporary=$(mktemp /usr/local/bin/.liuer-wp-cli.XXXXXXXX) || return 1
+        if ! curl -q -fsS --proto '=https' --connect-timeout 15 --max-time 180 --max-filesize 33554432 \
+            https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o "$temporary" \
+            || [[ ! -s "$temporary" ]] || ! install -o root -g root -m 755 "$temporary" /usr/local/bin/wp; then
+            rm -f "$temporary"; log_error 'Khong cai duoc WP-CLI; chua update site nao.'; return 1
+        fi
+        rm -f "$temporary"; candidate=/usr/local/bin/wp
+    fi
+    # Reject a user-writable tool/parent instead of executing it with authority
+    # from another site. Trusted distro symlinks may resolve to a regular file.
+    BATCH_WP_CLI=$(python3 -I - "$candidate" <<'LIUER_WP_CLI'
+import os,stat,sys
+try:
+    path=os.path.realpath(sys.argv[1]); item=os.stat(path)
+    assert stat.S_ISREG(item.st_mode) and item.st_uid==0 and not item.st_mode&0o022 and item.st_size>0
+    parent=os.path.dirname(path)
+    while True:
+        item=os.stat(parent); assert item.st_uid==0 and not item.st_mode&0o022
+        if parent=='/': break
+        parent=os.path.dirname(parent)
+    print(path)
+except (AssertionError,OSError): sys.exit(1)
+LIUER_WP_CLI
+    ) || { log_error 'WP-CLI khong phai file/root path an toan; can kiem tra thu cong.'; return 1; }
+}
+
+_batch_wp_command() {
+    # Variables below are scoped by _batch_wp_update_one. Clear inherited PHP,
+    # WP-CLI, loader and root environment; run ALL application code as site UID.
+    ( cd / && _run_as_site_user "$wp_user" env -i \
+        PATH=/usr/local/bin:/usr/bin:/bin HOME="$wp_home" TMPDIR="$wp_home/tmp" LC_ALL=C \
+        WP_CLI_CONFIG_PATH=/dev/null WP_CLI_CACHE_DIR="$wp_home/cache" WP_CLI_PACKAGES_DIR="$wp_home/packages" \
+        WP_CLI_DISABLE_AUTO_CHECK_UPDATE=1 WP_CLI_PHP="$wp_php" \
+        timeout -k 30s 20m "$wp_php" "$BATCH_WP_CLI" --path="$wp_root" \
+        --skip-plugins --skip-themes --skip-packages --no-color "$@" )
+}
+
+_batch_wp_update_one() {
+    (
+    umask 077
+    set -o pipefail
+    local domain="$1" target="$2" minimum="$3" backup="$4" report="$5" context current after actual_php directory tool_version
+    local wp_user wp_branch wp_root wp_site token wp_php wp_home
+    printf 'preflight\n' > "$report/$domain.stage" || return 1
+    context=$(_batch_wp_context "$domain") || {
+        printf 'LOI\tKhai bao WordPress nhung thieu core/wp-config.php hoac metadata/user/root khong hop le; khong update\n' > "$report/$domain.result"
+        return 1
+    }
+    IFS='|' read -r wp_user wp_branch wp_root wp_site token <<< "$context"
+    wp_php=$(get_php_bin "$wp_branch"); actual_php=$(_php_maint_version "$wp_php")
+    [[ "$actual_php" == "$wp_branch".* ]] && _batch_wp_at_least "$actual_php" "$minimum" \
+        || { log_error "PHP ${wp_branch} CLI thieu/khong dung nhanh/khong du yeu cau ${minimum}; khong tu doi PHP."
+             printf 'LOI\tPHP CLI thieu/sai nhanh/duoi yeu cau %s; khong tu doi PHP\n' "$minimum" > "$report/$domain.result"; return 1; }
+    if [[ -e "$wp_root/.maintenance" || -L "$wp_root/.maintenance" ]]; then
+        printf 'BO QUA\tDang co .maintenance; khong tu xoa khoa\n' > "$report/$domain.result"; return 20
+    fi
+    wp_home="$wp_site/.liuer-wp-cli"
+    _run_as_site_user "$wp_user" mkdir -p -m 700 -- "$wp_home/tmp" "$wp_home/cache" || return 1
+    tool_version=$(_batch_wp_command cli version) || return 1
+    [[ "$tool_version" =~ ^WP-CLI[[:space:]][0-9]+\.[0-9]+\.[0-9]+$ ]] \
+        || { log_error 'WP-CLI entry point/version khong hop le voi PHP da chon; chua update core.'; return 1; }
+    _batch_wp_command core is-installed || return 1
+    if _batch_wp_command core is-installed --network; then
+        printf 'BO QUA\tWordPress Multisite: can xu ly rieng\n' > "$report/$domain.result"; return 20
+    fi
+    if _batch_wp_command option get core_updater.lock >/dev/null 2>&1; then
+        printf 'BO QUA\tDang co core_updater.lock; khong tu xoa khoa\n' > "$report/$domain.result"; return 20
+    fi
+    current=$(_batch_wp_command core version) || return 1
+    _batch_wp_at_least "$target" "$current" || { log_error 'Core version khong hop le/dev/moi hon dich; khong downgrade.'; return 1; }
+    if _batch_wp_at_least "$current" "$target"; then
+        printf 'BO QUA\tDa la WordPress %s\n' "$current" > "$report/$domain.result"; return 20
+    fi
+    for directory in "$wp_root" "$wp_root/wp-admin" "$wp_root/wp-includes" "$wp_root/wp-load.php" "$wp_root/wp-includes/version.php" "$wp_root/wp-admin/includes/update-core.php"; do
+        _run_as_site_user "$wp_user" test -w "$directory" || {
+            log_error 'Core khong ghi duoc bang site user. Xem Permission profiles / Editable; khong tu chmod/chown hang loat.'
+            printf 'LOI\tCore khong ghi duoc; xem Permission profiles / Editable, khong tu chmod/chown\n' > "$report/$domain.result"; return 1
+        }
+    done
+    if [[ "$backup" == 1 ]]; then
+        printf 'backup\n' > "$report/$domain.stage" || return 1
+        printf '[INFO] %s: BACKUP code + DB (site lon co the lau)...\n' "$domain" >&3
+        _run_as_site_user "$wp_user" timeout -k 30s 60m tar -cf - -C "$wp_root" . | gzip > "$report/$domain.code.tar.gz.partial" \
+            && gzip -t "$report/$domain.code.tar.gz.partial" \
+            && mv "$report/$domain.code.tar.gz.partial" "$report/$domain.code.tar.gz" || return 1
+        _batch_wp_command db export - --single-transaction --quick --no-tablespaces --quiet | gzip > "$report/$domain.db.sql.gz.partial" || return 1
+        gzip -t "$report/$domain.db.sql.gz.partial" \
+            && python3 -I -c 'import gzip,sys; sys.exit(0 if gzip.open(sys.argv[1],"rb").read(1) else 1)' "$report/$domain.db.sql.gz.partial" \
+            && mv "$report/$domain.db.sql.gz.partial" "$report/$domain.db.sql.gz" || return 1
+    fi
+    [[ "$(_batch_wp_context "$domain")" == "$context" && ! -e "$wp_root/.maintenance" && ! -L "$wp_root/.maintenance" ]] \
+        || { log_error 'Site metadata/root/state da thay doi; chua bat dau core update.'; return 1; }
+    printf 'core-update\n' > "$report/$domain.stage" || return 1
+    printf '[INFO] %s: WordPress %s -> %s...\n' "$domain" "$current" "$target" >&3
+    _batch_wp_command core update "--version=$target" \
+        '--exec=if (!defined("CORE_UPGRADE_SKIP_NEW_BUNDLED")) { define("CORE_UPGRADE_SKIP_NEW_BUNDLED", true); } elseif (!CORE_UPGRADE_SKIP_NEW_BUNDLED) { WP_CLI::error("CORE_UPGRADE_SKIP_NEW_BUNDLED must be true for this core-only batch."); }' || return 1
+    printf 'database-update\n' > "$report/$domain.stage" || return 1
+    printf '[INFO] %s: cap nhat schema WordPress...\n' "$domain" >&3
+    _batch_wp_command core update-db || return 1
+    printf 'verification\n' > "$report/$domain.stage" || return 1
+    after=$(_batch_wp_command core version) || return 1
+    [[ "$after" == "$target" ]] && _batch_wp_command core verify-checksums "--version=$target" || return 1
+    printf 'OK\tWordPress %s -> %s; da kiem tra core/schema\n' "$current" "$after" > "$report/$domain.result" || return 1
+    printf 'done\n' > "$report/$domain.stage"
+    )
+}
+
+_batch_run_wp_core() {
+    (
+    umask 077
+    local target="$1" minimum="$2" backup="$3" mode="${4:-wp-core}" domain meta conf status report stage line rc plugin plugin_status reason prepared=0 i=0 ok=0 failed=0 skipped=0
+    [[ "$mode" == wp-core || "$mode" == wp-plugins ]] || return 1
+    [[ "$backup" == 0 || "$backup" == 1 ]] && [[ ${#BATCH_DOMAINS[@]} -gt 0 && ${#BATCH_DOMAINS[@]} -le 200 ]] || return 1
+    _batch_wp_at_least "$target" "$target" && _batch_wp_at_least "$minimum" "$minimum" || return 1
+    command -v flock >/dev/null && command -v timeout >/dev/null || { log_error 'Can flock/timeout; chua update core.'; return 1; }
+    exec 9>/run/liuer-batch.lock; flock -n 9 || { log_error 'Mot luot batch dang chay; thu lai sau.'; return 1; }
+    _batch_new_report "$mode" || return 1; report="$BATCH_REPORT"
+    : > "$report/results.tsv"
+    for domain in "${BATCH_DOMAINS[@]}"; do
+        i=$((i+1)); log_info "WORDPRESS ${i}/${#BATCH_DOMAINS[@]}: $domain"
+        meta="${SITES_META_DIR}/${domain}.conf"; conf="${NGINX_CONF_DIR}/${domain}.conf"
+        if ! _batch_site_meta_ok "$domain"; then
+            printf '%s\tLOI\tMetadata khong hop le; khong update\n' "$domain" >> "$report/results.tsv"; failed=$((failed+1)); continue
+        fi
+        if ! grep -Fqx 'TYPE=wordpress' "$meta"; then
+            log_warn "BO QUA ${domain}: khong phai WordPress; khong tu doi type."
+            printf '%s\tBO QUA\tKhong phai WordPress; khong sua code/DB\n' "$domain" >> "$report/results.tsv"; skipped=$((skipped+1)); continue
+        fi
+        status=$(sed -n 's/^STATUS=//p' "$meta")
+        if [[ "$status" == locked || -e "${conf}.disabled" || -L "${conf}.disabled" || -e "${conf}.premaint" || -L "${conf}.premaint" ]]; then
+            log_warn "BO QUA ${domain}: locked/bao tri."
+            printf '%s\tBO QUA\tSite locked/bao tri; giu nguyen\n' "$domain" >> "$report/results.tsv"; skipped=$((skipped+1)); continue
+        fi
+        if [[ "$prepared" == 0 ]]; then
+            _batch_wp_cli_prepare || return 1
+            prepared=1
+        fi
+        rc=0
+        ( if [[ "$mode" == wp-plugins ]]; then _batch_wp_plugins_one "$domain" "$backup" "$report"
+          else _batch_wp_update_one "$domain" "$target" "$minimum" "$backup" "$report"; fi ) \
+            9>&- 3>&1 < /dev/null > "$report/$domain.log" 2>&1 || rc=$?
+        if [[ "$rc" == 0 || "$rc" == 20 ]] && [[ -s "$report/$domain.result" ]]; then
+            line=$(<"$report/$domain.result")
+            printf '%s\t%s\n' "$domain" "$line" >> "$report/results.tsv"
+            if [[ "$rc" == 0 ]]; then
+                ok=$((ok+1))
+                if [[ "$mode" == wp-plugins ]]; then log_success "DA XU LY PLUGIN: ${domain}."; else log_success "DA UPDATE ${domain}: WordPress ${target}."; fi
+            else skipped=$((skipped+1)); log_warn "BO QUA ${domain}: ${line#*$'\t'}"; fi
+        else
+            stage='preflight'; [[ ! -f "$report/$domain.stage" ]] || stage=$(<"$report/$domain.stage")
+            line=''; [[ ! -f "$report/$domain.result" ]] || line=$(<"$report/$domain.result")
+            if [[ "$line" == LOI$'\t'* ]]; then printf '%s\t%s\n' "$domain" "$line" >> "$report/results.tsv"
+            else
+                case "$stage" in plugin-update) printf '%s\tLOI\tPlugin co the da thay doi; xem log/backup, khong rollback tu dong\n' "$domain" >> "$report/results.tsv" ;;
+                    core-update|database-update|verification)
+                    printf '%s\tLOI\tCo the da doi core/DB; xem log/backup, khong rollback tu dong\n' "$domain" >> "$report/results.tsv" ;;
+                    *) printf '%s\tLOI\tKiem tra/backup that bai; chua bat dau core update. Xem log\n' "$domain" >> "$report/results.tsv" ;;
+                esac
+            fi
+            failed=$((failed+1)); log_warn "LOI ${domain}: xem log; tiep tuc domain ke tiep."
+        fi
+    done
+    _batch_summary "$report" "$ok" "$failed" "$skipped"
+    if [[ "$mode" == wp-plugins ]]; then
+        for domain in "${BATCH_DOMAINS[@]}"; do
+            [[ -s "$report/$domain.plugins.tsv" ]] || continue
+            printf '\n  PLUGIN: %s\n' "$domain"
+            while IFS=$'\t' read -r plugin plugin_status reason; do printf '    %-30s %-8s %s\n' "$plugin" "$plugin_status" "$reason"; done < "$report/$domain.plugins.tsv"
+        done
+    fi
+    log_warn 'Ban cap nhat khong bao dam moi plugin/theme tuong thich. Kiem tra website; backup/partial giu trong bao cao, khong tu xoa/rollback.'
+    [[ "$failed" == 0 ]]
+    )
+}
+
+batch_update_wordpress() {
+    (
+    umask 077
+    local release target minimum choice backup
+    while true; do
+        print_section 'CAP NHAT WORDPRESS CORE - CHON NHIEU SITE'
+        _batch_select_domains wp-core || return 0
+        release=$(_batch_wp_latest) || { log_error 'Khong doc duoc WordPress stable tu API chinh thuc; chua update.'; return 1; }
+        IFS='|' read -r target minimum <<< "$release"
+        printf '\n  WordPress stable: %s | PHP toi thieu: %s | %s domain\n' "$target" "$minimum" "${#BATCH_DOMAINS[@]}"
+        printf '  %s\n' "${BATCH_DOMAINS[@]}"
+        echo '1) Backup code + DB truoc moi site (khuyen nghi, co the ton nhieu dung luong/thoi gian)'
+        echo '2) Khong backup (tu chiu rui ro, nen co snapshot/backup san)  |  0) Back'
+        read -r -p 'Chon [1]: ' choice || return 0
+        case "$choice" in 1|'') backup=1 ;; 2) backup=0 ;; 0) continue ;; *) log_warn 'Lua chon khong hop le.'; continue ;; esac
+        log_warn 'CHI WordPress core + schema DB, khong update plugin/theme hay doi PHP. Site khong phai WP/locked/bao tri/Multisite se bo qua. Core co tuy bien co the bi ghi de; plugin/theme co the khong tuong thich.'
+        log_warn 'Khong tu xoa khoa, --force, downgrade, rollback, doi DNS/SSL hay chmod/chown. Backup khi site dang ghi khong phai snapshot dong bo; hay tam dung cron/queue/ghi du lieu neu can ban sao nhat quan.'
+        if confirm_action 'Update core cho cac site WordPress da chon? (WP-CLI se duoc cai neu thieu)'; then
+            _batch_run_wp_core "$target" "$minimum" "$backup" || true
+            press_enter
+        fi
+    done
+    )
+}
+
+_batch_wp_plugin_rows() {
+    python3 -I -c 'import json,re,sys
+try:
+    rows=json.load(sys.stdin); assert isinstance(rows,list) and len(rows)<=2000
+    seen=set()
+    for i,row in enumerate(rows):
+        assert isinstance(row,dict)
+        name=row.get("name",""); file=row.get("file",""); version=row.get("version",""); status=row.get("status","")
+        if not isinstance(name,str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,99}",name): name="invalid-entry-"+str(i+1)
+        assert name not in seen; seen.add(name)
+        reason="-"; state="ready"
+        if status not in ["active","inactive"]: state="skip"; reason="MU/drop-in/network/loai khong ho tro"
+        elif not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,99}",name): state="skip"; reason="Slug khong xac minh duoc"
+        elif not isinstance(file,str) or not file.startswith(name+"/") or not re.fullmatch(r"[A-Za-z0-9_./-]+\.php",file) or any(p in [".","..",""] for p in file.split("/")): state="skip"; reason="Plugin don file/doi thu muc/custom layout: xu ly rieng"
+        elif not isinstance(version,str) or not re.fullmatch(r"[0-9]{1,5}(?:\.[0-9]{1,5}){0,7}",version): state="skip"; reason="Version khong ho tro/dev: xu ly rieng"
+        print("|".join([name,file if state=="ready" else "-",version if state=="ready" else "-",state,reason]))
+except (AssertionError,TypeError,ValueError): sys.exit(1)'
+}
+
+_batch_wp_plugin_meta() {
+    python3 -I -c 'import json,re,sys
+def ver(v):
+    assert isinstance(v,str) and re.fullmatch(r"[0-9]{1,5}(?:\.[0-9]{1,5}){0,7}",v)
+    return tuple((list(map(int,v.split(".")))+[0]*8)[:8])
+try:
+    slug,current,core,php=sys.argv[1:]; info=json.load(sys.stdin)
+    assert isinstance(info,dict) and info.get("slug")==slug
+    target=info["version"]; ver(target)
+    assert info.get("download_link")=="https://downloads.wordpress.org/plugin/"+slug+"."+target+".zip"
+    state="ready"; reason="-"
+    if ver(target)<=ver(current): state="skip"; reason="Da moi nhat/moi hon kho; khong downgrade"
+    elif ver(php)<ver(info.get("requires_php") or "0"): state="skip"; reason="PHP khong du yeu cau; khong tu nang PHP"
+    elif ver(core)<ver(info.get("requires") or "0"): state="skip"; reason="WordPress core khong du yeu cau; khong tu nang core"
+    print("|".join([state,target,reason]))
+except (AssertionError,KeyError,TypeError,ValueError): sys.exit(1)' "$1" "$2" "$3" "$4"
+}
+
+_batch_wp_plugin_fetch() {
+    local url="$1" file="$2"
+    [[ -s "$file" && ! -L "$file" ]] && return 0
+    curl -q -fsS --proto '=https' --connect-timeout 15 --max-time 60 --max-filesize 8388608 \
+        "$url" -o "$file.partial" && [[ -s "$file.partial" ]] && mv "$file.partial" "$file"
+}
+
+_batch_wp_plugin_guard() {
+    # Manifest comes from a fixed WordPress.org HTTPS endpoint, not the site.
+    # The filesystem walker/hash/header checks run as the site's UID, never root.
+    _run_as_site_user "$wp_user" python3 -I -c '
+import hashlib,json,os,re,stat,sys
+try:
+    root,slug,entry,version,mode=sys.argv[1:]
+    assert re.fullmatch(r"[a-z0-9][a-z0-9-]{0,99}",slug) and entry.startswith(slug+"/")
+    data=json.load(sys.stdin); assert data.get("plugin")==slug and data.get("version")==version
+    files=data["files"]; assert isinstance(files,dict) and 0<len(files)<=50000
+    for name,hashes in files.items():
+        assert isinstance(name,str) and "\\" not in name and not any(ord(c)<32 for c in name)
+        assert all(p not in ["",".",".."] for p in name.split("/")) and not name.startswith("/")
+        assert isinstance(hashes,dict) and re.fullmatch(r"[a-f0-9]{64}",hashes.get("sha256",""))
+    assert entry[len(slug)+1:] in files
+    if mode=="validate": sys.exit(0)
+    assert mode=="check"
+    base=root+"/wp-content/plugins/"+slug
+    assert os.path.realpath(base)==base and os.path.isdir(base)
+    seen=set()
+    for folder,dirs,names in os.walk(base,followlinks=False):
+        assert not any(n in [".git",".svn",".hg"] for n in dirs)
+        assert not any(os.path.islink(os.path.join(folder,n)) for n in dirs)
+        for name in names:
+            path=os.path.join(folder,name); relative=os.path.relpath(path,base).replace(os.sep,"/")
+            assert relative in files
+            fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+            with os.fdopen(fd,"rb") as stream:
+                item=os.fstat(stream.fileno()); assert stat.S_ISREG(item.st_mode) and item.st_nlink==1
+                digest=hashlib.sha256()
+                while True:
+                    chunk=stream.read(1048576)
+                    if not chunk: break
+                    digest.update(chunk)
+            assert digest.hexdigest()==files[relative]["sha256"]
+            seen.add(relative)
+    assert seen==set(files)
+    with open(root+"/wp-content/plugins/"+entry,"rb") as stream: header=stream.read(8192).decode("utf-8",errors="replace")
+    uri=re.search(r"^[ \t/*#@]*Update URI:[ \t]*(.*?)[ \t\r]*$",header,re.M|re.I)
+    if uri and uri[1]: assert uri[1] in ["https://wordpress.org/plugins/"+slug+"/","https://wordpress.org/plugins/"+slug]
+except (AssertionError,OSError,KeyError,TypeError,ValueError):
+    print("Plugin checksum/source/layout not verified; no forced overwrite.",file=sys.stderr); sys.exit(1)
+' "$wp_root" "$1" "$2" "$3" "$4"
+}
+
+_batch_wp_plugins_one() {
+    (
+    umask 077
+    set -o pipefail
+    local domain="$1" backup="$2" report="$3" context token actual_php tool_version core_version
+    local wp_user wp_branch wp_root wp_site wp_php wp_home slug entry current state reason meta target package guard after old_json new_json
+    local updated=0 errors=0 skipped=0 backed_up=0
+    printf 'preflight\n' > "$report/$domain.stage" || return 1
+    context=$(_batch_wp_context "$domain") || {
+        printf 'LOI\tThieu core/wp-config.php hoac metadata/user/root khong hop le; khong update plugin\n' > "$report/$domain.result"; return 1
+    }
+    IFS='|' read -r wp_user wp_branch wp_root wp_site token <<< "$context"
+    wp_php=$(get_php_bin "$wp_branch"); actual_php=$(_php_maint_version "$wp_php")
+    [[ "$actual_php" == "$wp_branch".* ]] || { log_error 'PHP CLI thieu/sai nhanh; khong tu doi PHP.'; return 1; }
+    if [[ -e "$wp_root/.maintenance" || -L "$wp_root/.maintenance" ]]; then
+        printf 'BO QUA\tDang co .maintenance; khong tu xoa\n' > "$report/$domain.result"; return 20
+    fi
+    wp_home="$wp_site/.liuer-wp-cli"
+    _run_as_site_user "$wp_user" mkdir -p -m 700 -- "$wp_home/tmp" "$wp_home/cache" || return 1
+    tool_version=$(_batch_wp_command cli version) || return 1
+    [[ "$tool_version" =~ ^WP-CLI[[:space:]][0-9]+\.[0-9]+\.[0-9]+$ ]] && _batch_wp_command core is-installed || return 1
+    if _batch_wp_command core is-installed --network; then
+        printf 'BO QUA\tWordPress Multisite: xu ly rieng\n' > "$report/$domain.result"; return 20
+    fi
+    if _batch_wp_command option get core_updater.lock >/dev/null 2>&1 || _batch_wp_command option get auto_updater.lock >/dev/null 2>&1; then
+        printf 'BO QUA\tDang co updater lock; khong tu xoa\n' > "$report/$domain.result"; return 20
+    fi
+    core_version=$(_batch_wp_command core version) || return 1
+    _batch_wp_command plugin list --skip-update-check --fields=name,file,version,status --format=json > "$report/$domain.inventory.json" || return 1
+    _batch_wp_plugin_rows < "$report/$domain.inventory.json" > "$report/$domain.plan" || return 1
+    mkdir -m 700 -p "$report/api" || return 1
+    : > "$report/$domain.plugins.tsv"
+    while IFS='|' read -r slug entry current state reason; do
+        [[ -n "$slug" ]] || continue
+        if [[ "$state" != ready ]]; then
+            printf '%s\tBO QUA\t%s\n' "$slug" "$reason" >> "$report/$domain.plugins.tsv"; skipped=$((skipped+1)); continue
+        fi
+        printf '[INFO] %s: kiem tra plugin %s...\n' "$domain" "$slug" >&3
+        if ! _batch_wp_plugin_fetch "https://api.wordpress.org/plugins/info/1.2/?action=plugin_information&request%5Bslug%5D=$slug" "$report/api/$slug.info.json" \
+            || ! meta=$(_batch_wp_plugin_meta "$slug" "$current" "$core_version" "$actual_php" < "$report/api/$slug.info.json"); then
+            reason='Khong xac minh duoc plugin/nguon WP.org (premium/custom/API loi)'
+            printf '%s\tBO QUA\t%s\n' "$slug" "$reason" >> "$report/$domain.plugins.tsv"; skipped=$((skipped+1)); continue
+        fi
+        IFS='|' read -r state target reason <<< "$meta"
+        if [[ "$state" != ready ]]; then
+            printf '%s\tBO QUA\t%s\n' "$slug" "$reason" >> "$report/$domain.plugins.tsv"; skipped=$((skipped+1)); continue
+        fi
+        old_json="$report/api/$slug.$current.checksums.json"; new_json="$report/api/$slug.$target.checksums.json"
+        if ! _batch_wp_plugin_fetch "https://downloads.wordpress.org/plugin-checksums/$slug/$current.json" "$old_json" \
+            || ! _batch_wp_plugin_guard "$slug" "$entry" "$current" check < "$old_json" \
+            || ! _batch_wp_plugin_fetch "https://downloads.wordpress.org/plugin-checksums/$slug/$target.json" "$new_json" \
+            || ! _batch_wp_plugin_guard "$slug" "$entry" "$target" validate < "$new_json"; then
+            printf '%s\tBO QUA\tKhong khop checksum/ma tuy bien/Update URI rieng/khong co manifest tin cay\n' "$slug" >> "$report/$domain.plugins.tsv"; skipped=$((skipped+1)); continue
+        fi
+        if [[ "$backup" == 1 && "$backed_up" == 0 ]]; then
+            printf 'backup\n' > "$report/$domain.stage" || return 1
+            printf '[INFO] %s: BACKUP code + DB truoc khi update plugin...\n' "$domain" >&3
+            _run_as_site_user "$wp_user" timeout -k 30s 60m tar -cf - -C "$wp_root" . | gzip > "$report/$domain.code.tar.gz.partial" \
+                && gzip -t "$report/$domain.code.tar.gz.partial" && mv "$report/$domain.code.tar.gz.partial" "$report/$domain.code.tar.gz" || return 1
+            _batch_wp_command db export - --single-transaction --quick --no-tablespaces --quiet | gzip > "$report/$domain.db.sql.gz.partial" || return 1
+            gzip -t "$report/$domain.db.sql.gz.partial" \
+                && python3 -I -c 'import gzip,sys; sys.exit(0 if gzip.open(sys.argv[1],"rb").read(1) else 1)' "$report/$domain.db.sql.gz.partial" \
+                && mv "$report/$domain.db.sql.gz.partial" "$report/$domain.db.sql.gz" || return 1
+            backed_up=1
+        fi
+        [[ "$(_batch_wp_context "$domain")" == "$context" && ! -e "$wp_root/.maintenance" && ! -L "$wp_root/.maintenance" ]] \
+            || { log_error 'Site metadata/root/state thay doi; dung site nay.'; return 1; }
+        if ! _batch_wp_plugin_guard "$slug" "$entry" "$current" check < "$old_json"; then
+            printf '%s\tBO QUA\tPlugin da thay doi sau kiem tra; khong ghi de\n' "$slug" >> "$report/$domain.plugins.tsv"; skipped=$((skipped+1)); continue
+        fi
+        package="https://downloads.wordpress.org/plugin/$slug.$target.zip"
+        guard="--exec=add_filter('upgrader_pre_download', function(\$reply, \$package) { if (\$package !== '${package}') { return new WP_Error('liuer_source_refused', 'Only the reviewed WordPress.org package is allowed.'); } return false; }, PHP_INT_MAX, 2);"
+        printf 'plugin-update\n' > "$report/$domain.stage" || return 1
+        printf '[INFO] %s: %s %s -> %s...\n' "$domain" "$slug" "$current" "$target" >&3
+        if _batch_wp_command plugin update "$slug" "--version=$target" "$guard" \
+            && after=$(_batch_wp_command plugin get "$slug" --field=version) && [[ "$after" == "$target" ]] \
+            && _batch_wp_plugin_guard "$slug" "$entry" "$target" check < "$new_json"; then
+            printf '%s\tOK\t%s -> %s; da doi chieu checksum\n' "$slug" "$current" "$target" >> "$report/$domain.plugins.tsv"; updated=$((updated+1))
+        else
+            printf '%s\tLOI\tUpdate/kiem tra that bai; plugin/DB co the da thay doi, xem log/backup\n' "$slug" >> "$report/$domain.plugins.tsv"; errors=$((errors+1))
+        fi
+    done < "$report/$domain.plan"
+    if [[ "$errors" != 0 ]]; then state=LOI
+    elif [[ "$updated" != 0 ]]; then state=OK
+    else state='BO QUA'; fi
+    printf '%s\tPlugin: %s cap nhat | %s loi | %s bo qua\n' "$state" "$updated" "$errors" "$skipped" > "$report/$domain.result" || return 1
+    [[ "$errors" == 0 ]] || return 1
+    [[ "$updated" != 0 ]] || return 20
+    )
+}
+
+batch_update_wp_plugins() {
+    (
+    umask 077
+    local choice backup
+    while true; do
+        print_section 'PLUGIN WORDPRESS.ORG - CHON NHIEU SITE'
+        _batch_select_domains wp-plugins || return 0
+        printf '\n  %s domain; chi plugin doi chieu duoc voi WordPress.org.\n' "${#BATCH_DOMAINS[@]}"
+        printf '  %s\n' "${BATCH_DOMAINS[@]}"
+        echo '1) Backup code + DB truoc moi site (khuyen nghi)'
+        echo '2) Khong backup (nen co snapshot/backup san)  |  0) Back'
+        read -r -p 'Chon [1]: ' choice || return 0
+        case "$choice" in 1|'') backup=1 ;; 2) backup=0 ;; 0) continue ;; *) log_warn 'Lua chon khong hop le.'; continue ;; esac
+        log_warn 'Plugin tra phi/tu viet/bi sua code/khong xac minh nguon, MU/drop-in, site khong phai WP/locked/bao tri/Multisite se bo qua. Khong tu doi type, PHP, core hay theme.'
+        log_warn 'Plugin moi co the loi tuong thich/thay doi DB. Co backup khong dam bao snapshot dong bo khi dang ghi. Khong tu chmod/chown, --force, xoa khoa hay rollback; kiem tra website sau update.'
+        if confirm_action 'Update plugin WP.org du dieu kien tren cac site da chon? (cai WP-CLI neu thieu)'; then
+            _batch_run_wp_core 0.0 0.0 "$backup" wp-plugins || true
+            press_enter
+        fi
+    done
+    )
 }
 
 batch_install_ssl() {
@@ -12456,7 +12943,7 @@ _api_web_site_action() {
         settings)
             case "$value:$extra" in gzip:0|gzip:1|static_cache:0|static_cache:1|routing:enable|routing:disable|maintenance:enable|maintenance:disable) ;; *) log_error "Invalid site setting."; return 1 ;; esac
             [[ -s "$conf" ]] || { log_error "Repair the empty vhost first."; return 1; }
-            local backup had_maintenance=0
+            local backup had_maintenance=0 LIUER_DEFER_NGINX_RELOAD=1
             backup=$(mktemp -d "${CONFIG_DIR}/site-settings.XXXXXX") || return 1
             chmod 700 "$backup"
             cp -a "$conf" "${backup}/nginx.conf" || return 1
@@ -12466,7 +12953,10 @@ _api_web_site_action() {
                 static_cache) _api_set_static_cache "$domain" "$extra" ;;
                 routing) _api_set_routing "$domain" "$extra" ;;
                 maintenance) _api_set_maintenance "$domain" "$extra" ;;
-            esac) || ! nginx -t || ! nginx -s reload; then
+            esac) || ! { case "$value" in
+                gzip|static_cache) _site_performance_matches "$value" "$extra" "$conf" ;;
+                *) true ;;
+            esac; } || ! nginx -t || ! nginx -s reload; then
                 cp -a "${backup}/nginx.conf" "$conf"
                 if [[ "$had_maintenance" == 1 ]]; then cp -a "${backup}/premaint" "${conf}.premaint"; else rm -f "${conf}.premaint"; fi
                 nginx -t >/dev/null 2>&1 && nginx -s reload >/dev/null 2>&1 || true
@@ -12954,6 +13444,18 @@ _api_set_hardening() {
     systemctl reload "$svc" 2>/dev/null || systemctl restart "$svc" 2>/dev/null || true
 }
 
+_site_performance_matches() {
+    local setting="$1" enabled="$2" conf="$3"
+    [[ -s "$conf" && ! -L "$conf" ]] || return 1
+    case "$setting:$enabled" in
+        gzip:1) grep -Eq '^[[:space:]]*gzip[[:space:]]+on[[:space:]]*;' "$conf" ;;
+        gzip:0) ! grep -Eq '^[[:space:]]*gzip[[:space:]]+on[[:space:]]*;' "$conf" ;;
+        static_cache:1) grep -Fq '# liuer-static-cache-start' "$conf" && grep -Fq '# liuer-static-cache-end' "$conf" ;;
+        static_cache:0) ! grep -Eq '# liuer-static-cache-(start|end)' "$conf" ;;
+        *) return 1 ;;
+    esac
+}
+
 _api_set_gzip() {
     local domain="$1" enabled="${2:-1}"
     local _conf="${NGINX_CONF_DIR}/${domain}.conf"
@@ -12973,9 +13475,9 @@ _api_set_gzip() {
             }
         } { print }' "$_conf" > "$_tmpf" && mv "$_tmpf" "$_conf"
     else
-        sed -i '/^\s*gzip/d' "$_conf"
+        sed -i '/^[[:space:]]*gzip/d' "$_conf"
     fi
-    nginx -t &>/dev/null && nginx -s reload
+    [[ "${LIUER_DEFER_NGINX_RELOAD:-0}" == 1 ]] || { nginx -t &>/dev/null && nginx -s reload; }
 }
 
 _api_set_static_cache() {
@@ -13002,7 +13504,7 @@ _api_set_static_cache() {
         awk '/# liuer-static-cache-start/{skip=1} skip && /# liuer-static-cache-end/{skip=0; next} !skip' \
             "$_conf" > "$_tmpf" && mv "$_tmpf" "$_conf"
     fi
-    nginx -t &>/dev/null && nginx -s reload
+    [[ "${LIUER_DEFER_NGINX_RELOAD:-0}" == 1 ]] || { nginx -t &>/dev/null && nginx -s reload; }
 }
 
 _api_set_basic_auth() {
@@ -13810,12 +14312,14 @@ main() {
 
         batch)
             check_root; detect_os
-            [[ $# == 2 ]] || { log_error 'Usage: liuer batch [create|ssl|db-config] (interactive)'; return 1; }
+            [[ $# == 2 ]] || { log_error 'Usage: liuer batch [create|ssl|db-config|wp-core|wp-plugins] (interactive)'; return 1; }
             case "$2" in
                 create) batch_create_sites ;;
                 ssl) batch_install_ssl ;;
                 db-config) _import_config_menu ;;
-                *) log_error 'Usage: liuer batch [create|ssl|db-config] (interactive)'; return 1 ;;
+                wp-core) batch_update_wordpress ;;
+                wp-plugins) batch_update_wp_plugins ;;
+                *) log_error 'Usage: liuer batch [create|ssl|db-config|wp-core|wp-plugins] (interactive)'; return 1 ;;
             esac
             ;;
 
@@ -13901,7 +14405,7 @@ main() {
             echo "  php-maintenance  Audit/update runtimes; migrate only confirmed 8.0/8.1 sites"
             echo "  php-maintenance legacy74  Review/update ONLY installed PHP 7.4 vendor packages"
             echo "  php-versions     Show installed FPM/CLI patch versions (--tsv for inventory)"
-            echo "  batch create|ssl|db-config  Bulk sites, SSL or managed DB connections"
+            echo "  batch create|ssl|db-config|wp-core|wp-plugins  Bulk sites, SSL, DB or WP updates"
             echo "  imports          Optional code migration, EMPTY-DB SQL import, config and confirmed SQL cleanup"
             echo "  help           Show this help"
             echo ""
