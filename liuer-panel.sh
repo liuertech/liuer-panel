@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.31"
+readonly VERSION="2.7.33"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -1677,7 +1677,9 @@ _save_web_user() {
     useradd --system --user-group --no-create-home --shell "$_shell" "$_username" \
         || { log_error "Failed to create system user '$_username'."; return 1; }
     echo "${_username}:${_password}" | chpasswd 2>/dev/null || log_warn "chpasswd failed for '${_username}' — password may not be set."
-    mkdir -p "$CONFIG_DIR" && chmod 700 "$CONFIG_DIR"
+    # Preserve the installed panel's directory traversal permissions (710).
+    [[ ! -L "$CONFIG_DIR" ]] || { log_error 'Unsafe config directory.'; return 1; }
+    [[ -d "$CONFIG_DIR" ]] || install -d -m 700 "$CONFIG_DIR" || return 1
     touch "$WEB_USERS_FILE" && chmod 600 "$WEB_USERS_FILE"
     sed -i "/^${_username}|/d" "$WEB_USERS_FILE" 2>/dev/null || true
     local _enc; _enc=$(encrypt_pass "$_password")
@@ -6440,6 +6442,7 @@ update_tool() {
 
     if [[ "$remote_ver" == "$VERSION" ]]; then
         log_success "Already up to date (v${VERSION})."
+        php_maintenance_legacy74 || log_warn 'PHP 7.4 maintenance not completed; the Liuer version is unchanged.'
         press_enter; return 0
     fi
 
@@ -6625,7 +6628,296 @@ update_system_packages() {
     press_enter
 }
 
-# Runtime maintenance is opt-in. Updating the panel never invokes these functions.
+# Runtime maintenance is opt-in. Tool updates offer ONLY installed PHP 7.4;
+# 8.x/system-CLI maintenance still requires its separate explicit workflow.
+_php74_backport_build() {
+    local family="$1" build="$2" revision
+    case "$family" in
+        rhel)
+            [[ "$build" =~ ^(0:)?7\.4\.33-([0-9]+)\.el(8|9|10)\.remi$ ]] || return 1
+            revision="${BASH_REMATCH[2]}"; [[ ${#revision} -le 5 ]] && ((10#$revision >= 31)) ;;
+        debian)
+            # Recognized vendor packaging floors, not PHP's displayed 7.4.33.
+            # Candidate repository origin is checked separately in the plan.
+            if [[ "$build" =~ ^1:7\.4\.33-([0-9]+)\+(0~[0-9]{8}\.[0-9]+\+debian(12|13)~[0-9]+\.gbp[0-9a-f]+|ubuntu(20\.04|22\.04|24\.04)\.[0-9]+\+deb\.sury\.org\+[0-9]+)$ ]]; then
+                revision="${BASH_REMATCH[1]}"; [[ ${#revision} -le 5 ]] && ((10#$revision >= 31))
+            elif [[ "$build" =~ ^7\.4\.3-4ubuntu2\.29\+esm([0-9]+)$ ]]; then
+                revision="${BASH_REMATCH[1]}"; [[ ${#revision} -le 5 ]] && ((10#$revision >= 5))
+            else return 1; fi ;;
+        *) return 1 ;;
+    esac
+}
+
+_php74_installed_builds() {
+    case "$OS_FAMILY" in
+        rhel) rpm -q --qf '%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n' php74-php-common php74-php-cli php74-php-fpm ;;
+        debian) dpkg-query -W -f='${binary:Package}\t${Version}\n' php7.4-common php7.4-cli php7.4-fpm ;;
+        *) return 1 ;;
+    esac
+}
+
+_php74_installed_verified() {
+    local records name build count=0
+    records=$(_php74_installed_builds) || return 1
+    while IFS=$'\t' read -r name build; do
+        [[ -n "$name" && -n "$build" ]] && _php74_backport_build "$OS_FAMILY" "$build" || return 1
+        count=$((count+1))
+    done <<< "$records"
+    [[ "$count" == 3 ]]
+}
+
+_php74_runtime_matches() {
+    local build version
+    build=$(_php74_installed_builds | head -n 1 | cut -f2) || return 1
+    version="${build#*:}"; version="${version%%-*}"
+    [[ "$version" == 7.4.* ]] && [[ "$(_php_maint_version "$(get_php_bin 7.4)")" == "$version" ]] \
+        && [[ "$(_php_maint_version "$(_php_maint_fpm 7.4)")" == "$version" ]]
+}
+
+_php74_plan_safe() {
+    local report="$1"
+    python3 -I - "$OS_FAMILY" "$report" <<'LIUER_PHP74_PLAN'
+import os,re,sys
+family,folder=sys.argv[1:]
+allowed=set(open(folder+'/names.txt').read().splitlines())
+text=open(folder+'/plan.log').read()
+changes=[]
+try:
+    assert allowed
+    if family=='debian':
+        assert not re.search(r'^Remv |will be DOWNGRADED|unauthenticated|WARNING:.*cannot be authenticated',text,re.M|re.I)
+        for line in text.splitlines():
+            if not line.startswith('Inst '): continue
+            match=re.match(r'^Inst ([A-Za-z0-9.+:-]+)(?: \[[^\]]+\])? \(([^ ]+) ',line); assert match
+            name,version=match.groups(); assert name in allowed and name.split(':')[0].startswith('php7.4-')
+            changes.append((name,version))
+        assert re.search(r'^\d+ upgraded, \d+ newly installed, 0 to remove',text,re.M)
+    elif family=='rhel':
+        assert not re.search(r'^(?:Removing|Downgrading|Reinstalling|Installing|Replacing|Obsoleting)[^\n]*:',text,re.M)
+        block=re.search(r'^Upgrading:\n(.*?)^Transaction Summary',text,re.M|re.S); assert block
+        pending=''
+        for line in block[1].splitlines():
+            fields=line.split()
+            if not fields or set(line.strip())<=set('=-'): continue
+            if len(fields)==1:
+                assert not pending and fields[0] in allowed; pending=fields[0]; continue
+            if pending: fields.insert(0,pending); pending=''
+            assert len(fields)>=4 and fields[0] in allowed and fields[0].startswith('php74-php-')
+            assert fields[1] in ['x86_64','aarch64','noarch','i686','ppc64le','s390x']
+            assert re.fullmatch(r'[A-Za-z0-9:+.~-]+',fields[2]) and fields[3].startswith('remi')
+            changes.append((fields[0],fields[2]))
+        assert not pending
+        count=re.search(r'^Upgrade\s+(\d+) Package',text,re.M); assert count and int(count[1])==len(changes)
+    else: raise AssertionError()
+    assert changes and len(changes)==len(set(n for n,v in changes))
+    with open(folder+'/planned.tsv','x') as out:
+        for name,version in changes: out.write(name+'\t'+version+'\n')
+except (AssertionError,OSError,ValueError):
+    print('PHP 7.4 package plan changes other packages / has an unsupported layout; refused. Review '+folder+'/plan.log',file=sys.stderr)
+    sys.exit(1)
+LIUER_PHP74_PLAN
+}
+
+_php74_candidate_verified() {
+    local report="$1" name build core_build core package='php74-php-common'
+    [[ "$OS_FAMILY" != debian ]] || package='php7.4-common'
+    build=$(awk -F '\t' -v wanted="$package" '$1==wanted || $1 ~ ("^" wanted ":[a-z0-9]+$") {print $2}' "${report}/planned.tsv")
+    if [[ -z "$build" ]]; then
+        # A core package already fixed need not be present in the upgrade set.
+        build=$(_php74_installed_builds | awk -F '\t' -v wanted="$package" '$1==wanted || $1 ~ ("^" wanted ":[a-z0-9]+$") {print $2}')
+    fi
+    _php74_backport_build "$OS_FAMILY" "$build" || { log_error 'No recognized PHP 7.4 vendor backport candidate. No packages changed; manual vendor verification required.'; return 1; }
+    for core in common cli fpm; do
+        name="${package%common}${core}"
+        core_build=$(awk -F '\t' -v wanted="$name" '$1==wanted || $1 ~ ("^" wanted ":[a-z0-9]+$") {print $2}' "${report}/planned.tsv")
+        [[ -n "$core_build" ]] || core_build=$(_php74_installed_builds | awk -F '\t' -v wanted="$name" '$1==wanted || $1 ~ ("^" wanted ":[a-z0-9]+$") {print $2}')
+        [[ "$core_build" == "$build" ]] && _php74_backport_build "$OS_FAMILY" "$core_build" || { log_error 'PHP 7.4 common/CLI/FPM would have missing, mixed or unverified vendor builds; unchanged.'; return 1; }
+    done
+    if [[ "$OS_FAMILY" == debian ]]; then
+        LC_ALL=C apt-cache policy "$package" > "${report}/candidate-policy.txt" || return 1
+        # Require the recognized publisher on the exact version's policy block.
+        python3 -I - "$report" "$build" <<'LIUER_PHP74_ORIGIN'
+import re,sys
+text=open(sys.argv[1]+'/candidate-policy.txt').read().splitlines(); version=sys.argv[2]; active=False; origins=[]
+for line in text:
+    row=re.match(r'^\s*(?:\*\*\*\s+)?(\S+)\s+\d+\s*$',line)
+    if row: active=row[1]==version; continue
+    if active: origins.append(line)
+pattern=r'https?://(?:packages\.sury\.org/php|ppa\.launchpad(?:content)?\.net/ondrej/php/ubuntu|esm\.ubuntu\.com/(?:apps|infra)/ubuntu)(?:/|\s)'
+if not any(re.search(pattern,line) for line in origins):
+    print('PHP 7.4 candidate publisher not recognized; no package changes.',file=sys.stderr); sys.exit(1)
+LIUER_PHP74_ORIGIN
+    fi
+}
+
+_php74_apply_packages() {
+    local report="$1" package build interpreter
+    local -a specs=()
+    if [[ "$OS_FAMILY" == debian ]]; then
+        # The last-moment APT hook inspects the ACTUAL downloaded .deb set.
+        # A changed dependency plan must fail before dpkg installs any package.
+        python3 -I - "$report" <<'LIUER_PHP74_APT_GUARD'
+import os,sys
+folder=sys.argv[1]
+script='''import os,subprocess,sys
+folder=os.path.dirname(os.path.realpath(__file__))
+with open(folder+'/planned.tsv') as stream: allowed=dict(line.rstrip('\\n').split('\\t') for line in stream)
+seen=False
+for path in sys.stdin.read().splitlines():
+    if not path: continue
+    values=subprocess.check_output(['dpkg-deb','-f',path,'Package','Version','Architecture'],text=True).splitlines()
+    fields=dict(line.split(': ',1) for line in values)
+    name=fields['Package']; version=fields['Version']; arch=fields['Architecture']
+    key=name if name in allowed else name+':'+arch
+    if not name.startswith('php7.4-') or allowed.get(key)!=version:
+        sys.exit('PHP 7.4 guard refused an unreviewed package; nothing should be installed. Review report.')
+    seen=True
+if seen:
+    with open(folder+'/transaction-started','a') as out: out.write('apt-guard-passed\\n')
+'''
+with open(folder+'/apt-guard.py','x') as stream: stream.write(script)
+os.chmod(folder+'/apt-guard.py',0o600)
+LIUER_PHP74_APT_GUARD
+        [[ $? == 0 ]] || return 1
+        while IFS=$'\t' read -r package build; do specs+=("${package}=${build}"); done < "${report}/planned.tsv"
+        NEEDRESTART_MODE=l DEBIAN_FRONTEND=noninteractive apt-get --no-remove --no-install-recommends \
+            -o Dpkg::Options::=--force-confold -o "DPkg::Pre-Install-Pkgs::=python3 -I ${report}/apt-guard.py" \
+            install --only-upgrade -y "${specs[@]}"
+    else
+        interpreter=/usr/bin/python3
+        [[ ! -x /usr/libexec/platform-python ]] || interpreter=/usr/libexec/platform-python
+        "$interpreter" -I - "$report" <<'LIUER_PHP74_DNF_APPLY'
+import sys
+import dnf,dnf.rpm,rpm
+folder=sys.argv[1]
+with open(folder+'/planned.tsv') as stream: expected=dict(line.rstrip('\n').split('\t') for line in stream)
+normalized=lambda v:v[2:] if v.startswith('0:') else v
+try:
+    with dnf.Base() as base:
+        base.conf.read()
+        base.conf.substitutions['releasever']=dnf.rpm.detect_releasever(base.conf.installroot)
+        base.conf.gpgcheck=True; base.conf.install_weak_deps=False; base.conf.obsoletes=False
+        base.read_all_repos()
+        for repo in base.repos.iter_enabled(): repo.gpgcheck=True
+        base.fill_sack()
+        for name,version in expected.items():
+            assert name.startswith('php74-php-')
+            candidates=[p for p in base.sack.query().available().filter(name=name)
+                        if normalized(p.evr)==normalized(version)]
+            assert len(candidates)==1 and candidates[0].reponame.startswith('remi')
+            base.package_upgrade(candidates[0])
+        base.resolve(allow_erasing=False)
+        new=list(base.transaction.install_set); old=list(base.transaction.remove_set)
+        actual={p.name:p.evr for p in new}
+        assert len(new)==len(expected) and {n:normalized(v) for n,v in actual.items()}=={n:normalized(v) for n,v in expected.items()}
+        assert len(old)==len(new)
+        for previous in old:
+            replacement=[p for p in new if p.name==previous.name and p.arch==previous.arch]
+            assert len(replacement)==1
+            current=replacement[0]
+            assert rpm.labelCompare((str(current.epoch),current.version,current.release),(str(previous.epoch),previous.version,previous.release))>0
+        base.download_packages(new)
+        for package in new:
+            result,error=base.package_signature_check(package)
+            assert result==0, error  # Never auto-import an unknown signing key.
+        with open(folder+'/transaction-started','x') as out: out.write('dnf-guard-passed\n')
+        base.do_transaction()
+except Exception as error:
+    print('PHP 7.4 transaction refused/failed; inspect protected report: '+str(error),file=sys.stderr)
+    sys.exit(1)
+LIUER_PHP74_DNF_APPLY
+    fi
+}
+
+php_maintenance_legacy74() {
+    (
+    umask 077
+    [[ $# == 0 ]] || { log_error 'Usage: liuer php-maintenance legacy74 (interactive confirmation required)'; return 1; }
+    local packages package report svc active=0 boot_state default_cli after_cli failed=0 rc=0
+    packages=$(_php_maint_packages 7.4) || return 1
+    [[ -n "$packages" ]] || return 0
+    [[ -t 0 && -t 1 ]] || { log_warn 'PHP 7.4 unchanged: run liuer php-maintenance legacy74 in a terminal to review/confirm.'; return 0; }
+    log_info 'PHP 7.4 only: check/install vendor backports from existing repositories. PHP 8.x / 5.6 / site PHP selections are NOT updated.'
+    _php74_installed_builds || { log_error 'PHP 7.4 CLI/FPM/common packages missing; custom runtime left unchanged.'; return 1; }
+    if _php74_installed_verified && _php74_runtime_matches; then
+        log_info 'PHP 7.4 core packages meet the recorded vendor backport floor; checking newer vendor builds still requires confirmation.'
+    fi
+    log_warn 'If confirmed, ONLY PHP 7.4 packages may be upgraded; active PHP 7.4-FPM will restart briefly. Queue/Supervisor workers are not restarted.'
+    confirm_action 'Check/apply PHP 7.4 vendor package maintenance now?' || { log_info 'PHP 7.4 unchanged.'; return 0; }
+    command -v flock >/dev/null && command -v python3 >/dev/null || { log_error 'flock/python3 required; no package changes.'; return 1; }
+    exec 9>/run/liuer-php-maintenance.lock; flock -n 9 || { log_error 'Runtime maintenance already running.'; return 1; }
+    svc=$(get_php_service 7.4)
+    boot_state=$(systemctl is-enabled "$svc" 2>/dev/null || true)
+    case "$boot_state" in enabled|disabled|static|indirect) ;; *) log_error 'Unsupported/masked PHP 7.4 service state; unchanged.'; return 1 ;; esac
+    systemctl is-active --quiet "$svc" && active=1
+    _php_maint_test_fpm 7.4 || { log_error 'Invalid existing PHP 7.4 FPM config; no package changes.'; return 1; }
+    _php74_runtime_matches || { log_error 'PHP 7.4 package / binary versions disagree; custom runtime left unchanged.'; return 1; }
+    install -d -m 700 /var/backups/liuer-panel/runtime || return 1
+    report=$(mktemp -d /var/backups/liuer-panel/runtime/php74.XXXXXXXX) || return 1
+    log_info "PHP 7.4 protected config backup/report: $report"
+    _php74_installed_builds > "${report}/before.tsv" || return 1
+    printf '%s\n' "$packages" > "${report}/names.txt"
+    _php_maint_modules 7.4 > "${report}/modules-before.txt" || return 1
+    [[ -s "${report}/modules-before.txt" ]] || return 1
+    default_cli=$(readlink -f /usr/bin/php 2>/dev/null || true)
+    local -a requested=()
+    while IFS= read -r package; do
+        case "$OS_FAMILY:$package" in rhel:php74-php-*|debian:php7.4-*) requested+=("$package") ;; *) log_error 'Unexpected package name; unchanged.'; return 1 ;; esac
+    done <<< "$packages"
+    case "$OS_FAMILY" in
+        debian)
+            tar -cpf "${report}/config.tar" /etc/php/7.4 2>"${report}/backup.log" || return 1
+            dpkg --audit > "${report}/dpkg-audit.txt" 2>&1 || return 1
+            [[ ! -s "${report}/dpkg-audit.txt" ]] || { log_error 'Pending/broken dpkg state; fix manually before PHP 7.4 maintenance.'; return 1; }
+            apt-get update > "${report}/repository.log" 2>&1 || { log_error "Repo refresh failed: $report"; return 1; }
+            LC_ALL=C apt-get --simulate --no-remove install --only-upgrade "${requested[@]}" > "${report}/plan.log" 2>&1 || return 1 ;;
+        rhel)
+            tar -cpf "${report}/config.tar" /etc/opt/remi/php74 2>"${report}/backup.log" || return 1
+            LC_ALL=C dnf --refresh --color=never --assumeno --setopt=install_weak_deps=False --setopt=obsoletes=False \
+                --exclude='php8*' --exclude='php5*' --exclude='php7[0-356789]*' --exclude='php-*' --exclude=php \
+                upgrade "${requested[@]}" > "${report}/plan.log" 2>&1 || rc=$?
+            [[ "$rc" == 0 || "$rc" == 1 ]] || return 1 ;;
+        *) log_error 'Unsupported package manager; no changes.'; return 1 ;;
+    esac
+    if { [[ "$OS_FAMILY" == rhel && "$rc" == 0 ]] && grep -Fxq 'Nothing to do.' "${report}/plan.log"; } \
+        || { [[ "$OS_FAMILY" == debian ]] && grep -Eq '^0 upgraded, 0 newly installed, 0 to remove' "${report}/plan.log"; }; then
+        if _php74_installed_verified && _php74_runtime_matches; then
+            log_success "PHP 7.4 already has the repository's current recognized backport build. No packages/services changed. Report: $report"
+            return 0
+        fi
+        log_error "Repo has no recognized PHP 7.4 backport update; runtime remains unverified. Report: $report"
+        return 1
+    fi
+    _php74_plan_safe "$report" && _php74_candidate_verified "$report" || { log_error "PHP 7.4 unchanged; review $report"; return 1; }
+    _php74_apply_packages "$report" > "${report}/change.log" 2>&1 || failed=1
+    if [[ "$failed" != 0 && ! -f "${report}/transaction-started" ]]; then
+        log_error "PHP 7.4 package transaction refused before installation; no service restart. Review $report/change.log"
+        return 1
+    fi
+    if _php_maint_test_fpm 7.4 > "${report}/fpm-after.log" 2>&1; then
+        if [[ "$active" == 1 ]]; then systemctl restart "$svc" && systemctl is-active --quiet "$svc" || failed=1
+        else systemctl stop "$svc" || failed=1; fi
+    else failed=1; log_error 'Invalid FPM config after PHP 7.4 update; no automatic downgrade. Review protected config backup.'; fi
+    case "$boot_state" in
+        enabled) systemctl enable "$svc" >/dev/null 2>&1 || failed=1 ;;
+        disabled) systemctl disable "$svc" >/dev/null 2>&1 || failed=1 ;;
+    esac
+    after_cli=$(readlink -f /usr/bin/php 2>/dev/null || true)
+    if [[ "$default_cli" != "$after_cli" ]]; then
+        if [[ "$OS_FAMILY" == debian && -n "$default_cli" && -x "$default_cli" ]]; then
+            update-alternatives --set php "$default_cli" >> "${report}/change.log" 2>&1 || failed=1
+        else failed=1; log_error 'Default CLI path changed unexpectedly; manual review required.'; fi
+    fi
+    _php_maint_modules 7.4 > "${report}/modules-after.txt" || failed=1
+    comm -23 "${report}/modules-before.txt" "${report}/modules-after.txt" > "${report}/modules-missing.txt"
+    [[ ! -s "${report}/modules-missing.txt" ]] || failed=1
+    _php74_installed_builds > "${report}/after.tsv" || failed=1
+    [[ "$failed" == 0 ]] && _php74_installed_verified && _php74_runtime_matches || { log_error "PHP 7.4 update failed/unverified. No automatic package downgrade or retry. Report: $report"; return 1; }
+    log_success "PHP 7.4 vendor backport packages verified; active FPM restarted. Report: $report"
+    log_warn 'PHP 7.4 is EOL; backports are not full support. CLI/Supervisor/cron workers already running must be reviewed/restarted separately.'
+    )
+}
+
 _php_maint_minimum() {
     case "$1" in 8.2) echo 8.2.35 ;; 8.3) echo 8.3.36 ;; 8.4) echo 8.4.27 ;; 8.5) echo 8.5.12 ;; *) return 1 ;; esac
 }
@@ -6945,7 +7237,8 @@ php_maintenance_audit() {
         cli=$(_php_maint_version "$(get_php_bin "$branch")"); fpm=$(_php_maint_version "$(_php_maint_fpm "$branch")")
         minimum=$(_php_maint_minimum "$branch" || echo none)
         case "$branch" in
-            5.6|7.4) state=legacy-unchanged ;;
+            5.6) state=legacy-unchanged ;;
+            7.4) state=legacy-unchanged; _php74_installed_verified && state=vendor-backport-build ;;
             8.0|8.1) state=migration-required ;;
             *) state=unverified; _php_maint_verified "$branch" && state=patched-version ;;
         esac
@@ -7244,6 +7537,7 @@ update_service() {
     echo "  3) MySQL / MariaDB"
     echo "  4) Redis"
     echo "  5) Memcached"
+    echo "  6) PHP 7.4 only (vendor packages)"
     echo "  0) Back"
     echo -e "${YELLOW}Select:${NC} \c"
     read -r _ch
@@ -7268,6 +7562,7 @@ update_service() {
                debian) apt-get install --only-upgrade -y memcached ;;
            esac
            log_success "Memcached updated." ;;
+        6) php_maintenance_legacy74 ;;
         0) return ;;
         *) log_warn "Invalid selection." ;;
     esac
@@ -9630,6 +9925,7 @@ menu_website() {
         echo "   8  Operations & logs"
         echo "   9  WordPress & Laravel"
         echo "  10  Change site type"
+        echo "  11  Create sites in bulk"
         _sub_footer; read -r _ch
         case "$_ch" in
             1)  create_website ;;
@@ -9642,6 +9938,7 @@ menu_website() {
             8)  menu_website_operations ;;
             9)  menu_website_framework ;;
             10) change_site_type ;;
+            11) batch_create_sites ;;
             0)  return ;;
             *)  log_warn "Invalid selection." ;;
         esac
@@ -9655,12 +9952,14 @@ menu_website_domain() {
         echo "   2  Redirects (www handling)"
         echo "   3  Domain aliases"
         echo "   4  HTTP/2 & HTTP/3"
+        echo "   5  SSL in bulk"
         _sub_footer; read -r _ch
         case "$_ch" in
             1) manage_site_ssl ;;
             2) manage_redirects ;;
             3) manage_domain_aliases ;;
             4) toggle_http_protocol ;;
+            5) batch_install_ssl ;;
             0) return ;;
             *) log_warn "Invalid selection." ;;
         esac
@@ -9943,6 +10242,251 @@ menu_system() {
 # MAIN MENU
 # =============================================================================
 # BEGIN EMBEDDED IMPORT TOOLS (canonical private sources: bin/import-tools.py, bin/import-menu.sh)
+# Canonical CLI-only batch helpers, embedded in liuer-panel.sh.
+_batch_collect_domains() {
+    BATCH_DOMAINS=()
+    local line token seen=' ' finished=0
+    local -a tokens=()
+    echo 'Dan domain (moi dong mot/nhieu domain, cach bang dau cach hoac dau phay).'
+    echo 'Nhap . de ket thuc; 0 de huy. Toi da 200 domain; khong nhap URL/duong dan.'
+    while IFS= read -r line; do
+        [[ "$line" != 0 ]] || return 1
+        if [[ "$line" == . ]]; then finished=1; break; fi
+        [[ ${#line} -le 65536 ]] || { log_error 'Dong nhap qua dai; chua tao site nao.'; return 1; }
+        line="${line//,/ }"; tokens=()
+        read -r -a tokens <<< "$line"
+        for token in ${tokens[@]+"${tokens[@]}"}; do
+            token=$(printf '%s' "$token" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+            if ! validate_domain "$token"; then
+                printf 'Domain khong hop le: %q. Chua tao site nao.\n' "$token" >&2
+                return 1
+            fi
+            [[ "$seen" != *" $token "* ]] || continue
+            seen+="$token "; BATCH_DOMAINS+=("$token")
+            [[ ${#BATCH_DOMAINS[@]} -le 200 ]] || { log_error 'Toi da 200 domain/luot; chua tao site nao.'; return 1; }
+        done
+    done
+    [[ "$finished" == 1 && ${#BATCH_DOMAINS[@]} -gt 0 ]]
+}
+
+_batch_create_conflict() {
+    local domain="$1" path
+    for path in "${SITES_META_DIR}/${domain}.conf" "${NGINX_CONF_DIR}/${domain}.conf" "${NGINX_CONF_DIR}/${domain}.conf.disabled"; do
+        [[ ! -e "$path" && ! -L "$path" ]] || return 0
+    done
+    if [[ -f "$DB_LIST_FILE" ]] && awk -F'|' -v d="$domain" '$1==d {found=1} END {exit !found}' "$DB_LIST_FILE"; then return 0; fi
+    return 1
+}
+
+_batch_site_meta_ok() {
+    local domain="$1" meta="${SITES_META_DIR}/$1.conf"
+    validate_domain "$domain" && [[ -f "$meta" && ! -L "$meta" ]] \
+        && grep -Fqx "DOMAIN=$domain" "$meta" && [[ "$(grep -c '^DOMAIN=' "$meta")" == 1 ]]
+}
+
+_batch_created_ok() {
+    local domain="$1" type="$2" php="$3" status="$4" meta="${SITES_META_DIR}/$1.conf" conf="${NGINX_CONF_DIR}/$1.conf"
+    _batch_site_meta_ok "$domain" && grep -Fqx "TYPE=$type" "$meta" && grep -Fqx "STATUS=$status" "$meta" || return 1
+    if [[ "$type" != static ]]; then
+        local pool svc
+        pool=$(get_php_pool_conf "$php" "$domain"); svc=$(get_php_service "$php")
+        grep -Fqx "PHP_VERSION=$php" "$meta" && [[ -s "$pool" && ! -L "$pool" ]] && _php_maint_test_fpm "$php" || return 1
+        { systemctl reload "$svc" || systemctl restart "$svc"; } && systemctl is-active --quiet "$svc" || return 1
+    fi
+    if [[ "$status" == locked ]]; then conf="${conf}.disabled"; fi
+    [[ -s "$conf" && ! -L "$conf" ]] && nginx -t && nginx -s reload
+}
+
+_batch_new_report() {
+    local kind="$1" base='/var/backups/liuer-panel/batches'
+    [[ "$kind" == create || "$kind" == ssl ]] || return 1
+    [[ ! -L "$base" ]] || { log_error 'Unsafe batch report directory.'; return 1; }
+    install -d -m 700 "$base" || return 1
+    BATCH_REPORT=$(mktemp -d "${base}/${kind}.XXXXXXXX") || return 1
+    chmod 700 "$BATCH_REPORT"
+}
+
+_batch_summary() {
+    local report="$1" ok="$2" failed="$3" skipped="$4" domain status reason
+    print_section 'KET QUA HANG LOAT'
+    while IFS=$'\t' read -r domain status reason; do printf '  %-38s %-8s %s\n' "$domain" "$status" "$reason"; done < "$report/results.tsv"
+    printf '\n  Thanh cong: %s | Loi: %s | Bo qua: %s\n' "$ok" "$failed" "$skipped"
+    printf '  Bao cao / log tung domain (root-only): %s\n' "$report"
+    [[ "$failed" == 0 ]] || log_warn 'Domain loi da duoc ghi nhan; khong tu retry. Kiem tra log truoc khi thu lai.'
+}
+
+batch_create_sites() {
+    (
+    umask 077
+    print_section 'TAO SITE HANG LOAT'
+    _batch_collect_domains || { log_info 'Da huy; chua tao site nao.'; return 0; }
+    local choice type php='' source='empty' with_db=0 framework='' initial_status=active domain report
+    local ok=0 failed=0 skipped=0 i=0
+    echo 'Loai site chung: 1) PHP thuan  2) Laravel  3) WordPress  4) HTML tinh  0) Back'
+    read -r -p 'Chon: ' choice || return 0
+    case "$choice" in 1) type=php ;; 2) type=laravel ;; 3) type=wordpress ;; 4) type=static ;; 0|'') return 0 ;; *) log_error 'Lua chon khong hop le; chua tao site.'; return 1 ;; esac
+    if [[ "$type" != static ]]; then
+        SELECTED_PHP_VERSION=''; select_php_version || return 0; php="$SELECTED_PHP_VERSION"
+    fi
+    case "$type" in
+        php)
+            echo 'Ma nguon: 1) Thu muc rong  2) Trang PHP mau  0) Back'
+            read -r -p 'Chon [1]: ' choice || return 0
+            case "$choice" in 1|'') source=empty ;; 2) source=demo ;; 0) return 0 ;; *) return 1 ;; esac ;;
+        wordpress)
+            echo 'Ma nguon: 1) Thu muc rong (tu upload code)  2) Tai WordPress moi nhat  0) Back'
+            read -r -p 'Chon [1]: ' choice || return 0
+            case "$choice" in 1|'') source=empty ;; 2) source=latest ;; 0) return 0 ;; *) return 1 ;; esac ;;
+        laravel)
+            echo 'Ma nguon: 1) Thu muc rong (tu upload project)  2) Laravel moi nhat  3) Chon version  0) Back'
+            read -r -p 'Chon [1]: ' choice || return 0
+            case "$choice" in
+                1|'') source=empty ;;
+                2) source=latest ;;
+                3) source=version; read -r -p 'Laravel version (vi du 10, 11, 12; 0=Back): ' framework || return 0
+                   [[ "$framework" != 0 ]] || return 0
+                   [[ "$framework" =~ ^[0-9]{1,2}(\.[0-9]{1,3}){0,2}$ ]] || { log_error 'Version khong hop le; chua tao site.'; return 1; } ;;
+                0) return 0 ;; *) return 1 ;;
+            esac ;;
+    esac
+    if [[ "$type" != static ]]; then
+        echo 'Database rieng tung site: 1) Tao DB MySQL/MariaDB rong  2) Khong tao DB  0) Back'
+        read -r -p 'Chon [2]: ' choice || return 0
+        case "$choice" in 1) with_db=1 ;; 2|'') with_db=0 ;; 0) return 0 ;; *) return 1 ;; esac
+    fi
+    if [[ "$source" == empty ]]; then
+        echo 'Trang thai ban dau: 1) Active  2) Locked (chuan bi chuyen web)  0) Back'
+        read -r -p 'Chon [1]: ' choice || return 0
+        case "$choice" in 1|'') initial_status=active ;; 2) initial_status=locked ;; 0) return 0 ;; *) return 1 ;; esac
+    fi
+    printf '\n  %s | PHP=%s | source=%s%s | Tao DB=%s | %s\n' "$type" "${php:-N/A}" "$source" "${framework:+:$framework}" "$with_db" "$initial_status"
+    for domain in "${BATCH_DOMAINS[@]}"; do
+        if _batch_create_conflict "$domain"; then printf '  BO QUA  %s (da co site/config/DB mapping)\n' "$domain"
+        else printf '  TAO     %s\n' "$domain"; fi
+    done
+    log_warn 'Moi site co system user rieng. Khong copy code, import SQL, doi DNS hay tu cai SSL. Site loi co the de lai tai nguyen do dang; xem log, khong tu xoa du lieu de thu lai.'
+    confirm_action 'Tao cac site moi trong danh sach nay?' || return 0
+    command -v flock >/dev/null || { log_error 'Can flock; chua tao site nao.'; return 1; }
+    exec 9>/run/liuer-batch.lock; flock -n 9 || { log_error 'Mot luot batch dang chay; thu lai sau.'; return 1; }
+    _batch_new_report create || return 1; report="$BATCH_REPORT"
+    : > "$report/results.tsv"
+    log_info "Bao cao: $report"
+    for domain in "${BATCH_DOMAINS[@]}"; do
+        i=$((i+1)); log_info "TAO ${i}/${#BATCH_DOMAINS[@]}: $domain"
+        if _batch_create_conflict "$domain"; then
+            printf '%s\tBO QUA\tDa co site/config/DB mapping; khong ghi de\n' "$domain" >> "$report/results.tsv"; skipped=$((skipped+1)); continue
+        fi
+        if ( nginx -t && { [[ "$type" == static ]] || _php_maint_test_fpm "$php"; } \
+             && LIUER_NONINTERACTIVE=1 _api_create_site "$domain" "$type" "$php" "$source" "$with_db" "$framework" "$initial_status" \
+             && _batch_created_ok "$domain" "$type" "$php" "$initial_status" ) 9>&- < /dev/null > "$report/$domain.log" 2>&1; then
+            printf '%s\tOK\tSite da tao; SSL la buoc rieng\n' "$domain" >> "$report/results.tsv"; ok=$((ok+1))
+        else
+            printf '%s\tLOI\tKiem tra log/nguon tai nguyen do dang truoc khi thu lai\n' "$domain" >> "$report/results.tsv"; failed=$((failed+1))
+        fi
+    done
+    _batch_summary "$report" "$ok" "$failed" "$skipped"
+    log_info 'Cai SSL sau khi chuyen code/DNS: Website > Domain, SSL & redirects > SSL hang loat.'
+    press_enter
+    [[ "$failed" == 0 ]]
+    )
+}
+
+_batch_select_ssl_domains() {
+    BATCH_DOMAINS=()
+    local meta domain choice selected i=0 label
+    local -a candidates=()
+    command -v python3 >/dev/null || { log_error 'Can python3 de chon nhieu domain.'; return 1; }
+    for meta in "${SITES_META_DIR}"/*.conf; do
+        [[ -f "$meta" && ! -L "$meta" ]] || continue
+        domain="${meta##*/}"; domain="${domain%.conf}"
+        _batch_site_meta_ok "$domain" || continue
+        candidates+=("$domain"); i=$((i+1)); label='Chua cai SSL'
+        if grep -qx 'STATUS=locked' "$meta" || [[ -e "${NGINX_CONF_DIR}/${domain}.conf.disabled" ]]; then label='Locked: se bo qua'
+        elif grep -Eq '^[[:space:]]*ssl_certificate[[:space:]]' "${NGINX_CONF_DIR}/${domain}.conf" 2>/dev/null; then label='Da co SSL: se bo qua'; fi
+        printf '  %3d) %-38s %s\n' "$i" "$domain" "$label"
+    done
+    [[ ${#candidates[@]} -gt 0 ]] || { log_warn 'Chua co site duoc quan ly.'; return 1; }
+    echo 'A) Tat ca  |  so thu tu (vi du 1,3,5-8)  |  0) Back. Toi da 200 domain/luot.'
+    while read -r -p 'Chon domain: ' choice; do
+        [[ -n "$choice" && "$choice" != 0 ]] || return 1
+        if selected=$(printf '%s\n' "${candidates[@]}" | python3 -I -c '
+import re,sys
+rows=sys.stdin.read().splitlines(); choice=sys.argv[1].strip()
+try:
+    assert rows and len(choice)<=4096
+    if choice.lower()=="a": indices=set(range(1,len(rows)+1))
+    else:
+        assert not re.search(r"(^|,)\s*(,|$)",choice)
+        indices=set()
+        for token in re.split(r"[\s,]+",choice):
+            match=re.fullmatch(r"([1-9][0-9]{0,8})(?:-([1-9][0-9]{0,8}))?",token); assert match
+            start=int(match[1]); end=int(match[2] or match[1]); assert 1<=start<=end<=len(rows)
+            indices.update(range(start,end+1))
+    assert 0<len(indices)<=200
+    print("\n".join(rows[index-1] for index in sorted(indices)))
+except (AssertionError,ValueError): sys.exit(1)
+' "$choice"); then
+            while IFS= read -r domain; do BATCH_DOMAINS+=("$domain"); done <<< "$selected"
+            return 0
+        fi
+        log_warn 'Lua chon khong hop le / qua 200 domain. Chon lai hoac 0 de huy.'
+    done
+    return 1
+}
+
+batch_install_ssl() {
+    (
+    umask 077
+    print_section "CAI SSL HANG LOAT (LET'S ENCRYPT)"
+    _batch_select_ssl_domains || return 0
+    local email='' saved='' domain report conf meta status choice i=0 ok=0 failed=0 skipped=0
+    [[ ! -f "${CONFIG_DIR}/ssl_email" ]] || saved=$(head -n 1 "${CONFIG_DIR}/ssl_email")
+    while true; do
+        read -r -p "Email Let's Encrypt [${saved:-chua co}; 0=Back]: " email || return 0
+        [[ "$email" != 0 ]] || return 0
+        email="${email:-$saved}"
+        [[ "$email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] && break
+        log_warn 'Email khong hop le.'
+    done
+    printf '\n  Email chung: %s | %s domain\n' "$email" "${#BATCH_DOMAINS[@]}"
+    printf '  %s\n' "${BATCH_DOMAINS[@]}"
+    log_warn 'DNS/port 80 phai san sang. Site locked / da co SSL se bo qua. Domain loi van chay domain ke tiep; khong tu retry, khong force-renew hay xoa cert.'
+    confirm_action 'Cai SSL cho danh sach nay?' || return 0
+    command -v flock >/dev/null || { log_error 'Can flock; chua cai SSL.'; return 1; }
+    exec 9>/run/liuer-batch.lock; flock -n 9 || { log_error 'Mot luot batch dang chay; thu lai sau.'; return 1; }
+    _batch_new_report ssl || return 1; report="$BATCH_REPORT"
+    : > "$report/results.tsv"
+    log_info "Bao cao: $report"
+    for domain in "${BATCH_DOMAINS[@]}"; do
+        i=$((i+1)); log_info "SSL ${i}/${#BATCH_DOMAINS[@]}: $domain"
+        conf="${NGINX_CONF_DIR}/${domain}.conf"; meta="${SITES_META_DIR}/${domain}.conf"
+        if ! _batch_site_meta_ok "$domain" || [[ -L "$conf" ]]; then
+            printf '%s\tLOI\tMetadata/config khong an toan; khong cai\n' "$domain" >> "$report/results.tsv"; failed=$((failed+1)); continue
+        fi
+        status=$(sed -n 's/^STATUS=//p' "$meta")
+        if [[ "$status" == locked || -e "${conf}.disabled" || -L "${conf}.disabled" ]]; then
+            printf '%s\tBO QUA\tSite locked; khong tu unlock\n' "$domain" >> "$report/results.tsv"; skipped=$((skipped+1)); continue
+        fi
+        if [[ ! -f "$conf" || ( -n "$status" && "$status" != active ) ]]; then
+            printf '%s\tLOI\tKhong co config active hop le\n' "$domain" >> "$report/results.tsv"; failed=$((failed+1)); continue
+        fi
+        if grep -Eq '^[[:space:]]*ssl_certificate[[:space:]]' "$conf"; then
+            printf '%s\tBO QUA\tDa co SSL; dung menu tung site neu can thay/gia han\n' "$domain" >> "$report/results.tsv"; skipped=$((skipped+1)); continue
+        fi
+        if ( nginx -t && setup_ssl_free "$domain" "$email" 1 \
+             && grep -Eq '^[[:space:]]*ssl_certificate[[:space:]]' "$conf" ) 9>&- < /dev/null > "$report/$domain.log" 2>&1; then
+            printf '%s\tOK\tSSL da cai\n' "$domain" >> "$report/results.tsv"; ok=$((ok+1))
+            lcp_notify site_updated "\"domain\":\"${domain}\",\"ssl_enabled\":true"
+        else
+            printf '%s\tLOI\tXem log: DNS/ACME/Nginx/Certbot; khong tu retry\n' "$domain" >> "$report/results.tsv"; failed=$((failed+1))
+        fi
+    done
+    _batch_summary "$report" "$ok" "$failed" "$skipped"
+    press_enter
+    [[ "$failed" == 0 ]]
+    )
+}
+
 _liuer_import_tools() {
     python3 -I - "$@" <<'LIUER_IMPORT_PY'
 #!/usr/bin/env python3
@@ -11003,8 +11547,11 @@ def receive_rsync(command, identity, receive, report):
                     last_heartbeat = now
                     copy_progress(detail='Dang quet/nhan file; %ss tu du lieu rsync gan nhat (khong phai %% hoan tat).' % int(now - last_activity), force=True)
             process.wait(timeout=5)
-            require(process.returncode == 0, 'Rsync failed; destination code was not changed. Private log: ' + report + '/rsync.log')
-            copy_progress(detail='DA NHAN XONG CODE (rsync exit=0); con kiem tra/dua file, KHONG backup. So lieu rsync cuoi: ' + (last_detail or 'khong co'), force=True)
+            require(process.returncode in (0, 24), 'Rsync failed (exit=%s); destination code was not changed. Private log: %s/rsync.log' % (process.returncode, report))
+            if process.returncode == 24:
+                copy_progress('CANH BAO RSYNC 24', 'Mot so file NGUON bien mat khi dang copy. Van dua cac file da nhan vao site dich; khong bao dam du file/snapshot nhat quan. Xem rsync.log va kiem tra website.', force=True)
+            copy_progress(detail='DA NHAN XONG CODE (rsync exit=%s); con kiem tra/dua file, KHONG backup. So lieu rsync cuoi: ' % process.returncode + (last_detail or 'khong co'), force=True)
+            return process.returncode
         finally:
             selector.close()
             # Kill only the owned operation's process group (SSH included).
@@ -11048,7 +11595,7 @@ def sync_code(identifier, panel, domain, source, expected_site=None):
                            '-e', ' '.join(shlex.quote(x) for x in options), '--',
                            peer['user'] + '@' + ('[' + peer['host'] + ']' if ':' in peer['host'] else peer['host']) + ':' + source + '/', receive + '/']
                 copy_progress('RSYNC TAI CODE', 'Dang quet/nhan danh sach file...', force=True)
-                receive_rsync(command, identity, receive, report)
+                rsync_exit = receive_rsync(command, identity, receive, report)
                 source_fd = directory(receive)
                 target_fd = None
                 try:
@@ -11060,10 +11607,11 @@ def sync_code(identifier, panel, domain, source, expected_site=None):
                 finally:
                     os.close(source_fd)
                     if target_fd is not None: os.close(target_fd)
-        copy_progress('HOAN TAT', 'KHONG BACKUP CODE. Bao cao: ' + report, force=True)
+        warning = 'SOURCE_FILES_VANISHED' if rsync_exit == 24 else None
+        copy_progress('HOAN TAT CO CANH BAO' if warning else 'HOAN TAT', ('RSYNC 24: file nguon bien mat; kiem tra website va rsync.log. ' if warning else '') + 'KHONG BACKUP CODE. Bao cao: ' + report, force=True)
         return dict(outcome, domain=domain, copied=True, target=target, overwrite_confirmed=True,
                     locked=data.get('STATUS') == 'locked', site_status=data.get('STATUS'), database_imported=False,
-                    report=report, transfer_mode='rsync-single-receive-rename',
+                    report=report, rsync_exit_code=rsync_exit, warnings=[warning] if warning else [], transfer_mode='rsync-single-receive-rename',
                     note='Single rsync receive then same-filesystem rename/link promotion. NO CODE BACKUP; old overwritten contents are not retained. Existing older backup directories are not removed. Destination-only entries retained. No --delete, DB import, DNS or site-state change. Incoming links/special files omitted; destination conflicts refused. Copied wp-config.php/.env retain SOURCE credentials; update separately.')
     finally:
         COPY_PROGRESS = None
@@ -11436,7 +11984,7 @@ _import_sync_single() {
         read -r -p 'Nhập đúng dòng màu đỏ ở trên; 0/Enter để hủy: ' acknowledgment || return
         if [[ "$acknowledgment" == "GHI DE ${domain}" ]]; then
             if result=$(_liuer_import_api sync "$profile" "$panel" "$domain" "$source" --overwrite-confirmed --confirm --no-code-backup); then
-                if python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert d.get("copied") is True and d.get("overwrite_confirmed") is True and d.get("domain")==sys.argv[2] and d.get("backup_created") is False; print("KHONG BACKUP CODE. Bao cao: "+str(d.get("report",""))); print("File moi: %s | Ghi de: %s"%(d.get("files_created",0),d.get("files_overwritten",0)))' "$result" "$domain"; then
+                if python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); assert d.get("copied") is True and d.get("overwrite_confirmed") is True and d.get("domain")==sys.argv[2] and d.get("backup_created") is False; print("KHONG BACKUP CODE. Bao cao: "+str(d.get("report",""))); print("File moi: %s | Ghi de: %s"%(d.get("files_created",0),d.get("files_overwritten",0))); print("[WARN] RSYNC 24: file NGUON bien mat khi copy; da copy cac file nhan duoc. Kiem tra website va rsync.log, khong bao dam du file.") if d.get("rsync_exit_code")==24 else None' "$result" "$domain"; then
                     log_success 'COPY HOAN TAT. Khong import DB hoac doi trang thai site. Kiem tra ket noi DB va code truoc khi su dung.'
                 else
                     log_error 'CHUA XAC NHAN DUOC KET QUA COPY. Kiem tra website/bao cao; khong backup code, khong tu chay lai.'
@@ -11509,7 +12057,8 @@ try:
     elif action=="result":
         assert data.get("domain")==args[0] and data.get("copied") is True and data.get("overwrite_confirmed") is True
         assert data.get("backup_created") is False and isinstance(data.get("report"),str)
-        print("KHONG BACKUP CODE | Bao cao: %s | file moi=%s | ghi de=%s"%(safe(data["report"]),int(data["files_created"]),int(data["files_overwritten"])))
+        warning=" | [WARN] RSYNC 24: file NGUON bien mat; da copy cac file nhan duoc, kiem tra website/rsync.log" if data.get("rsync_exit_code")==24 else ""
+        print("KHONG BACKUP CODE | Bao cao: %s | file moi=%s | ghi de=%s%s"%(safe(data["report"]),int(data["files_created"]),int(data["files_overwritten"]),warning))
     else: raise ValueError("Unknown action")
 except (ValueError,AssertionError,IndexError,KeyError,TypeError,OSError):
     print("Lua chon/du lieu khong hop le. Dung A, so thu tu, dau cach/phay hoac khoang nhu 2-6; kiem tra lai danh sach.",file=sys.stderr); sys.exit(1)
@@ -13142,15 +13691,26 @@ main() {
             show_php_versions "${2:-table}"
             ;;
 
+        batch)
+            check_root; detect_os
+            [[ $# == 2 ]] || { log_error 'Usage: liuer batch [create|ssl] (interactive)'; return 1; }
+            case "$2" in
+                create) batch_create_sites ;;
+                ssl) batch_install_ssl ;;
+                *) log_error 'Usage: liuer batch [create|ssl] (interactive)'; return 1 ;;
+            esac
+            ;;
+
         php-maintenance)
             check_root; detect_os
             case "${2:-menu}" in
                 audit) php_maintenance_audit ;;
                 system-cli) shift 2; php_maintenance_system_cli "$@" ;;
+                legacy74) shift 2; php_maintenance_legacy74 "$@" ;;
                 apply) shift 2; php_maintenance_apply "$@" ;;
                 rollback) [[ $# == 4 ]] || { log_error "Usage: liuer php-maintenance rollback RUN_ID DOMAIN"; return 1; }; php_maintenance_rollback "$3" "$4" ;;
                 menu) php_maintenance_menu ;;
-                *) log_error "Usage: liuer php-maintenance [audit|system-cli|apply --confirm [DOMAIN:FINGERPRINT ...]|rollback RUN_ID DOMAIN]"; return 1 ;;
+                *) log_error "Usage: liuer php-maintenance [audit|legacy74|system-cli|apply --confirm [DOMAIN:FINGERPRINT ...]|rollback RUN_ID DOMAIN]"; return 1 ;;
             esac
             ;;
 
@@ -13165,11 +13725,12 @@ main() {
             _liuer_import_api "$@"
             ;;
 
-        # ── Auto repair (called internally after update, no interaction) ──────
+        # ── Post-update repair; PHP 7.4 offer is interactive on a TTY only ────
         _repair_auto)
             check_root
             detect_os
             do_repair
+            php_maintenance_legacy74 2>&1 || log_warn 'PHP 7.4 maintenance not completed. Other runtimes were not selected for maintenance.'
             ;;
 
         _update_web_panel_auto)
@@ -13220,7 +13781,9 @@ main() {
             echo "  version        Show current version"
             echo "  web-panel      Install or manage the optional browser panel"
             echo "  php-maintenance  Audit/update runtimes; migrate only confirmed 8.0/8.1 sites"
+            echo "  php-maintenance legacy74  Review/update ONLY installed PHP 7.4 vendor packages"
             echo "  php-versions     Show installed FPM/CLI patch versions (--tsv for inventory)"
+            echo "  batch create|ssl  Create grouped sites / install SSL for multiple sites"
             echo "  imports          Optional code migration, EMPTY-DB SQL import, config and confirmed SQL cleanup"
             echo "  help           Show this help"
             echo ""
