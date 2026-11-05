@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.7.38"
+readonly VERSION="2.8.0"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -61,9 +61,10 @@ lcp_notify() {
     local body="{\"internal_token\":\"${token}\",\"action\":\"${action}\""
     [[ -n "$payload" ]] && body="${body},${payload}"
     body="${body}}"
+    # The body carries the internal token, so it goes over stdin, never argv.
     curl -sf --max-time 3 -X POST "http://localhost:${port}/internal/notify" \
         -H "Content-Type: application/json" \
-        -d "$body" &>/dev/null & disown
+        -d @- <<<"$body" &>/dev/null & disown
 }
 
 # =============================================================================
@@ -869,6 +870,52 @@ _disable_default_fpm_pools() {
     done
 }
 
+# Run a sed program containing a secret: read from stdin, so it never shows up
+# in /proc/<pid>/cmdline.
+_sed_secret() {
+    local script="$1" file="$2"
+    sed -i -f /dev/stdin "$file" <<<"$script"
+}
+
+# chmod follows symlinks, so `find -exec chmod` as root inside a site lets its
+# owner swap an entry for a symlink mid-walk and retarget the mode at any system
+# file. This walks with directory fds and fchmods only what O_NOFOLLOW opened.
+# usage: _safe_tree_chmod <dir> <dir_mode> <file_mode> [1 = also chmod <dir>]
+_safe_tree_chmod() {
+    local root="$1" dir_mode="$2" file_mode="$3" include_root="${4:-0}"
+    python3 -I -S - "$root" "$dir_mode" "$file_mode" "$include_root" <<'PY'
+import os, stat, sys
+root, dir_mode, file_mode, include_root = sys.argv[1], int(sys.argv[2], 8), int(sys.argv[3], 8), sys.argv[4] == '1'
+FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+def walk(parent, depth):
+    if depth > 512:
+        return
+    with os.scandir(parent) as listing:
+        names = [entry.name for entry in listing]
+    for name in names:
+        try:
+            fd = os.open(name, FLAGS, dir_fd=parent)
+        except OSError:
+            continue  # symlink, vanished, or unreadable special file: never followed.
+        try:
+            info = os.fstat(fd)
+            if stat.S_ISDIR(info.st_mode):
+                os.fchmod(fd, dir_mode)
+                walk(fd, depth + 1)
+            elif stat.S_ISREG(info.st_mode):
+                os.fchmod(fd, file_mode)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+top = os.open(root, FLAGS | os.O_DIRECTORY)
+if include_root:
+    os.fchmod(top, dir_mode)
+walk(top, 0)
+os.close(top)
+PY
+}
+
 _set_site_perms() {
     local site_dir="$1" site_user="$2"
     local nginx_user="nginx"
@@ -883,8 +930,7 @@ _set_site_perms() {
     # Reset top-level dir to root:root 755 — required for SFTP ChrootDirectory
     chown root:root "$site_dir" 2>/dev/null || true
     chmod 755 "$site_dir"
-    find "$site_dir" -mindepth 1 -type d -exec chmod 750 {} +
-    find "$site_dir" -type f -exec chmod 640 {} +
+    _safe_tree_chmod "$site_dir" 750 640
     # Add nginx to site group — restart required (not just reload) to apply new group
     if ! groups "$nginx_user" 2>/dev/null | grep -qw "$site_user"; then
         usermod -aG "$site_user" "$nginx_user" 2>/dev/null || true
@@ -927,8 +973,7 @@ _repair_sftp_perms() {
                     # umask is not a valid FPM pool directive. Never write it
                     # here; generated pools use the service's process umask.
                 fi
-                find "$_croot" -mindepth 1 -type d -exec chmod 770 {} + 2>/dev/null || true
-                find "$_croot" -mindepth 1 -type f -exec chmod 660 {} + 2>/dev/null || true
+                _safe_tree_chmod "$_croot" 770 660 2>/dev/null || true
             fi
         elif [[ $_in_match -eq 1 && "$_line" =~ ^[^[:space:]] && -n "${_line//[[:space:]]/}" ]]; then
             _in_match=0; _sfuser=""
@@ -1211,25 +1256,38 @@ ensure_secret_key() {
     fi
 }
 
+# `-pass file:` keeps the master key out of /proc/<pid>/cmdline, which site users
+# can read. Never pass a secret to an external command as an argument.
 encrypt_pass() {
-    local plaintext="$1"
-    local key
-    key=$(cat "$SECRET_KEY_FILE")
-    printf '%s' "$plaintext" | openssl enc -aes-256-cbc -a -salt -md md5 -pass "pass:${key}" 2>/dev/null
+    local plaintext="$1" cipher
+    cipher=$(printf '%s' "$plaintext" | openssl enc -aes-256-cbc -a -A -salt -pbkdf2 -iter 200000 -md sha256 \
+        -pass "file:${SECRET_KEY_FILE}" 2>/dev/null) || return 1
+    [[ -n "$cipher" ]] || return 1
+    printf 'v2:%s' "$cipher"
+}
+
+# liuercp still decrypts the original format; only its notifications use this.
+_encrypt_pass_legacy() {
+    printf '%s' "$1" | openssl enc -aes-256-cbc -a -salt -md md5 -pass "file:${SECRET_KEY_FILE}" 2>/dev/null
 }
 
 decrypt_pass() {
     local cipher="$1"
     [[ -z "$cipher" ]] && return 1
-    local key
-    key=$(cat "$SECRET_KEY_FILE" 2>/dev/null)
-    [[ -z "$key" ]] && return 1
+    [[ -s "$SECRET_KEY_FILE" ]] || return 1
     local result
-    result=$(printf '%s\n' "$cipher" | openssl enc -aes-256-cbc -a -d -md md5 -pass "pass:${key}" 2>/dev/null)
-    [[ -z "$result" ]] && \
-    result=$(printf '%s\n' "$cipher" | openssl enc -aes-256-cbc -a -d -pass "pass:${key}" 2>/dev/null)
-    [[ -z "$result" ]] && \
-    result=$(printf '%s\n' "$cipher" | openssl enc -aes-256-cbc -a -d -pbkdf2 -pass "pass:${key}" 2>/dev/null)
+    # openssl prints partial plaintext before reporting a bad decrypt, so only its
+    # exit status tells a wrong format from a right one.
+    if [[ "$cipher" == v2:* ]]; then
+        result=$(printf '%s' "${cipher#v2:}" | openssl enc -aes-256-cbc -a -A -d -pbkdf2 -iter 200000 -md sha256 \
+            -pass "file:${SECRET_KEY_FILE}" 2>/dev/null) || result=""
+    else
+        result=$(printf '%s\n' "$cipher" | openssl enc -aes-256-cbc -a -d -md md5 -pass "file:${SECRET_KEY_FILE}" 2>/dev/null) || result=""
+        [[ -z "$result" ]] && \
+        { result=$(printf '%s\n' "$cipher" | openssl enc -aes-256-cbc -a -d -pass "file:${SECRET_KEY_FILE}" 2>/dev/null) || result=""; }
+        [[ -z "$result" ]] && \
+        { result=$(printf '%s\n' "$cipher" | openssl enc -aes-256-cbc -a -d -pbkdf2 -pass "file:${SECRET_KEY_FILE}" 2>/dev/null) || result=""; }
+    fi
     [[ -z "$result" ]] && return 1
     printf '%s' "$result"
 }
@@ -1240,22 +1298,24 @@ decrypt_pass() {
 mysql_exec() {
     local query="$1"
 
+    # SQL goes over stdin. `-e` would publish every CREATE/ALTER USER password
+    # in /proc/<pid>/cmdline; the client only masks its own -p value.
     # Use cached method from this session
     if [[ -n "$MYSQL_CONNECT_METHOD" ]]; then
         case "$MYSQL_CONNECT_METHOD" in
-            nopass) mysql -u root -e "$query" 2>/dev/null; return $? ;;
-            mycnf)  mysql --defaults-file=/root/.my.cnf -e "$query" 2>/dev/null; return $? ;;
-            pass)   mysql -u root -p"${MYSQL_ROOT_PASS}" -e "$query" 2>/dev/null; return $? ;;
+            nopass) mysql -u root <<<"$query" 2>/dev/null; return $? ;;
+            mycnf)  mysql --defaults-file=/root/.my.cnf <<<"$query" 2>/dev/null; return $? ;;
+            pass)   MYSQL_PWD="$MYSQL_ROOT_PASS" mysql -u root <<<"$query" 2>/dev/null; return $? ;;
         esac
     fi
 
     # Try without password
-    if mysql -u root -e "$query" &>/dev/null; then
+    if mysql -u root <<<"$query" &>/dev/null; then
         MYSQL_CONNECT_METHOD="nopass"; return 0
     fi
 
     # Try /root/.my.cnf
-    if [[ -f /root/.my.cnf ]] && mysql --defaults-file=/root/.my.cnf -e "$query" &>/dev/null; then
+    if [[ -f /root/.my.cnf ]] && mysql --defaults-file=/root/.my.cnf <<<"$query" &>/dev/null; then
         MYSQL_CONNECT_METHOD="mycnf"; return 0
     fi
 
@@ -1263,7 +1323,7 @@ mysql_exec() {
     echo -e "${YELLOW}Enter MySQL root password:${NC}"
     read -rs MYSQL_ROOT_PASS
     echo ""
-    if mysql -u root -p"${MYSQL_ROOT_PASS}" -e "$query" &>/dev/null; then
+    if MYSQL_PWD="$MYSQL_ROOT_PASS" mysql -u root <<<"$query" &>/dev/null; then
         MYSQL_CONNECT_METHOD="pass"; return 0
     fi
 
@@ -2267,7 +2327,7 @@ PHP
                             sed -i "s/^#\? *DB_PORT=.*/DB_PORT=3306/"                "$env_file"
                             sed -i "s/^#\? *DB_DATABASE=.*/DB_DATABASE=${_ldb_name}/" "$env_file"
                             sed -i "s/^#\? *DB_USERNAME=.*/DB_USERNAME=${_ldb_user}/" "$env_file"
-                            sed -i "s/^#\? *DB_PASSWORD=.*/DB_PASSWORD=${_ldb_pass}/" "$env_file"
+                            _sed_secret "s/^#\? *DB_PASSWORD=.*/DB_PASSWORD=${_ldb_pass}/" "$env_file"
                             log_success "Laravel .env configured with MySQL."
                         else
                             log_info "Database created; configure Laravel .env after uploading/deploying the source."
@@ -2279,7 +2339,7 @@ PHP
 
                 "PostgreSQL")
                     if sudo -u postgres psql -c "CREATE DATABASE ${_ldb_name};" 2>/dev/null \
-                       && sudo -u postgres psql -c "CREATE USER ${_ldb_user} WITH PASSWORD '${_ldb_pass}';" 2>/dev/null \
+                       && sudo -u postgres psql -v ON_ERROR_STOP=1 <<<"CREATE USER ${_ldb_user} WITH PASSWORD '${_ldb_pass}';" &>/dev/null \
                        && sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${_ldb_name} TO ${_ldb_user};" 2>/dev/null; then
 
                         mkdir -p "$CONFIG_DIR"
@@ -2297,7 +2357,7 @@ PHP
                             sed -i "s/^#\? *DB_PORT=.*/DB_PORT=5432/"                "$env_file"
                             sed -i "s/^#\? *DB_DATABASE=.*/DB_DATABASE=${_ldb_name}/" "$env_file"
                             sed -i "s/^#\? *DB_USERNAME=.*/DB_USERNAME=${_ldb_user}/" "$env_file"
-                            sed -i "s/^#\? *DB_PASSWORD=.*/DB_PASSWORD=${_ldb_pass}/" "$env_file"
+                            _sed_secret "s/^#\? *DB_PASSWORD=.*/DB_PASSWORD=${_ldb_pass}/" "$env_file"
                             log_success "Laravel .env configured with PostgreSQL."
                         else
                             log_info "Database created; configure Laravel .env after uploading/deploying the source."
@@ -2429,14 +2489,15 @@ PHP
                         cp "${web_root}/wp-config-sample.php" "${web_root}/wp-config.php"
                         sed -i "s/database_name_here/${_db_name}/" "${web_root}/wp-config.php"
                         sed -i "s/username_here/${_db_user}/" "${web_root}/wp-config.php"
-                        sed -i "s/password_here/${_db_pass}/" "${web_root}/wp-config.php"
+                        _sed_secret "s/password_here/${_db_pass}/" "${web_root}/wp-config.php"
                         sed -i "s/localhost/127.0.0.1/" "${web_root}/wp-config.php"
                         # Fetch auth keys/salts
                         local _salts
                         _salts=$(curl -fsSL "https://api.wordpress.org/secret-key/1.1/salt/" 2>/dev/null || true)
                         if [[ -n "$_salts" ]]; then
                             local _tmp="${web_root}/wp-config.php.tmp"
-                            awk -v salts="$_salts" '
+                            LIUER_WP_SALTS="$_salts" awk '
+                                BEGIN { salts=ENVIRON["LIUER_WP_SALTS"] }
                                 /define\(.AUTH_KEY/ { found=1 }
                                 found && /define\(.NONCE_SALT/ { print salts; found=0; next }
                                 !found { print }
@@ -4112,7 +4173,7 @@ _create_db_for() {
             mysql_exec "FLUSH PRIVILEGES;" || return 1
             ;;
         postgresql)
-            sudo -u postgres psql -c "CREATE USER ${db_user} WITH PASSWORD '${db_pass}';" 2>/dev/null || return 1
+            sudo -u postgres psql -v ON_ERROR_STOP=1 <<<"CREATE USER ${db_user} WITH PASSWORD '${db_pass}';" &>/dev/null || return 1
             sudo -u postgres psql -c "CREATE DATABASE ${db_name} OWNER ${db_user};" 2>/dev/null || return 1
             ;;
         *)
@@ -5582,19 +5643,23 @@ _apply_framework_permissions() {
     done
     chown -hR root:"$site_user" "$site_dir"
     chown root:root "$site_dir" && chmod 755 "$site_dir"
-    find "$site_dir" -mindepth 1 -type d -exec chmod 750 {} +
-    find "$site_dir" -type f -exec chmod 640 {} +
+    # Now that the tree is root-owned the owner can no longer swap a parent for a
+    # symlink. Check again: a swap made before this point must not reach chown.
+    for dir in "${writable[@]}"; do
+        _realpath_within_site "$site_dir" "$dir" 0 >/dev/null || {
+            log_error "Framework writable directory escapes this website: ${dir}"; return 1;
+        }
+    done
+    _safe_tree_chmod "$site_dir" 750 640
     for dir in "${writable[@]}"; do
         mkdir -p "$dir"
         chown -hR "$site_user":"$site_user" "$dir"
         if [[ "$site_type" == "wordpress" && "$profile" == "framework_hardened" ]]; then
             # PHP-FPM is the owner and can write with 750/640. Do not grant
             # group write here because nginx is also a member of the site group.
-            find "$dir" -type d -exec chmod 750 {} +
-            find "$dir" -type f -exec chmod 640 {} +
+            _safe_tree_chmod "$dir" 750 640 1
         else
-            find "$dir" -type d -exec chmod 770 {} +
-            find "$dir" -type f -exec chmod 660 {} +
+            _safe_tree_chmod "$dir" 770 660 1
         fi
     done
     _site_meta_set "$domain" PERMISSION_PROFILE "$profile"
@@ -5801,7 +5866,7 @@ backup_website() {
                 case "$_type" in
                     mysql|mariadb)
                         local _dump_tmp; _dump_tmp=$(mktemp)
-                        if mysqldump -u "$_db_user" -p"${_pass}" "$_db_name" > "$_dump_tmp" 2>/dev/null; then
+                        if MYSQL_PWD="$_pass" mysqldump -u "$_db_user" "$_db_name" > "$_dump_tmp" 2>/dev/null; then
                             gzip -c "$_dump_tmp" > "$db_bk" && log_success "Database backup OK." || log_warn "Compress failed."
                         else
                             log_warn "Database backup failed (mysqldump error)."
@@ -5870,11 +5935,10 @@ restore_backup() {
         if [[ -n "$db_line" ]]; then
             local _db_name _db_user _enc _type _pass
             IFS='|' read -r _ _db_name _db_user _enc _type <<< "$db_line"
-            _pass=$(decrypt_pass "$_enc" 2>/dev/null || echo "")
             log_info "Restoring database from: $latest_db"
             case "$_type" in
                 mysql|mariadb)
-                    zcat "$latest_db" | mysql -u "$_db_user" -p"${_pass}" "$_db_name" \
+                    _restore_mysql_as_site "$domain" "$latest_db" "$_db_name" "$_db_user" "$_enc" \
                         && log_success "Database restored." \
                         || log_error "Database restore failed."
                     ;;
@@ -6337,6 +6401,25 @@ check_update() {
     press_enter
 }
 
+# True when $1 sorts strictly after $2 as a dotted version.
+_version_is_newer() {
+    [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" == "$1" ]]
+}
+
+# Verify a detached base64 RSA-SHA256 signature made by the release key.
+_verify_cli_signature() {
+    local file="$1" signature="$2" key raw rc=1
+    [[ -s "$file" && -s "$signature" ]] || return 1
+    key=$(mktemp) || return 1
+    raw=$(mktemp) || { rm -f "$key"; return 1; }
+    _web_panel_release_key > "$key"
+    if base64 -d "$signature" > "$raw" 2>/dev/null; then
+        openssl dgst -sha256 -verify "$key" -signature "$raw" "$file" &>/dev/null && rc=0
+    fi
+    rm -f "$key" "$raw"
+    return "$rc"
+}
+
 update_tool() {
     print_section "UPDATE LIUER PANEL"
     local target="${INSTALL_DIR}/${SCRIPT_NAME}"
@@ -6360,7 +6443,14 @@ update_tool() {
     echo -e "  Updating: ${DIM}v${VERSION}${NC} → ${BOLD}${GREEN}v${remote_ver}${NC}\n"
     confirm_action "Proceed with update?" || { log_info "Cancelled."; return 0; }
 
-    local backup_path="/tmp/liuer-panel-backup-$(date +%Y%m%d_%H%M%S).sh"
+    if ! _version_is_newer "$remote_ver" "$VERSION"; then
+        log_error "Refusing to replace v${VERSION} with older v${remote_ver}."
+        press_enter; return 1
+    fi
+
+    local backup_path
+    backup_path=$(mktemp /tmp/liuer-panel-backup.XXXXXX) \
+        || { log_error "Backup failed. Aborting."; return 1; }
     log_info "Backing up current script → $backup_path"
     cp "$target" "$backup_path" \
         || { log_error "Backup failed. Aborting."; return 1; }
@@ -6376,11 +6466,17 @@ update_tool() {
     log_info "Downloading v${remote_ver}..."
     curl -fsSL --max-time 120 "$raw_url" -o "${target}.tmp"
     local dl_rc=$?
+    curl -fsSL --max-time 30 "${raw_url/%\?*/}.sig" -o "${target}.tmp.sig"
+    [[ $? -eq 0 ]] || dl_rc=1
 
     local downloaded_version=""
     downloaded_version=$(sed -n 's/^readonly VERSION="\([0-9][0-9.]*\)"$/\1/p' "${target}.tmp" 2>/dev/null | head -1)
+    # GitHub is only the transport: this script runs as root, so a new version
+    # must carry a signature from the offline release key.
     if [[ $dl_rc -eq 0 && -s "${target}.tmp" && "$downloaded_version" == "$remote_ver" ]] \
+          && _verify_cli_signature "${target}.tmp" "${target}.tmp.sig" \
           && bash -n "${target}.tmp"; then
+        rm -f "${target}.tmp.sig"
         mv "${target}.tmp" "$target"
         chmod +x "$target"
         ln -sf "$target" "$BIN_LINK"
@@ -6394,8 +6490,8 @@ update_tool() {
         sleep 1
         exec "$BIN_LINK"
     else
-        rm -f "${target}.tmp"
-        log_error "Download failed (curl exit: ${dl_rc}). Restoring backup..."
+        rm -f "${target}.tmp" "${target}.tmp.sig"
+        log_error "Download or signature check failed (curl exit: ${dl_rc}). Restoring backup..."
         cp "$backup_path" "$target" \
             && log_success "Rollback successful." \
             || log_error "Rollback failed! Restore manually from: $backup_path"
@@ -6465,6 +6561,7 @@ do_repair() {
     # access to phpMyAdmin by the VPS public IP at its secret path.
     _remove_legacy_phpmyadmin_superuser || log_warn "Legacy phpMyAdmin database account still needs manual review."
     _publish_phpmyadmin_access || log_warn "Could not publish phpMyAdmin on the server IP; the previous Nginx configuration was restored."
+    _ensure_proc_hidepid || log_warn "Other users can still see root's process list."
 
     # 5. If Memcached is installed, ensure php-memcached extension is present
     if systemctl is-active --quiet memcached 2>/dev/null; then
@@ -7597,21 +7694,74 @@ _phpmyadmin_server_ip() {
     printf '%s' "${ip:-SERVER_IP}"
 }
 
+# phpMyAdmin takes database passwords, so it answers on HTTPS only; port 80 just
+# redirects. The certificate is self-signed until the panel supports Let's Encrypt.
+_ensure_phpmyadmin_tls() {
+    local tls_dir="${CONFIG_DIR}/pma-tls" cert key ip
+    cert="${tls_dir}/pma.crt"; key="${tls_dir}/pma.key"
+    install -d -m 700 "$tls_dir" || return 1
+    [[ -s "$cert" && -s "$key" ]] && return 0
+    ip=$(_phpmyadmin_server_ip)
+    openssl req -x509 -nodes -newkey rsa:3072 -sha256 -days 825 -keyout "$key" -out "$cert" \
+        -subj "/CN=${ip}" -addext "subjectAltName=IP:${ip}" &>/dev/null \
+        || openssl req -x509 -nodes -newkey rsa:3072 -sha256 -days 825 -keyout "$key" -out "$cert" \
+            -subj "/CN=${ip}" &>/dev/null \
+        || return 1
+    chmod 600 "$key"
+    chmod 644 "$cert"
+}
+
+_write_phpmyadmin_nginx_conf() {
+    local conf="$1" token="$2" socket="$3" tls_dir="${CONFIG_DIR}/pma-tls"
+    cat > "$conf" <<EOF
+# phpMyAdmin — managed by Liuer Panel; HTTPS by server IP and secret path
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name "";
+
+    location /${token}/ { return 301 https://\$host\$request_uri; }
+    location / { return 404; }
+}
+
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name "";
+    client_max_body_size 256M;
+
+    ssl_certificate ${tls_dir}/pma.crt;
+    ssl_certificate_key ${tls_dir}/pma.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location /${token}/ {
+        alias /var/www/phpmyadmin/;
+        index index.php;
+
+        location ~ \.php$ {
+            fastcgi_pass unix:${socket};
+            fastcgi_index index.php;
+            fastcgi_param SCRIPT_FILENAME \$request_filename;
+            include fastcgi_params;
+        }
+    }
+    location / { return 404; }
+}
+EOF
+}
+
 _publish_phpmyadmin_access() {
-    local conf="${NGINX_CONF_DIR}/phpmyadmin.conf" backup
+    local conf="${NGINX_CONF_DIR}/phpmyadmin.conf" backup token socket
     [[ -f "$conf" ]] || return 0
+    [[ -f "${CONFIG_DIR}/pma_path" ]] || return 0
+    token=$(<"${CONFIG_DIR}/pma_path")
+    [[ "$token" =~ ^pma_[A-Za-z0-9]{12}$ ]] || return 1
+    socket=$(sed -n 's/^[[:space:]]*fastcgi_pass[[:space:]]\+unix:\([^;]*\);.*/\1/p' "$conf" | head -1)
+    [[ -n "$socket" ]] || socket=$(get_php_pool_socket "8.2" "phpmyadmin")
+    _ensure_phpmyadmin_tls || return 1
     backup=$(mktemp /tmp/liuer-pma-nginx.XXXXXX) || return 1
     cp -a "$conf" "$backup" || { rm -f "$backup"; return 1; }
-    sed -i -E \
-        -e 's/^([[:space:]]*)listen[[:space:]]+127\.0\.0\.1:8090;/\1listen 80 default_server;/' \
-        -e 's/^([[:space:]]*)listen[[:space:]]+80([[:space:]]+default_server)?;/\1listen 80 default_server;/' \
-        -e 's/^([[:space:]]*)listen[[:space:]]+\[::\]:80([[:space:]]+default_server)?;/\1listen [::]:80 default_server;/' \
-        -e 's/^([[:space:]]*)server_name[[:space:]]+localhost;/\1server_name "";/' \
-        -e 's/(client_max_body_size[[:space:]]+[0-9]+)MB;/\1M;/' \
-        "$conf"
-    if ! grep -qE '^[[:space:]]*listen[[:space:]]+\[::\]:80' "$conf"; then
-        sed -i '/^[[:space:]]*listen 80 default_server;/a\    listen [::]:80 default_server;' "$conf"
-    fi
+    _write_phpmyadmin_nginx_conf "$conf" "$token" "$socket"
     if ! nginx -t &>/dev/null; then
         cp -a "$backup" "$conf"
         rm -f "$backup"
@@ -7627,11 +7777,11 @@ _publish_phpmyadmin_access() {
         local token ip
         token=$(<"${CONFIG_DIR}/pma_path")
         ip=$(_phpmyadmin_server_ip)
-        printf '%s\n' "http://${ip}/${token}/" > "${CONFIG_DIR}/pma_url"
+        printf '%s\n' "https://${ip}/${token}/" > "${CONFIG_DIR}/pma_url"
         printf '%s\n' "public" > "${CONFIG_DIR}/pma_access_mode"
         chmod 600 "${CONFIG_DIR}/pma_url" "${CONFIG_DIR}/pma_access_mode"
     fi
-    log_success "phpMyAdmin is reachable by server IP on HTTP port 80 at its secret path."
+    log_success "phpMyAdmin is reachable by server IP over HTTPS at its secret path."
 }
 
 install_phpmyadmin() {
@@ -7740,27 +7890,8 @@ PHP
         pma_conf_backup=$(mktemp /tmp/liuer-pma-nginx.XXXXXX) || return 1
         cp -a "$pma_conf" "$pma_conf_backup" || { rm -f "$pma_conf_backup"; return 1; }
     fi
-    cat > "$pma_conf" <<EOF
-# phpMyAdmin — managed by Liuer Panel; access by server IP and secret path
-server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    server_name "";
-    client_max_body_size 256M;
-
-    location /${pma_token}/ {
-        alias /var/www/phpmyadmin/;
-        index index.php;
-
-        location ~ \.php$ {
-            fastcgi_pass unix:${php_socket};
-            fastcgi_index index.php;
-            fastcgi_param SCRIPT_FILENAME \$request_filename;
-            include fastcgi_params;
-        }
-    }
-}
-EOF
+    _ensure_phpmyadmin_tls || { rm -f "$pma_conf_backup"; log_error "Could not create the phpMyAdmin TLS certificate."; return 1; }
+    _write_phpmyadmin_nginx_conf "$pma_conf" "$pma_token" "$php_socket"
     if ! nginx -t &>/dev/null; then
         if [[ -n "$pma_conf_backup" ]]; then
             cp -a "$pma_conf_backup" "$pma_conf"
@@ -7783,7 +7914,7 @@ EOF
     log_success "phpMyAdmin installed."
     local pma_ip
     pma_ip=$(_phpmyadmin_server_ip)
-    local pma_public_url="http://${pma_ip}/${pma_token}/"
+    local pma_public_url="https://${pma_ip}/${pma_token}/"
     echo "$pma_public_url" > "${CONFIG_DIR}/pma_url"
     chmod 600 "${CONFIG_DIR}/pma_url"
     echo -e "  URL    : ${BOLD}${pma_public_url}${NC}"
@@ -8097,9 +8228,13 @@ _apply_web_panel_db_grants() {
     if mysql_exec "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='liuer_panel' AND TABLE_NAME='users' AND COLUMN_NAME='username';" | grep -Fxq username; then
         user_columns="${user_columns},username"
     fi
+    local file_grant_sql=""
+    if mysql_exec "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='liuer_panel' AND TABLE_NAME='file_manager_grants';" | grep -Fxq file_manager_grants; then
+        file_grant_sql="GRANT SELECT ON liuer_panel.file_manager_grants TO 'liuer_panel_web'@'127.0.0.1';"
+    fi
     mysql_exec "REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'liuer_panel_web'@'127.0.0.1';
 GRANT SELECT (${user_columns}) ON liuer_panel.users TO 'liuer_panel_web'@'127.0.0.1';
-GRANT SELECT ON liuer_panel.jobs TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_sites TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.settings TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.hosting_packages TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_databases TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_sftp_users TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_crons TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_backups TO 'liuer_panel_web'@'127.0.0.1'; FLUSH PRIVILEGES;"
+GRANT SELECT ON liuer_panel.jobs TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_sites TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.settings TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.hosting_packages TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_databases TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_sftp_users TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_crons TO 'liuer_panel_web'@'127.0.0.1'; GRANT SELECT ON liuer_panel.managed_backups TO 'liuer_panel_web'@'127.0.0.1'; ${file_grant_sql} FLUSH PRIVILEGES;"
 }
 
 _ensure_web_panel_app_key() {
@@ -8164,7 +8299,8 @@ _ensure_web_panel_control_plane() {
     chown root:root "$WEB_PANEL_WORKER_CONFIG"
     chmod 600 "$WEB_PANEL_WORKER_CONFIG"
     _apply_web_panel_db_grants || return 1
-    _configure_web_panel_control
+    _configure_web_panel_control || return 1
+    _configure_web_panel_files
 }
 
 _set_web_panel_source_permissions() {
@@ -8211,6 +8347,8 @@ php_admin_value[error_log] = /var/log/liuer-web-panel-php.log
 php_admin_value[session.save_path] = ${runtime}/sessions
 php_admin_value[upload_tmp_dir] = ${runtime}/tmp
 php_admin_value[sys_temp_dir] = ${runtime}/tmp
+php_admin_value[upload_max_filesize] = 8M
+php_admin_value[post_max_size] = 28M
 php_admin_value[open_basedir] = ${WEB_PANEL_DIR}:${CONFIG_DIR}:${runtime}:/usr/share/zoneinfo
 php_admin_value[disable_functions] = ${DANGEROUS_FUNCTIONS}
 EOF
@@ -8264,7 +8402,7 @@ ${listen_directives}
     add_header Referrer-Policy "no-referrer" always;
     add_header Content-Security-Policy "default-src 'self'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" always;
 
-    client_max_body_size 16m;
+    client_max_body_size 32m;
     location / { try_files \$uri \$uri/ /index.php?\$query_string; }
     location /assets/ { try_files \$uri =404; expires 7d; access_log off; }
     location = /index.php {
@@ -8320,6 +8458,50 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable --now "$WEB_PANEL_CONTROL_SERVICE"
+}
+
+_configure_web_panel_files() {
+    local php_bin; php_bin=$(_web_panel_php_bin)
+    # CLI upgrades may precede the private Web Panel release on a VPS.
+    [[ -f "${WEB_PANEL_DIR}/bin/file-ops.py" && -f "${WEB_PANEL_DIR}/bin/files.php" ]] || return 0
+    install -d -o root -g root -m 755 /usr/local/libexec/liuer-panel || return 1
+    install -o root -g root -m 755 "${WEB_PANEL_DIR}/bin/file-ops.py" /usr/local/libexec/liuer-panel/file-ops.py || return 1
+    cat > /etc/systemd/system/liuer-web-files.service <<EOF
+[Unit]
+Description=Liuer Web Panel site-isolated file service
+After=network.target mariadb.service
+Wants=mariadb.service
+
+[Service]
+Type=simple
+User=root
+Group=liuerpanel
+RuntimeDirectory=liuer-panel-files
+RuntimeDirectoryMode=0750
+ExecStart=${php_bin} ${WEB_PANEL_DIR}/bin/files.php
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=false
+ProtectSystem=strict
+ReadWritePaths=/home/web /run/liuer-panel-files
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0007
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now liuer-web-files.service
+    systemctl restart liuer-web-files.service
 }
 
 _configure_web_panel_worker() {
@@ -8452,6 +8634,7 @@ install_web_panel() {
 
     _apply_web_panel_db_grants || { _cleanup_incomplete_web_panel; log_error "Database privilege isolation failed."; press_enter; return 1; }
     _configure_web_panel_control || { _cleanup_incomplete_web_panel; log_error "Control service setup failed."; press_enter; return 1; }
+    _configure_web_panel_files || { _cleanup_incomplete_web_panel; log_error "File service setup failed."; press_enter; return 1; }
     _configure_web_panel_fpm || { _cleanup_incomplete_web_panel; log_error "PHP-FPM configuration failed."; press_enter; return 1; }
     _configure_web_panel_nginx "$port" "$bind_address" || { _cleanup_incomplete_web_panel; log_error "Nginx configuration failed."; press_enter; return 1; }
     _configure_web_panel_worker || { _cleanup_incomplete_web_panel; log_error "Worker service setup failed."; press_enter; return 1; }
@@ -8470,6 +8653,7 @@ install_web_panel() {
 
     local server_ip; server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
     [[ -z "$server_ip" ]] && server_ip="SERVER_IP"
+    _ensure_proc_hidepid || log_warn "Other users can still see root's process list."
     log_success "Liuer Web Panel installed successfully."
     if [[ "$access_mode" == "private" ]]; then
         echo -e "  Tunnel   : ${BOLD}ssh -L ${port}:127.0.0.1:${port} root@${server_ip}${NC}"
@@ -8530,8 +8714,11 @@ update_web_panel() {
     fi
     rm -rf "$backup"
     systemctl restart "$WEB_PANEL_CONTROL_SERVICE" 2>/dev/null || true
+    systemctl restart liuer-web-files.service 2>/dev/null || true
     systemctl restart "$WEB_PANEL_SERVICE" 2>/dev/null || true
     systemctl restart "$(get_php_service "8.2")" 2>/dev/null || true
+    _ensure_proc_hidepid || log_warn "Other users can still see root's process list."
+    _publish_phpmyadmin_access || log_warn "phpMyAdmin stays on its previous configuration."
     log_success "Liuer Web Panel updated to ${new_version}."
     [[ "$automatic" == "1" ]] || press_enter
 }
@@ -8591,6 +8778,60 @@ reset_web_panel_admin() {
     press_enter
 }
 
+# Hide other users' processes: without this any site user can watch root's
+# command lines. Opt out with: touch /etc/liuer-panel/no-hidepid
+_ensure_proc_hidepid() {
+    [[ "$(uname -s)" == Linux && ! -e "${CONFIG_DIR}/no-hidepid" ]] || return 0
+    if command -v systemd-detect-virt &>/dev/null && systemd-detect-virt --container --quiet; then
+        log_info "Container detected: /proc mount options are managed by the host."
+        return 0
+    fi
+    local group="liuerproc" gid unit
+    getent group "$group" >/dev/null || groupadd --system "$group" || return 1
+    gid=$(getent group "$group" | cut -d: -f3)
+    [[ "$gid" =~ ^[0-9]+$ ]] || return 1
+    if command -v systemctl &>/dev/null; then
+        # logind and polkit inspect other users' processes.
+        for unit in systemd-logind polkit; do
+            systemctl cat "${unit}.service" &>/dev/null || continue
+            install -d -m 755 "/etc/systemd/system/${unit}.service.d"
+            printf '[Service]\nSupplementaryGroups=%s\n' "$group" > "/etc/systemd/system/${unit}.service.d/liuer-hidepid.conf"
+        done
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl try-restart polkit.service systemd-logind.service 2>/dev/null || true
+    fi
+    mount -o "remount,hidepid=2,gid=${gid}" /proc || { log_warn "Could not apply hidepid to /proc."; return 1; }
+    if grep -Eq '^[^#[:space:]]+[[:space:]]+/proc[[:space:]]+proc[[:space:]]' /etc/fstab 2>/dev/null; then
+        sed -i -E "s|^([^#[:space:]]+[[:space:]]+/proc[[:space:]]+proc[[:space:]]+).*$|\1defaults,hidepid=2,gid=${gid} 0 0|" /etc/fstab
+    else
+        printf 'proc /proc proc defaults,hidepid=2,gid=%s 0 0\n' "$gid" >> /etc/fstab
+    fi
+    log_success "/proc now hides other users' processes."
+}
+
+# New passwords for the panel's own DB accounts. Run once after updating from a
+# version that exposed them through process arguments.
+rotate_panel_db_passwords() {
+    web_panel_installed || { log_warn "Liuer Web Panel is not installed."; return 1; }
+    local app_key web_user web_pass control_pass worker_pass
+    app_key=$(_web_panel_ini_value "$WEB_PANEL_WORKER_CONFIG" security app_key)
+    [[ "$app_key" =~ ^[a-f0-9]{64}$ ]] || { log_error "Worker configuration is unreadable."; return 1; }
+    web_user=$(_web_panel_ini_value "$WEB_PANEL_CONFIG" database user)
+    web_user="${web_user:-liuer_panel_web}"
+    web_pass=$(rand_str 40); control_pass=$(rand_str 40); worker_pass=$(rand_str 40)
+    mysql_exec "ALTER USER '${web_user}'@'127.0.0.1' IDENTIFIED BY '${web_pass}'; ALTER USER 'liuer_panel_control'@'127.0.0.1' IDENTIFIED BY '${control_pass}'; ALTER USER 'liuer_panel_worker'@'127.0.0.1' IDENTIFIED BY '${worker_pass}';" \
+        || { log_error "Could not change the panel database passwords."; return 1; }
+    _write_web_panel_ini "$WEB_PANEL_CONFIG" "$web_user" "$web_pass"
+    _write_web_panel_ini "$WEB_PANEL_CONTROL_CONFIG" "liuer_panel_control" "$control_pass" "$app_key"
+    _write_web_panel_ini "$WEB_PANEL_WORKER_CONFIG" "liuer_panel_worker" "$worker_pass" "$app_key"
+    chown root:liuerpanel "$WEB_PANEL_CONFIG"; chmod 640 "$WEB_PANEL_CONFIG"
+    chown root:liuercontrol "$WEB_PANEL_CONTROL_CONFIG"; chmod 640 "$WEB_PANEL_CONTROL_CONFIG"
+    chown root:root "$WEB_PANEL_WORKER_CONFIG"; chmod 600 "$WEB_PANEL_WORKER_CONFIG"
+    _web_panel_fpm_details
+    systemctl restart "$WEB_PANEL_CONTROL_SERVICE" liuer-web-files.service "$WEB_PANEL_SERVICE" "$WEB_PANEL_FPM_SERVICE"
+    log_success "Panel database passwords rotated."
+}
+
 repair_web_panel() {
     print_section "REPAIR LIUER WEB PANEL"
     web_panel_installed || { log_warn "Liuer Web Panel is not installed."; press_enter; return 1; }
@@ -8618,8 +8859,13 @@ uninstall_web_panel() {
     local port access_mode; port=$(_web_panel_state_value PORT); port="${port:-$WEB_PANEL_DEFAULT_PORT}"; access_mode=$(_web_panel_state_value ACCESS_MODE); access_mode="${access_mode:-public}"
     _web_panel_fpm_details
     systemctl disable --now "$WEB_PANEL_SERVICE" 2>/dev/null || true
+    systemctl disable --now liuer-web-files.service 2>/dev/null || true
     systemctl disable --now "$WEB_PANEL_CONTROL_SERVICE" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${WEB_PANEL_SERVICE}" "/etc/systemd/system/${WEB_PANEL_CONTROL_SERVICE}" "$WEB_PANEL_NGINX_CONF" "$WEB_PANEL_FPM_CONF"
+    rm -f "/etc/systemd/system/${WEB_PANEL_SERVICE}" "/etc/systemd/system/${WEB_PANEL_CONTROL_SERVICE}" /etc/systemd/system/liuer-web-files.service "$WEB_PANEL_NGINX_CONF" "$WEB_PANEL_FPM_CONF"
+    if [[ -f /usr/local/libexec/liuer-panel/file-ops.py && ! -L /usr/local/libexec/liuer-panel/file-ops.py ]]; then
+        rm /usr/local/libexec/liuer-panel/file-ops.py
+        rmdir /usr/local/libexec/liuer-panel 2>/dev/null || true
+    fi
     systemctl daemon-reload
     systemctl restart "$WEB_PANEL_FPM_SERVICE" 2>/dev/null || true
     nginx -t &>/dev/null && systemctl reload nginx || true
@@ -9679,7 +9925,7 @@ EOF
     # Restart sshd (not just reload) to apply Subsystem change
     systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
 
-    local _sfenc; _sfenc=$(encrypt_pass "$_sfpass" 2>/dev/null || echo "")
+    local _sfenc; _sfenc=$(_encrypt_pass_legacy "$_sfpass" 2>/dev/null || echo "")
     lcp_notify "sftp_created" "\"username\":\"${_sfuser}\",\"domain\":\"${_sfdom}\",\"password_enc\":\"${_sfenc}\""
     log_success "SFTP user created!"
     printf "  %-10s: %s\n" "User"     "$_sfuser"
@@ -10121,11 +10367,11 @@ show_pma_url() {
     local _pma; _pma=$(cat "${CONFIG_DIR}/pma_path")
     log_info "Fetching server IP..."
     local _ip; _ip=$(_phpmyadmin_server_ip)
-    local _url="http://${_ip}/${_pma}/"
+    local _url="https://${_ip}/${_pma}/"
 
     echo ""
     echo -e "  ${BOLD}phpMyAdmin URL:${NC}"
-    echo -e "  ${YELLOW}Public HTTP URL (use a strong database password):${NC}"
+    echo -e "  ${YELLOW}Public HTTPS URL, self-signed certificate (use a strong database password):${NC}"
     echo ""
     echo "$_url" > "${CONFIG_DIR}/pma_url"
     echo -e "  ${DIM}Saved: cat ${CONFIG_DIR}/pma_url${NC}"
@@ -13139,12 +13385,13 @@ _api_create_site() {
         result_db_pass=$(decrypt_pass "$_db_enc" 2>/dev/null) || { _api_rollback_new_site "$domain" "$site_user" "$site_dir" "$php_ver"; log_error "Could not read generated database credentials."; exit 1; }
         if [[ "$type" == "wordpress" && "$source_mode" == "latest" && -f "${web_root}/wp-config-sample.php" ]]; then
             cp "${web_root}/wp-config-sample.php" "${web_root}/wp-config.php"
-            sed -i "s/database_name_here/${result_db_name}/; s/username_here/${result_db_user}/; s/password_here/${result_db_pass}/" "${web_root}/wp-config.php"
+            _sed_secret "s/database_name_here/${result_db_name}/; s/username_here/${result_db_user}/; s/password_here/${result_db_pass}/" "${web_root}/wp-config.php"
             local _salts _wp_tmp
             _salts=$(curl -fsSL --max-time 15 "https://api.wordpress.org/secret-key/1.1/salt/" 2>/dev/null || true)
             if [[ -n "$_salts" ]]; then
                 _wp_tmp="${web_root}/wp-config.php.tmp"
-                awk -v salts="$_salts" '
+                LIUER_WP_SALTS="$_salts" awk '
+                    BEGIN { salts=ENVIRON["LIUER_WP_SALTS"] }
                     /define\(.AUTH_KEY/ { found=1 }
                     found && /define\(.NONCE_SALT/ { print salts; found=0; next }
                     !found { print }
@@ -13201,6 +13448,86 @@ _api_create_site() {
         printf 'LIUER_SECRET_JSON:{"db_name":"%s","db_user":"%s","db_password":"%s","db_host":"localhost"}\n' \
             "$result_db_name" "$result_db_user" "$result_db_pass"
     fi
+}
+
+# Remove a website and everything provisioned for it. Backups stay unless the
+# caller passes `purge`, because a mistaken delete has no other way back.
+_api_delete_site_full() {
+    local domain="$1" backups="${2:-keep}"
+    validate_domain "$domain" || { log_error "Invalid domain: $domain"; return 1; }
+    [[ "$backups" == keep || "$backups" == purge ]] || { log_error "Invalid backup option."; return 1; }
+    local meta="${SITES_META_DIR}/${domain}.conf" conf="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ -f "$meta" ]] || { log_error "Website does not exist: $domain"; return 1; }
+    local site_user php_ver backup_dir entry
+    site_user=$(grep '^WEB_USER=' "$meta" | head -1 | cut -d= -f2)
+    php_ver=$(grep '^PHP_VERSION=' "$meta" | head -1 | cut -d= -f2)
+    backup_dir=$(_find_backup_dir "$domain" 2>/dev/null || true)
+
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] || _remove_backup_schedule_entry "$entry" || return 1
+    done < <(crontab -l -u root 2>/dev/null | awk -v d="$domain" '$0 !~ /^#/ { for (i=1;i<NF;i++) if ($i=="_cron_backup" && $(i+1)==d) { print; break } }')
+
+    if [[ -f "$SFTP_USERS_FILE" ]]; then
+        local sftp_user _unused sftp_domain sftp_lines
+        sftp_lines=$(<"$SFTP_USERS_FILE")
+        while IFS='|' read -r sftp_user _unused sftp_domain; do
+            [[ "$sftp_domain" == "$domain" ]] && _api_delete_sftp "$sftp_user"
+        done <<< "$sftp_lines"
+    fi
+
+    # Only a vhost whose certificate Liuer manages can be cleaned automatically.
+    if [[ -f "$conf" ]] && grep -q '# liuer-managed-ssl-start' "$conf"; then
+        _remove_managed_ssl "$domain" || log_warn "SSL files of ${domain} need manual review."
+    fi
+    _delete_db_for "$domain"
+
+    if [[ -n "$php_ver" ]]; then
+        local pool_conf; pool_conf=$(get_php_pool_conf "$php_ver" "$domain")
+        rm -f "${pool_conf}.disabled"
+    fi
+    rm -f "${conf}.premaint" "${CONFIG_DIR}/suspended/${domain}.cron" "${CONFIG_DIR}/suspended/${domain}.sftp"
+    rm -f "/var/log/nginx/${domain}_access.log" "/var/log/nginx/${domain}_error.log" "/var/log/nginx/${domain}_php_error.log"
+    _api_delete_site "$domain"
+
+    if [[ -n "$site_user" && "$site_user" != root ]] && ! grep -qsx "WEB_USER=${site_user}" "${SITES_META_DIR}"/*.conf; then
+        crontab -r -u "$site_user" 2>/dev/null || true
+        userdel "$site_user" 2>/dev/null || log_warn "Could not remove system user: ${site_user}"
+        sed -i "/^${site_user}|/d" "$WEB_USERS_FILE" 2>/dev/null || true
+        rmdir "/home/web/${site_user}" 2>/dev/null || true
+    fi
+    if [[ "$backups" == purge && -n "$backup_dir" && -d "$backup_dir" ]]; then
+        case "$backup_dir" in
+            "${BACKUP_BASE}"/*|/backup/*) rm -rf -- "$backup_dir" ;;
+            *) log_warn "Backup directory left in place: ${backup_dir}" ;;
+        esac
+    fi
+    log_success "Website removed: $domain"
+}
+
+# Copy one root-only backup where the panel's PHP user can stream it. The worker
+# deletes exports after an hour; the token directory is the capability.
+_api_export_backup_file() {
+    local domain="$1" filename="$2" token="$3" size free bdir source
+    [[ "$filename" =~ ^(code_[A-Za-z0-9_.-]+\.tar\.gz|db_[A-Za-z0-9_.-]+\.sql\.gz)$ && "$filename" != *..* ]] \
+        || { log_error "Invalid backup filename."; return 1; }
+    [[ "$token" =~ ^[a-f0-9]{32}$ ]] || { log_error "Invalid export token."; return 1; }
+    bdir=$(_find_backup_dir "$domain") || { log_error "Backup directory not found."; return 1; }
+    source="${bdir}/${filename}"
+    [[ -f "$source" && ! -L "$source" ]] || { log_error "Backup file not found."; return 1; }
+    local base="/var/lib/liuer-panel/web-panel/exports" dir
+    install -d -o liuerpanel -g liuerpanel -m 700 "$base" || return 1
+    size=$(stat -c %s "$source") || return 1
+    free=$(df --output=avail -B1 "$base" | tail -1 | tr -d ' ')
+    [[ "$free" =~ ^[0-9]+$ ]] && (( free > size + size / 5 )) \
+        || { log_error "Not enough free disk space to export this backup."; return 1; }
+    dir="${base}/${token}"
+    install -d -o liuerpanel -g liuerpanel -m 700 "$dir" || return 1
+    if ! install -o liuerpanel -g liuerpanel -m 600 "$source" "${dir}/${filename}"; then
+        rm -rf -- "$dir"
+        log_error "Could not export the backup."
+        return 1
+    fi
+    printf '%s\n' "$size"
 }
 
 _api_delete_site() {
@@ -13267,7 +13594,9 @@ _api_create_sftp() {
 
     local sfuser sfpass
     while true; do
-        local rnd; rnd=$(tr -dc 'a-z0-9' < /dev/urandom | head -c8)
+        # 2>/dev/null: under PHP SIGPIPE is ignored, so tr reports "Broken pipe" and
+        # that text would land in the JSON the worker parses.
+        local rnd; rnd=$(tr -dc 'a-z0-9' < /dev/urandom 2>/dev/null | head -c8)
         sfuser="u${rnd}"
         id "$sfuser" &>/dev/null || break
     done
@@ -13301,7 +13630,7 @@ _api_create_sftp() {
     _repair_sftp_perms
     systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
 
-    local _sfenc; _sfenc=$(encrypt_pass "$sfpass" 2>/dev/null || echo "")
+    local _sfenc; _sfenc=$(_encrypt_pass_legacy "$sfpass" 2>/dev/null || echo "")
     lcp_notify "sftp_created" "\"username\":\"${sfuser}\",\"domain\":\"${domain}\",\"password_enc\":\"${_sfenc}\""
     printf '{"username":"%s","password":"%s","chroot":"%s"}\n' "$sfuser" "$sfpass" "$sfsite"
 }
@@ -13960,6 +14289,26 @@ _api_run_site_backup() {
     log_success "Backup complete → ${_bdir}"
 }
 
+# Feed a dump to MariaDB as the site's OS user and DB user. The client obeys `\!`
+# shell escapes, so restoring as root would run whatever a crafted dump contains
+# as root, and a root connection could reach every other database.
+_restore_mysql_as_site() {
+    local domain="$1" dump="$2" db_name="$3" db_user="$4" enc="$5" site_user pass cnf
+    site_user=$(grep '^WEB_USER=' "${SITES_META_DIR}/${domain}.conf" 2>/dev/null | head -1 | cut -d= -f2)
+    [[ "$site_user" =~ ^[a-zA-Z0-9_-]+$ && "$site_user" != root ]] && id "$site_user" &>/dev/null || return 1
+    pass=$(decrypt_pass "$enc" 2>/dev/null) || return 1
+    [[ -n "$pass" ]] || return 1
+    pass=${pass//\\/\\\\}; pass=${pass//\"/\\\"}
+    cnf=$(mktemp /tmp/liuer-restore.XXXXXX) || return 1
+    chmod 600 "$cnf"
+    printf '[client]\nuser=%s\npassword="%s"\n' "$db_user" "$pass" > "$cnf"
+    chown "$site_user" "$cnf" || { rm -f "$cnf"; return 1; }
+    zcat "$dump" | _run_as_site_user "$site_user" mysql --defaults-extra-file="$cnf" "$db_name"
+    local -a status=("${PIPESTATUS[@]}")
+    rm -f "$cnf"
+    [[ "${status[0]}" == 0 && "${status[1]}" == 0 ]]
+}
+
 _api_restore_backup_file() {
     local domain="$1" filename="$2"
     [[ -z "$domain" || -z "$filename" ]] && { printf '{"error":"domain and filename required"}\n'; exit 1; }
@@ -14010,7 +14359,7 @@ _api_restore_backup_file() {
                 local _safety="${_bdir}/db_pre_restore_$(date +%Y%m%d_%H%M%S).sql.gz"
                 mysqldump -u root "$_dbn" 2>/dev/null | gzip > "$_safety" \
                     || { rm -f "$_safety"; printf '{"error":"could not create pre-restore database safety backup"}\n'; exit 1; }
-                zcat "$_target" | mysql -u root "$_dbn" 2>/dev/null \
+                _restore_mysql_as_site "$domain" "$_target" "$_dbn" "$_dbu" "$_enc" 2>/dev/null \
                     || { printf '{"error":"database restore failed"}\n'; exit 1; } ;;
             postgresql|pgsql)
                 zcat "$_target" | sudo -u postgres psql "$_dbn" >/dev/null 2>&1 \
@@ -14169,8 +14518,55 @@ _api_set_index_file() {
     log_success "Index file set to $new_idx for $domain"
 }
 
-_api_lock_site() {
+# A panel lock taken above the owner must also stop what runs without Nginx/PHP:
+# cron keeps executing and SFTP keeps logging in otherwise.
+_suspend_site_access() {
     local domain="$1"
+    local meta="${SITES_META_DIR}/${domain}.conf" state="${CONFIG_DIR}/suspended"
+    local site_user other shared=0
+    install -d -m 700 "$state" || return 1
+    site_user=$(grep '^WEB_USER=' "$meta" 2>/dev/null | head -1 | cut -d= -f2)
+    for other in "${SITES_META_DIR}"/*.conf; do
+        [[ -f "$other" && "$other" != "$meta" ]] || continue
+        grep -qx "WEB_USER=${site_user}" "$other" && grep -qx 'STATUS=active' "$other" && shared=1
+    done
+    if [[ -n "$site_user" && "$shared" == 0 ]] && crontab -l -u "$site_user" > "${state}/${domain}.cron.tmp" 2>/dev/null; then
+        mv -f "${state}/${domain}.cron.tmp" "${state}/${domain}.cron"
+        crontab -r -u "$site_user" 2>/dev/null || true
+    fi
+    rm -f "${state}/${domain}.cron.tmp"
+    if [[ -f "$SFTP_USERS_FILE" ]]; then
+        local sftp_user _unused sftp_domain
+        while IFS='|' read -r sftp_user _unused sftp_domain; do
+            [[ "$sftp_domain" == "$domain" ]] || continue
+            usermod -L -e 1 "$sftp_user" 2>/dev/null || log_warn "Could not lock SFTP user ${sftp_user}."
+            printf '%s\n' "$sftp_user" >> "${state}/${domain}.sftp"
+        done < "$SFTP_USERS_FILE"
+    fi
+    return 0
+}
+
+_resume_site_access() {
+    local domain="$1"
+    local meta="${SITES_META_DIR}/${domain}.conf" state="${CONFIG_DIR}/suspended" site_user sftp_user
+    site_user=$(grep '^WEB_USER=' "$meta" 2>/dev/null | head -1 | cut -d= -f2)
+    if [[ -f "${state}/${domain}.cron" ]]; then
+        [[ -z "$site_user" ]] || crontab -u "$site_user" "${state}/${domain}.cron" 2>/dev/null \
+            || log_warn "Could not restore the crontab of ${domain}."
+        rm -f "${state}/${domain}.cron"
+    fi
+    if [[ -f "${state}/${domain}.sftp" ]]; then
+        while IFS= read -r sftp_user; do
+            [[ -n "$sftp_user" ]] || continue
+            usermod -U -e '' "$sftp_user" 2>/dev/null || log_warn "Could not unlock SFTP user ${sftp_user}."
+        done < "${state}/${domain}.sftp"
+        rm -f "${state}/${domain}.sftp"
+    fi
+    return 0
+}
+
+_api_lock_site() {
+    local domain="$1" mode="${2:-}"
     [[ -z "$domain" ]] && { log_error "Domain required"; exit 1; }
 
     local meta="${SITES_META_DIR}/${domain}.conf"
@@ -14188,6 +14584,7 @@ _api_lock_site() {
 
     sed -i "s/^STATUS=.*/STATUS=locked/" "$meta"
     grep -q "^STATUS=" "$meta" || echo "STATUS=locked" >> "$meta"
+    [[ "$mode" != suspend ]] || _suspend_site_access "$domain"
 
     nginx -t &>/dev/null && nginx -s reload
     log_success "Site locked: $domain"
@@ -14213,6 +14610,7 @@ _api_unlock_site() {
 
     sed -i "s/^STATUS=.*/STATUS=active/" "$meta"
     grep -q "^STATUS=" "$meta" || echo "STATUS=active" >> "$meta"
+    _resume_site_access "$domain"
 
     nginx -t &>/dev/null && nginx -s reload
     log_success "Site unlocked: $domain"
@@ -14370,8 +14768,9 @@ main() {
                 update)  update_web_panel ;;
                 repair)  repair_web_panel ;;
                 reset-password) reset_web_panel_admin ;;
+                rotate-db-passwords) rotate_panel_db_passwords ;;
                 menu)    manage_web_panel ;;
-                *) log_error "Usage: liuer web-panel [install|status|update|repair|reset-password]"; exit 1 ;;
+                *) log_error "Usage: liuer web-panel [install|status|update|repair|reset-password|rotate-db-passwords]"; exit 1 ;;
             esac
             ;;
 
@@ -14434,6 +14833,7 @@ main() {
         create_site)       check_root; detect_os; _api_create_site    "${2:-}" "${3:-php}" "${4:-8.2}" "${5:-empty}" "${6:-0}" "${7:-}" "${8:-active}" ;;
         web_site_action)   check_root; detect_os; _api_web_site_action "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
         web_panel_grants)  check_root; detect_os; _apply_web_panel_db_grants ;;
+        web_panel_files_setup) check_root; detect_os; _configure_web_panel_files ;;
         web_cache)         check_root; detect_os; _api_web_cache "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
         web_backup_schedule) check_root; detect_os; _api_web_backup_schedule "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" ;;
         web_php)
@@ -14448,6 +14848,9 @@ main() {
                 *) log_error "Unknown PHP operation."; return 1 ;;
             esac ;;
         delete_site)       check_root; detect_os; _api_delete_site    "${2:-}" ;;
+        delete_site_full)  check_root; detect_os; _api_delete_site_full "${2:-}" "${3:-keep}" ;;
+        export_backup_file) check_root; detect_os; _api_export_backup_file "${2:-}" "${3:-}" "${4:-}" ;;
+        web_panel_harden)  check_root; detect_os; _ensure_proc_hidepid; _publish_phpmyadmin_access ;;
         create_db)         check_root; detect_os; _api_create_db      "${2:-}" "${3:-mysql}" ;;
         delete_db)         check_root; detect_os; _api_delete_db      "${2:-}" ;;
         decrypt_value)                            _api_decrypt_value  "${2:-}" ;;
@@ -14461,7 +14864,7 @@ main() {
         enable_routing)    check_root; detect_os; _api_set_routing    "${2:-}" "enable" ;;
         disable_routing)   check_root; detect_os; _api_set_routing    "${2:-}" "disable" ;;
         set_index_file)    check_root; detect_os; _api_set_index_file "${2:-}" "${3:-index.php}" ;;
-        lock_site)         check_root; detect_os; _api_lock_site      "${2:-}" ;;
+        lock_site)         check_root; detect_os; _api_lock_site      "${2:-}" "${3:-}" ;;
         unlock_site)       check_root; detect_os; _api_unlock_site    "${2:-}" ;;
         restart_php)       check_root; detect_os; _api_restart_php    "${2:-}" ;;
         request_ssl)       check_root; detect_os; _api_request_ssl   "${2:-}" "${3:-}" ;;
