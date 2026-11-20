@@ -13,7 +13,7 @@ set -uo pipefail
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-readonly VERSION="2.8.0"
+readonly VERSION="2.8.1"
 readonly SCRIPT_NAME="liuer-panel.sh"
 readonly INSTALL_DIR="/opt/liuer-panel"
 readonly BIN_LINK="/usr/local/bin/liuer"
@@ -8488,6 +8488,10 @@ ProtectHome=false
 ProtectSystem=strict
 ReadWritePaths=/home/web /run/liuer-panel-files
 CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH
+# systemd's seccomp setup can clear SETUID despite its presence in the bound.
+# Keep it for the root broker; setpriv clears ambient/inheritable caps before
+# handing control to the site's unprivileged Python helper.
+AmbientCapabilities=CAP_SETUID
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
